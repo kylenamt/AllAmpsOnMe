@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "t3k"
+version = "0.1.0"
+description = "Phase 1 — TONE3000 amp-capture acquisition for the Open-Amp3000 project"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "requests==2.32.3",
+    "numpy==1.26.4",
+    "pandas==2.2.3",
+    "pyarrow==18.1.0",
+    "soundfile==0.12.1",
+    "click==8.1.7",
+    "tqdm==4.67.1",
+    "python-dotenv==1.0.1",
+]
+
+[project.optional-dependencies]
+# Heavy NAM/torch validation stack, kept optional so metadata-only stages
+# (auth/discover/select) install fast.
+validate = [
+    "neural-amp-modeler==0.11.0",
+    "torch==2.5.1",
+    "pytorch-lightning==2.5.2",
+]
+dev = ["pytest==8.3.4"]
+
+[project.scripts]
+t3k = "t3k.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+t3k = ["assets/*.wav"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

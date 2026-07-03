@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Open-Amp3000 Phase 1 (TONE3000 acquisition) ---
+# Never commit downloaded captures, probe outputs, tokens, or the publishable key.
+# Ignore everything under data/ EXCEPT the folder skeleton (kept via .gitkeep),
+# so the expected layout exists on a fresh checkout while contents stay private.
+/data/**
+!/data/captures/
+!/data/captures/.gitkeep
+!/data/manifests/
+!/data/manifests/.gitkeep
+*.nam
+*.probe.npy
+.t3k_tokens.json
+.env
