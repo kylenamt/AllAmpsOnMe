@@ -26,6 +26,12 @@ from .ratelimit import (
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 
+def _is_json(resp: requests.Response) -> bool:
+    """True if the response advertises a JSON body (checked via Content-Type only,
+    so it is safe for streamed responses where the body isn't read yet)."""
+    return "application/json" in resp.headers.get("Content-Type", "").lower()
+
+
 def _parse_retry_after(resp: requests.Response) -> float | None:
     value = resp.headers.get("Retry-After")
     if not value:
@@ -89,11 +95,24 @@ class T3KClient:
                 raise RetryableHTTPError(401, retry_after=0.0, message="token refreshed")
             if resp.status_code in _RETRYABLE_STATUS:
                 raise RetryableHTTPError(resp.status_code, _parse_retry_after(resp))
+            # Edge/WAF rate-limit blocks (TONE3000 is behind Vercel) surface as a
+            # 403 with a non-JSON body — e.g. "Forbidden\narn1::...". These are
+            # transient and clear on backoff, unlike a genuine application 403
+            # (which is JSON). Retry the former; treat the latter as a hard error.
+            if resp.status_code == 403 and not _is_json(resp):
+                raise RetryableHTTPError(403, _parse_retry_after(resp),
+                                         message="edge rate-limit / WAF block")
             if resp.status_code >= 400:
                 raise APIError(resp.status_code, resp.text[:300])
             return resp
 
-        return retry_with_backoff(do, self.retry)
+        try:
+            return retry_with_backoff(do, self.retry)
+        except RetryableHTTPError as exc:
+            # Retries exhausted. Surface as the client's public error type so
+            # callers (which catch APIError to skip/continue) don't crash on the
+            # internal retry signal.
+            raise APIError(exc.status, str(exc)) from exc
 
     def get_json(self, path: str, params: dict | None = None) -> dict:
         return self.request("GET", path, params=params).json()

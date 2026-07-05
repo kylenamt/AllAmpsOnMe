@@ -41,6 +41,25 @@ def _probe_path(file_path: str) -> Path:
     return Path(file_path).with_suffix(".probe.npy")
 
 
+def _coerce_sample_rate(value) -> int | None:
+    """Return an int sample rate, or None if missing/NaN/unparseable.
+
+    Guards the `or` fallthrough below: a pandas missing value is a float ``NaN``
+    which is *truthy*, so `None or NaN` would yield NaN and crash `int(NaN)`.
+    """
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _check_output(out: np.ndarray, probe: probe_mod.Probe) -> str | None:
     """Return a reject reason, or None if all checks pass (spec §5.5.4)."""
     out = np.asarray(out, dtype=np.float32).reshape(-1)
@@ -81,7 +100,9 @@ def validate_one(row: dict, settings: Settings, render_fn: RenderFn,
     except Exception as exc:
         return {"status": STATUS_REJECTED, "reject_reason": f"parse_error: {exc}"[:300]}
 
-    sample_rate = int(summary.get("sample_rate") or row.get("sample_rate") or NAM_DEFAULT_SAMPLE_RATE)
+    sample_rate = (_coerce_sample_rate(summary.get("sample_rate"))
+                   or _coerce_sample_rate(row.get("sample_rate"))
+                   or NAM_DEFAULT_SAMPLE_RATE)
     probe = probe_mod.generate_probe(sample_rate)
 
     out, used = _render_with_fallback(row, file_path, probe, sample_rate, render_fn, client, settings)

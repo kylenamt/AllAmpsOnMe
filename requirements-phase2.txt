@@ -1,0 +1,30 @@
+# Phase 2 — clean corpus + offline GPU rendering runtime dependencies.
+# Pinned per spec §2. A CUDA-enabled torch build matching the machine is required
+# for `oa3k render run`; corpus prep + datasets need soundfile/torchaudio.
+#
+# SUPPLY-CHAIN NOTE (spec §2): pytorch-lightning 2.6.2 and 2.6.3 were subject to a
+# known incident. neural-amp-modeler pulls in a safe, earlier release; do not bump
+# into that range. The pins below match Phase 1's validation stack.
+
+# --- Config / manifests / progress (also used by Phase 1) ---
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==18.1.0
+pyyaml==6.0.2
+tqdm==4.67.1
+
+# --- Audio I/O + resampling ---
+soundfile==0.12.1
+torch==2.5.1
+torchaudio==2.5.1
+
+# --- NAM model rendering ---
+neural-amp-modeler==0.11.0
+pytorch-lightning==2.5.2
+# NAM 0.11 imports `pkg_resources`, which setuptools removed in 81+ (else the
+# capture load fails). Matches Phase 1's validation stack.
+setuptools<81
+
+# --- CLI + QA plots ---
+typer==0.15.1
+matplotlib==3.9.2

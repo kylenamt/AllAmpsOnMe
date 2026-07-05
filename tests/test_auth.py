@@ -47,6 +47,11 @@ def test_build_authorize_url(settings):
     assert "code_challenge_method=S256" in url
     assert "state=st8" in url
     assert "response_type=code" in url
+    # Standard Flow must omit `prompt` so the consent screen (not the tone-picker)
+    # is shown; only an explicit prompt should appear in the URL.
+    assert "prompt" not in url
+    assert "prompt=select_tone" in auth.build_authorize_url(
+        settings, state="st8", challenge=challenge, prompt="select_tone")
 
 
 def test_exchange_and_refresh(monkeypatch, settings):

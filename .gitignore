@@ -230,3 +230,20 @@ __marimo__/
 *.probe.npy
 .t3k_tokens.json
 .env
+
+# --- Open-Amp3000 Phase 2 (rendering pipeline) ---
+# Renders + clean corpus are derived from license-restricted captures -> keep
+# private (they live under /data/, already ignored above). QA WAV/spectrogram
+# exports derive from renders too; ignore them but keep the metadata-only report.
+/results/**
+!/results/
+!/results/phase2_report.md
+
+# --- Open-Amp3000 Phase 3 (contrastive encoder) ---
+# Track the metadata-only report + its small figures. Checkpoints, training logs,
+# the crop cache (local /tmp), and embedding dumps stay private (derived from the
+# license-restricted renders / large external eval audio downloaded to /data/raw).
+!/results/phase3_report.md
+!/results/phase3/
+!/results/phase3/figures/
+!/results/phase3/figures/*.png

@@ -34,11 +34,18 @@ def _s(value) -> str:
 
 
 def _is_complete(row: pd.Series) -> bool:
-    """Acceptance §7.4: non-empty license, creator, and tone_url."""
+    """Acceptance: non-empty creator and tone_url (attribution).
+
+    License is recorded verbatim but NOT required for acceptance: the TONE3000
+    API returns an empty ``license`` for every candidate, and the pipeline only
+    records metadata (it never redistributes the capture files). Requiring a
+    license here would reject the entire corpus (spec §7 permits proceeding
+    without it); see the missing-license note in docs/phase1-spec.md §7.
+    """
     def ok(v) -> bool:
         s = _s(v).lower()
         return bool(s) and s != "unknown"
-    return ok(row.get("license")) and ok(row.get("creator")) and ok(row.get("tone_url"))
+    return ok(row.get("creator")) and ok(row.get("tone_url"))
 
 
 def _final_pool(df: pd.DataFrame) -> pd.Index:

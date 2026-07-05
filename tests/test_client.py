@@ -76,6 +76,26 @@ def test_non_retryable_raises(settings):
         client.get_json("tones/999")
 
 
+def test_edge_block_403_is_retried(settings):
+    # Vercel/WAF rate-limit blocks are 403 with a non-JSON body; retry, don't drop.
+    block = FakeResp(403, headers={"Content-Type": "text/plain"},
+                     text="Forbidden\narn1::123-abc")
+    seq = [block, block, FakeResp(200, {"data": []})]
+    client = _client(lambda *a: seq.pop(0), settings)
+    assert client.get_json("models") == {"data": []}
+    assert len(client.session.calls) == 3
+
+
+def test_json_403_is_not_retried(settings):
+    # A genuine application 403 (JSON body) is a hard error — no retry.
+    client = _client(lambda *a: FakeResp(403, {"error": "forbidden"},
+                                         headers={"Content-Type": "application/json"}),
+                     settings)
+    with pytest.raises(APIError):
+        client.get_json("models")
+    assert len(client.session.calls) == 1
+
+
 def test_download_model_hashes(tmp_path, settings):
     chunks = [b"abc", b"def", b"ghi"]
     client = _client(lambda *a: FakeResp(200, chunks=chunks), settings)

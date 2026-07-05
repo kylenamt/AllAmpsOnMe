@@ -103,7 +103,11 @@ class TokenStore:
 
 # --- URL / endpoint helpers -----------------------------------------------------
 def build_authorize_url(settings: Settings, state: str, challenge: str,
-                        prompt: str = "select_tone", extra: dict | None = None) -> str:
+                        prompt: str | None = None, extra: dict | None = None) -> str:
+    # The "Standard Flow" (full programmatic access) omits ``prompt`` entirely and
+    # shows a consent/authorize screen. Passing ``prompt=select_tone`` instead would
+    # trigger the tone-picker flow, which has nothing to confirm. Only include
+    # ``prompt`` when a caller explicitly asks for a non-standard flow.
     params = {
         "client_id": settings.publishable_key,
         "redirect_uri": settings.redirect_uri,
@@ -111,8 +115,9 @@ def build_authorize_url(settings: Settings, state: str, challenge: str,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "state": state,
-        "prompt": prompt,
     }
+    if prompt is not None:
+        params["prompt"] = prompt
     if extra:
         params.update({k: v for k, v in extra.items() if v is not None})
     return f"{settings.base_url}/oauth/authorize?{urllib.parse.urlencode(params)}"

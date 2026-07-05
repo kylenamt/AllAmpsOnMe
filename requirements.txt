@@ -22,3 +22,6 @@ python-dotenv==1.0.1
 neural-amp-modeler==0.11.0
 torch==2.5.1
 pytorch-lightning==2.5.2
+# NAM 0.11 imports `pkg_resources`, which setuptools removed in 81+. Without this
+# cap every capture fails `t3k validate` as `load_or_render_failed`.
+setuptools<81

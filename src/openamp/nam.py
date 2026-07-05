@@ -38,36 +38,66 @@ def parse_nam(path: str | Path) -> dict:
     }
 
 
+# The exported ``architecture`` string names the concrete net class. NAM's
+# ``BaseNet`` is abstract, so construction must go through the subclass.
+_ARCH_ALIASES = {
+    "wavenet": "WaveNet",
+    "lstm": "LSTM",
+    "convnet": "ConvNet",
+    "linear": "Linear",
+}
+
+
+def _translate_config(arch: str, config: dict) -> dict:
+    """Map exported .nam config keys onto the current constructor kwargs.
+
+    Older exports (schema ``version`` 0.5.x) name the WaveNet fields ``layers``
+    and ``head``; the installed ``_WaveNet.__init__`` expects ``layers_configs``
+    and ``head_config``. Only rename when the target key is absent so newer
+    exports pass through untouched.
+    """
+    config = dict(config)
+    if arch == "WaveNet":
+        if "layers" in config and "layers_configs" not in config:
+            config["layers_configs"] = config.pop("layers")
+        if "head" in config and "head_config" not in config:
+            config["head_config"] = config.pop("head")
+    return config
+
+
 def _import_nam_model(data: dict):
     """Reconstruct a runnable NAM model from parsed .nam data.
 
-    Tries the known construction paths across NAM versions. Kept narrow and
-    well-commented so it is easy to pin to a specific version if needed.
+    Selects the concrete architecture class, remaps the export config to the
+    installed constructor's kwargs, builds via ``init_from_config``, then loads
+    the weights. Isolated here so only this file changes across NAM versions.
     """
     try:
-        from nam.models.base import BaseNet  # type: ignore
+        from nam import models as nam_models  # type: ignore
     except Exception as exc:  # pragma: no cover - depends on optional dep
         raise NamBackendError(
-            "neural-amp-modeler is not installed. Install the validation extras: "
-            "`pip install -e .[validate]` (or `pip install -r requirements.txt`)."
+            "neural-amp-modeler could not be imported. Install the validation "
+            "extras (`pip install -e .[validate]`); if it is installed but the "
+            "import fails on `pkg_resources`, pin `setuptools<81` (NAM 0.x still "
+            f"imports pkg_resources). Underlying error: {exc}"
         ) from exc
 
-    config = data.get("config") or {}
+    arch = str(data.get("architecture") or "").strip()
+    cls = getattr(nam_models, _ARCH_ALIASES.get(arch.lower(), arch), None)
+    if cls is None:
+        raise NamBackendError(f"unknown/unsupported NAM architecture: {arch!r}")
+
+    config = _translate_config(arch, data.get("config") or {})
     weights = data.get("weights")
 
-    # Preferred: a single classmethod that rebuilds arch+weights from the export.
-    for ctor_name in ("init_from_config", "from_config"):
-        ctor = getattr(BaseNet, ctor_name, None)
-        if ctor is None:
-            continue
-        try:
-            net = ctor(config)
-        except Exception:
-            continue
-        _load_weights(net, weights)
-        return net
-
-    raise NamBackendError("could not construct a NAM model from the export config")
+    try:
+        net = cls.init_from_config(config)
+    except Exception as exc:
+        raise NamBackendError(
+            f"could not construct a {arch} model from the export config: {exc}"
+        ) from exc
+    _load_weights(net, weights)
+    return net
 
 
 def _load_weights(net, weights) -> None:

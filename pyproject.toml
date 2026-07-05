@@ -27,11 +27,48 @@ validate = [
     "neural-amp-modeler==0.11.0",
     "torch==2.5.1",
     "pytorch-lightning==2.5.2",
+    # NAM 0.11 imports `pkg_resources`, which setuptools removed in 81+. Cap
+    # below that or every capture fails validation as `load_or_render_failed`.
+    "setuptools<81",
+]
+# Phase 2 clean-corpus + GPU rendering stack (spec §2). Kept optional so the
+# Phase 1 metadata stages install fast. Avoids pytorch-lightning 2.6.2/2.6.3.
+phase2 = [
+    "pyyaml==6.0.2",
+    "tqdm==4.67.1",
+    "soundfile==0.12.1",
+    "torch==2.5.1",
+    "torchaudio==2.5.1",
+    "neural-amp-modeler==0.11.0",
+    "pytorch-lightning==2.5.2",
+    "typer==0.15.1",
+    "matplotlib==3.9.2",
+    # NAM 0.11 imports `pkg_resources` (removed from setuptools 81+); see [validate].
+    "setuptools<81",
 ]
 dev = ["pytest==8.3.4"]
+# Phase 3 contrastive-encoder training + frozen-probe evaluation (spec §5). Reuses
+# the Phase 2 torch/soundfile stack; adds probe/baseline/viz deps.
+phase3 = [
+    "pyyaml==6.0.2",
+    "torch==2.5.1",
+    "torchaudio==2.5.1",
+    "soundfile==0.12.1",
+    "scikit-learn==1.5.2",
+    "umap-learn==0.5.7",
+    "librosa==0.10.2.post1",
+    "matplotlib==3.9.2",
+    "tqdm==4.67.1",
+]
 
 [project.scripts]
 t3k = "t3k.cli:main"
+oa3k = "data.cli:app"
+# Phase 3 entrypoints (also runnable as `python -m train.contrastive` etc.).
+oa3k-train = "train.contrastive:main"
+oa3k-embed = "eval.embed:main"
+oa3k-eval = "eval.probes:main"
+oa3k-report = "eval.report:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

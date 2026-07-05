@@ -1,0 +1,17 @@
+# Phase 3 — contrastive guitar-effects encoder (training + frozen-probe eval).
+# Install into the same `open-amp3000` conda env used for Phase 2:
+#   pip install -r requirements-phase3.txt
+# Use a CUDA-enabled torch build matching your machine (training needs a GPU;
+# eval runs on CPU or GPU). Reuses the Phase 2 render stack where it overlaps.
+
+pyyaml==6.0.2
+numpy==1.26.4
+pandas==2.2.3
+torch==2.5.1
+torchaudio==2.5.1
+soundfile==0.12.1
+scikit-learn==1.5.2
+umap-learn==0.5.7
+librosa==0.10.2.post1
+matplotlib==3.9.2
+tqdm==4.67.1
