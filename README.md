@@ -1,4 +1,4 @@
-# Open-Amp3000
+# AllAmpsOnMe
 
 A general-purpose guitar amp model trained on data captured from [TONE3000](https://www.tone3000.com).
 
