@@ -1,0 +1,41 @@
+# Phase 4 paper-default FiLM-TCN amp foundation model (spec §1, arXiv:2411.14972).
+# Run name is the file stem ("paper") -> results/emulate/paper/.
+#
+#   openamp emulate --config configs/emulate/paper.yaml --overfit         # sanity #1
+#   openamp emulate --config configs/emulate/paper.yaml --limit-devices 10  # mini-run
+#   openamp emulate --config configs/emulate/paper.yaml                    # full run
+#
+# Size testing = copy this file, change numbers, rerun (no code changes). Data
+# paths / seed come from configs/openamp.yaml + env; this file overrides only the
+# `emulate:` section.
+
+emulate:
+  # --- Model (fully parametric; this block IS the paper default) ---------------
+  blocks: 2                # dilation resets per block
+  layers_per_block: 8
+  channels: 16
+  kernel_size: 3
+  dilation_growth: 2
+  embedding_dim: 64        # per-device embedding, FiLM at every layer
+  single_device: -1        # -1 = one-to-many over all render-ok devices
+
+  # --- Training ---------------------------------------------------------------
+  # ~10% of render-ok devices are excluded from training entirely (persisted to
+  # data/manifests/emulate_holdout.txt) so Phase 5 can enroll them as truly
+  # unseen devices, matching the reference code's 90/10 device split.
+  holdout_frac: 0.1
+  clip_seconds: 2.0
+  batch_size: 16
+  pairs_per_epoch: 50000
+  epochs: 60               # max; early-stopped at the val-ESR plateau
+  lr: 5.0e-4
+  weight_decay: 0.0
+  plateau_patience: 3
+  plateau_factor: 0.5
+  early_stop_patience: 8
+  stft_weight: 1.0         # ESR : MRSTFT = 1 : 1
+  preemph: 0.85
+  num_workers: 6
+  amp: false               # fp16 forward overflowed at epoch 53 (NaN collapse); fp32 is safe and ~free at this model size
+  val_pairs: 2000
+  log_every: 50

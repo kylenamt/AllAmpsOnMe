@@ -1,0 +1,4 @@
+# Embedding-dim sweep: 16 (vs paper 64). All other knobs inherit the
+# EmulateConfig defaults (= configs/emulate/paper.yaml).
+emulate:
+  embedding_dim: 16

@@ -1,0 +1,38 @@
+# Open-Amp3000 pipeline configuration. Every tunable lives here; all randomness
+# derives from `seed` so a run is reproducible. Data paths are NOT here — they
+# derive from OPENAMP_DATA_DIR (default ./data); API access comes from the
+# environment / .env (OPENAMP_API_KEY etc.). See src/openamp/config.py.
+
+seed: 1234
+
+# Fixed audio facts — change with care; the clip grid depends on them.
+sample_rate: 48000
+
+# --- Acquisition (TONE3000) ---------------------------------------------------
+acquire:
+  # NAM capture architecture: 2 = A2 (Slimmable NAM, canonical), 1 = legacy A1.
+  # Applies to BOTH the tone search and the per-tone model listing; the /models
+  # endpoint defaults to A1, so a capture pipeline that omits it silently gets A1
+  # captures no matter what the search asked for.
+  architecture: 2
+  select_target: 430
+
+# --- Clean corpus (rendering source) ------------------------------------------
+corpus:
+  # Clean-corpus size budget, in minutes of EGDB audio (the NAM sweep is appended
+  # on top of this budget and always goes to the train split).
+  minutes_total: 40.0
+  clip_seconds: 2.0
+  output_format: flac          # clean/render container (24-bit applied in code)
+  # Train/val/test split by source file, by duration. Must sum to 1.0.
+  split_ratios:
+    train: 0.8
+    val: 0.1
+    test: 0.1
+
+# --- Rendering ----------------------------------------------------------------
+render:
+  chunk_seconds: 10.0          # streaming render chunk (left-context added in code)
+
+# Emulator settings live in per-run files under configs/emulate/<name>.yaml;
+# each overrides only the `emulate:` section and names the run after its stem.
