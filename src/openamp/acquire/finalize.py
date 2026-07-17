@@ -1,29 +1,25 @@
-"""Stage: `t3k finalize` — top up to quota, assign device_ids, emit outputs (spec §5.7).
+"""Stage: assign device_ids, emit final outputs.
 
-If the validated, non-duplicate count is below the target, optionally loops back
-to select/download/validate/dedup replacement candidates. Then assigns the stable
-``device_id`` (zero-padded rank by make, model, model_id — the embedding-table
-index that must never change) and writes ``manifest.parquet`` (final) plus
+Assigns the stable ``device_id`` (rank by make, model, model_id — the
+embedding-table index that must never change) over the accepted (validated,
+non-duplicate, attributed) set and writes ``manifest.parquet`` (final) plus
 ``rejected.parquet``.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Callable
 
 import pandas as pd
 
-from . import manifest, select
-from .config import Settings
-from .manifest import (
-    ALL_COLUMNS,
+from openamp.core import manifest
+from openamp.core.config import Config
+from openamp.core.manifest import (
     FINAL_COLUMNS,
-    STATUS_SELECTED,
     STATUS_VALIDATED,
 )
 
-log = logging.getLogger("t3k.finalize")
+log = logging.getLogger("openamp.finalize")
 
 
 def _s(value) -> str:
@@ -39,8 +35,8 @@ def _is_complete(row: pd.Series) -> bool:
     License is recorded verbatim but NOT required for acceptance: the TONE3000
     API returns an empty ``license`` for every candidate, and the pipeline only
     records metadata (it never redistributes the capture files). Requiring a
-    license here would reject the entire corpus (spec §7 permits proceeding
-    without it); see the missing-license note in docs/phase1-spec.md §7.
+    license here would reject the entire corpus; see the missing-license note in
+    docs/history/design-01-acquisition.md.
     """
     def ok(v) -> bool:
         s = _s(v).lower()
@@ -55,41 +51,19 @@ def _final_pool(df: pd.DataFrame) -> pd.Index:
 
 
 def assign_device_ids(df: pd.DataFrame, index: pd.Index) -> pd.DataFrame:
-    """Assign stable, zero-padded device_ids over ``index`` (spec §5.7)."""
+    """Assign stable device_ids over ``index`` (rank by make, model, model_id)."""
     sub = df.loc[index].copy()
     sub["_mk"] = sub["make"].astype(str)
     sub["_md"] = sub["model"].astype(str)
     sub["_id"] = sub["model_id"].astype(str)
     order = sub.sort_values(["_mk", "_md", "_id"]).index
-    width = max(4, len(str(max(len(order) - 1, 0))))
     for rank, i in enumerate(order):
         df.at[i, "device_id"] = int(rank)
-        df.at[i, "device_id_str"] = str(rank).zfill(width)
     return df
 
 
-def finalize(df: pd.DataFrame, settings: Settings, *,
-             candidates: pd.DataFrame | None = None,
-             top_up_fn: Callable[[pd.DataFrame], pd.DataFrame] | None = None,
-             max_rounds: int = 3) -> tuple[pd.DataFrame, pd.DataFrame]:
+def finalize(df: pd.DataFrame, settings: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = manifest.ensure_schema(df).reset_index(drop=True)
-    target = settings.final_target
-
-    # --- Optional top-up loop (spec §5.7) -------------------------------------
-    rounds = 0
-    while len(_final_pool(df)) < target and top_up_fn is not None and candidates is not None \
-            and rounds < max_rounds:
-        need = target - len(_final_pool(df))
-        used_ids = set(df["model_id"].dropna().tolist())
-        extra = select.select(candidates, settings,
-                              target=int(need * 1.3) + 1, exclude_ids=used_ids)
-        if extra.empty:
-            log.info("no more replacement candidates available")
-            break
-        extra["status"] = STATUS_SELECTED
-        df = manifest.ensure_schema(pd.concat([df, extra], ignore_index=True))
-        df = top_up_fn(df)  # runs download -> validate -> dedup on the new rows
-        rounds += 1
 
     # --- Assign device_ids over the accepted set ------------------------------
     final_index = _final_pool(df)

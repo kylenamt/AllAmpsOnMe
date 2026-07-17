@@ -1,4 +1,4 @@
-"""Stage: `t3k select` — deterministic diversity selection of ~430 (spec §5.3).
+"""Stage: `openamp select` — deterministic diversity selection of ~430 (spec §5.3).
 
 Hard filters -> caps (per tone/creator/make-model) -> gain-style minimums ->
 brand round-robin fill. Fully deterministic given the same candidates + seed, so
@@ -8,18 +8,18 @@ re-running yields the identical selection.
 from __future__ import annotations
 
 import logging
-import math
 import random
-from collections import Counter, defaultdict
 
 import pandas as pd
 
-from . import manifest, normalize
-from .config import Settings
-from .constants import GAIN_CLEAN, GAIN_CRUNCH, GAIN_HIGH
-from .manifest import ALL_COLUMNS, STATUS_SELECTED
+from openamp.core import manifest
+from openamp.core.selection import two_phase_select
+from . import normalize
+from openamp.core.config import Config
+from .catalog import GAIN_CLEAN, GAIN_CRUNCH, GAIN_HIGH
+from openamp.core.manifest import ALL_COLUMNS, STATUS_SELECTED
 
-log = logging.getLogger("t3k.select")
+log = logging.getLogger("openamp.select")
 
 # Caps (spec §5.3.2).
 MAX_PER_TONE = 2
@@ -40,20 +40,6 @@ NO_USE_LICENSE_KEYWORDS = (
 def _license_ok(license_text: str) -> bool:
     t = (license_text or "").strip().lower()
     return not any(kw in t for kw in NO_USE_LICENSE_KEYWORDS)
-
-
-def _caps_ok(row: dict, tone_c: Counter, creator_c: Counter, mm_c: Counter) -> bool:
-    return (
-        tone_c[row["tone_id"]] < MAX_PER_TONE
-        and creator_c[row["creator_id"]] < MAX_PER_CREATOR
-        and mm_c[(row["make"], row["model"])] < MAX_PER_MAKEMODEL
-    )
-
-
-def _apply_caps(row: dict, tone_c: Counter, creator_c: Counter, mm_c: Counter) -> None:
-    tone_c[row["tone_id"]] += 1
-    creator_c[row["creator_id"]] += 1
-    mm_c[(row["make"], row["model"])] += 1
 
 
 def _eligible(df: pd.DataFrame, exclude_ids: set | None = None) -> pd.DataFrame:
@@ -84,48 +70,7 @@ def _eligible(df: pd.DataFrame, exclude_ids: set | None = None) -> pd.DataFrame:
     return pd.DataFrame(rows) if rows else df.iloc[0:0]
 
 
-def _pool_by_make(rows: list[dict]) -> dict[str, list[dict]]:
-    """Group rows by make, each queue ordered best-first (downloads desc)."""
-    pools: dict[str, list[dict]] = defaultdict(list)
-    for row in rows:
-        pools[row["make"]].append(row)
-    for make in pools:
-        pools[make].sort(key=lambda r: (-int(r.get("downloads") or 0), str(r.get("model_id"))))
-    return pools
-
-
-def _round_robin(pools: dict[str, list[dict]], need: int, chosen_ids: set,
-                 tone_c: Counter, creator_c: Counter, mm_c: Counter,
-                 make_order: list[str]) -> list[dict]:
-    """Greedy round-robin across makes, respecting caps. Consumes ``pools``."""
-    picked: list[dict] = []
-    while need > 0:
-        progressed = False
-        for make in make_order:
-            queue = pools.get(make)
-            if not queue:
-                continue
-            # Pop until we find a usable candidate for this make this round.
-            while queue:
-                cand = queue.pop(0)
-                if cand["model_id"] in chosen_ids:
-                    continue
-                if not _caps_ok(cand, tone_c, creator_c, mm_c):
-                    continue  # caps only tighten -> safe to drop permanently
-                _apply_caps(cand, tone_c, creator_c, mm_c)
-                chosen_ids.add(cand["model_id"])
-                picked.append(cand)
-                need -= 1
-                progressed = True
-                break
-            if need <= 0:
-                break
-        if not progressed:
-            break
-    return picked
-
-
-def select(candidates: pd.DataFrame, settings: Settings, *,
+def select(candidates: pd.DataFrame, settings: Config, *,
            target: int | None = None, seed: int | None = None,
            exclude_ids: set | None = None) -> pd.DataFrame:
     target = target or settings.select_target
@@ -139,30 +84,14 @@ def select(candidates: pd.DataFrame, settings: Settings, *,
 
     rows = eligible.to_dict("records")
     # Deterministic base order; seed only nudges equal-download ties.
+    order = lambda r: (-int(r.get("downloads") or 0), str(r.get("model_id")))
     rng.shuffle(rows)
-    rows.sort(key=lambda r: (-int(r.get("downloads") or 0), str(r.get("model_id"))))
+    rows.sort(key=order)
 
-    tone_c: Counter = Counter()
-    creator_c: Counter = Counter()
-    mm_c: Counter = Counter()
-    chosen_ids: set = set()
-    selected: list[dict] = []
-
-    make_order = sorted({r["make"] for r in rows})
-
-    # Phase A: guarantee each known gain bucket reaches its minimum share.
-    per_bucket_min = math.ceil(BUCKET_MIN_FRACTION * target)
-    for bucket in KNOWN_BUCKETS:
-        bucket_rows = [r for r in rows if r.get("gain_bucket") == bucket and r["model_id"] not in chosen_ids]
-        pools = _pool_by_make(bucket_rows)
-        need = min(per_bucket_min, max(0, target - len(selected)))
-        selected += _round_robin(pools, need, chosen_ids, tone_c, creator_c, mm_c, make_order)
-
-    # Phase B: fill the remainder via brand round-robin over everything left.
-    remaining = [r for r in rows if r["model_id"] not in chosen_ids]
-    pools = _pool_by_make(remaining)
-    selected += _round_robin(pools, target - len(selected), chosen_ids,
-                             tone_c, creator_c, mm_c, make_order)
+    selected = two_phase_select(
+        rows, target, caps=(MAX_PER_TONE, MAX_PER_CREATOR, MAX_PER_MAKEMODEL),
+        min_fraction=BUCKET_MIN_FRACTION, known_buckets=KNOWN_BUCKETS,
+        id_of=lambda r: r["model_id"], sort_key=order)
 
     out = manifest.ensure_schema(pd.DataFrame(selected))
     out["status"] = STATUS_SELECTED

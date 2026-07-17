@@ -1,8 +1,9 @@
 import pandas as pd
 from conftest import make_candidate
 
-from t3k import finalize, manifest
-from t3k.manifest import (
+from openamp.core import manifest
+from openamp.acquire import finalize
+from openamp.core.manifest import (
     STATUS_DUPLICATE,
     STATUS_REJECTED,
     STATUS_VALIDATED,
@@ -25,7 +26,7 @@ def test_finalize_assigns_stable_device_ids(settings):
         _validated(2, "fender", "twin"),
         # excluded rows:
         _validated(4, "mesa", "recto", status=STATUS_DUPLICATE),
-        _validated(5, "orange", "or120", license=""),   # incomplete -> rejected
+        _validated(5, "orange", "or120", creator=""),   # incomplete attribution -> rejected
         _validated(6, "peavey", "6505", status=STATUS_REJECTED),
     ]
     df = manifest.ensure_schema(pd.DataFrame(rows))

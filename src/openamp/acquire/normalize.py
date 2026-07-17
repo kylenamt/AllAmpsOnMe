@@ -14,7 +14,7 @@ import json
 import re
 from typing import Any, Iterable
 
-from .constants import (
+from .catalog import (
     AMP_GEAR_VALUES,
     EXCLUDE_KEYWORDS,
     GAIN_CLEAN,
@@ -24,7 +24,6 @@ from .constants import (
     GAIN_UNKNOWN,
     MAKE_ALIASES,
     MODEL_TO_MAKE,
-    NAM_FORMAT_VALUES,
 )
 
 _WS = re.compile(r"\s+")
@@ -70,11 +69,6 @@ def _norm(s: str) -> str:
 # --- classification helpers -----------------------------------------------------
 def is_amp_gear(gear: Any) -> bool:
     return _norm(text(gear)) in AMP_GEAR_VALUES
-
-
-def is_nam_format(fmt: Any) -> bool:
-    t = _norm(text(fmt))
-    return t in NAM_FORMAT_VALUES if t else True  # absent format -> don't exclude here
 
 
 def map_architecture(value: Any) -> str | None:

@@ -1,8 +1,10 @@
 import numpy as np
 import pandas as pd
 
-from t3k import dedup, manifest, probe as probe_mod
-from t3k.manifest import STATUS_DUPLICATE, STATUS_VALIDATED
+from openamp.dsp import audio as probe_mod
+from openamp.core import manifest
+from openamp.acquire import dedup
+from openamp.core.manifest import STATUS_DUPLICATE, STATUS_VALIDATED
 
 
 def _save_probe(settings, name, arr):

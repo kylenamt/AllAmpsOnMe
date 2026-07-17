@@ -1,73 +1,40 @@
-"""Stage: `t3k download` — resumable, checksummed model downloads (spec §5.4).
+"""Stage: resumable, checksummed model downloads.
 
 Downloads each selected capture's ``.nam`` to
 ``data/captures/{tone_id}/{model_id}.nam`` with Bearer auth. Skips files already
-present with a matching recorded hash. On a permanent A2 failure it falls back to
-the same tone's A1 model, flagging ``architecture_fallback``.
+present with a matching recorded hash. Transient failures (429/5xx/network) are
+retried with backoff inside the client; on a permanent A2 failure it falls back
+to the same tone's A1 model, flagging ``architecture_fallback``.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
-from . import manifest, normalize
+from openamp.core import manifest
+from openamp.core.util import sha256_file, utc_now
+from . import normalize
 from .client import T3KClient
-from .config import Settings
-from .manifest import (
+from openamp.core.config import Config
+from openamp.core.manifest import (
     STATUS_DOWNLOAD_FAILED,
     STATUS_DOWNLOADED,
     STATUS_SELECTED,
 )
 
-log = logging.getLogger("t3k.download")
+log = logging.getLogger("openamp.download")
 
-MAX_RETRIES = 5
 FLUSH_EVERY = 20
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _dest_path(settings: Settings, tone_id, model_id) -> Path:
+def _dest_path(settings: Config, tone_id, model_id) -> Path:
     return settings.captures_dir / str(tone_id) / f"{model_id}.nam"
 
 
-def _sha256_file(path: Path) -> tuple[str, int]:
-    sha = hashlib.sha256()
-    n = 0
-    with Path(path).open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 16), b""):
-            sha.update(chunk)
-            n += len(chunk)
-    return sha.hexdigest(), n
-
-
-def _download_with_retries(client: T3KClient, model_url: str, dest: Path,
-                           max_retries: int = MAX_RETRIES,
-                           sleep_fn=time.sleep) -> tuple[str, int]:
-    last: Exception | None = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            return client.download_model(model_url, dest)
-        except Exception as exc:  # includes APIError; client already backs off on 5xx/429
-            last = exc
-            log.warning("download attempt %d/%d failed for %s: %s",
-                        attempt, max_retries, dest.name, exc)
-            if attempt < max_retries:
-                sleep_fn(min(2 ** attempt, 30))
-    assert last is not None
-    raise last
-
-
-def _try_a1_fallback(client: T3KClient, row: dict, settings: Settings,
-                     sleep_fn=time.sleep) -> dict | None:
+def _try_a1_fallback(client: T3KClient, row: dict, settings: Config) -> dict | None:
     """Attempt the tone's A1 sibling as a substitute for a failed A2 model."""
     if row.get("architecture") != "A2":
         return None
@@ -86,7 +53,7 @@ def _try_a1_fallback(client: T3KClient, row: dict, settings: Settings,
             continue
         dest = _dest_path(settings, row["tone_id"], model_id)
         try:
-            sha, nbytes = _download_with_retries(client, model_url, dest, sleep_fn=sleep_fn)
+            sha, nbytes = client.download_model(model_url, dest)
         except Exception:
             continue
         return {
@@ -98,14 +65,14 @@ def _try_a1_fallback(client: T3KClient, row: dict, settings: Settings,
             "file_path": str(dest),
             "sha256": sha,
             "file_bytes": nbytes,
-            "downloaded_at": _now(),
+            "downloaded_at": utc_now(),
             "status": STATUS_DOWNLOADED,
         }
     return None
 
 
-def download(client: T3KClient, df: pd.DataFrame, settings: Settings, *,
-             progress: bool = True, sleep_fn=time.sleep) -> pd.DataFrame:
+def download(client: T3KClient, df: pd.DataFrame, settings: Config, *,
+             progress: bool = True) -> pd.DataFrame:
     settings.ensure_dirs()
     df = manifest.ensure_schema(df).reset_index(drop=True)
 
@@ -119,12 +86,12 @@ def download(client: T3KClient, df: pd.DataFrame, settings: Settings, *,
 
         # Resumable: a present file with a matching recorded hash is already done.
         if dest.is_file() and dest.stat().st_size > 0:
-            sha, nbytes = _sha256_file(dest)
+            sha = sha256_file(dest)
             recorded = row.get("sha256")
             if not isinstance(recorded, str) or not recorded or recorded == sha:
                 _set(df, i, status=STATUS_DOWNLOADED, file_path=str(dest),
-                     sha256=sha, file_bytes=nbytes,
-                     downloaded_at=row.get("downloaded_at") or _now())
+                     sha256=sha, file_bytes=dest.stat().st_size,
+                     downloaded_at=row.get("downloaded_at") or utc_now())
                 continue
 
         model_url = str(row.get("model_url") or "").strip()
@@ -133,12 +100,12 @@ def download(client: T3KClient, df: pd.DataFrame, settings: Settings, *,
             continue
 
         try:
-            sha, nbytes = _download_with_retries(client, model_url, dest, sleep_fn=sleep_fn)
+            sha, nbytes = client.download_model(model_url, dest)
             _set(df, i, status=STATUS_DOWNLOADED, file_path=str(dest),
-                 sha256=sha, file_bytes=nbytes, downloaded_at=_now(),
+                 sha256=sha, file_bytes=nbytes, downloaded_at=utc_now(),
                  architecture_fallback=bool(row.get("architecture_fallback") or False))
         except Exception as exc:
-            fallback = _try_a1_fallback(client, row, settings, sleep_fn=sleep_fn)
+            fallback = _try_a1_fallback(client, row, settings)
             if fallback is not None:
                 log.info("A2->A1 fallback succeeded for tone %s", row["tone_id"])
                 _set(df, i, **fallback)

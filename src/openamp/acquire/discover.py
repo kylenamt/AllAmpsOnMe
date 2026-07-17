@@ -1,4 +1,4 @@
-"""Stage: `t3k discover` — build the 2k–4k candidate model pool (spec §5.2).
+"""Stage: `openamp discover` — build the 2k–4k candidate model pool (spec §5.2).
 
 Runs several search passes (multiple sorts + a keyword sweep) to escape ranking
 bias, fetches each tone's models once, normalizes + filters to amp-only NAM
@@ -14,13 +14,14 @@ import logging
 
 import pandas as pd
 
-from . import manifest, normalize
+from openamp.core import manifest
+from . import normalize
 from .client import APIError, T3KClient
-from .config import Settings
-from .constants import AMP_SEARCH_TERMS
-from .manifest import DISCOVERY_COLUMNS
+from openamp.core.config import Config
+from .catalog import AMP_SEARCH_TERMS
+from openamp.core.manifest import DISCOVERY_COLUMNS
 
-log = logging.getLogger("t3k.discover")
+log = logging.getLogger("openamp.discover")
 
 DEFAULT_SORTS = ("trending", "downloads", "newest")
 FLUSH_EVERY = 25  # tones
@@ -50,12 +51,13 @@ def iter_candidate_tones(client: T3KClient, sorts, terms, base, *,
             continue
 
 
-def discover(client: T3KClient, settings: Settings, *,
+def discover(client: T3KClient, settings: Config, *,
              sorts=DEFAULT_SORTS, terms=AMP_SEARCH_TERMS,
-             gears: str = "amp", architecture: int | str = 2,
+             gears: str = "amp", architecture: int | str | None = None,
              max_candidates: int = 4000, max_pages: int = 20, page_size: int = 50,
              resume: bool = True, progress: bool = True) -> pd.DataFrame:
     settings.ensure_dirs()
+    architecture = settings.architecture if architecture is None else architecture
 
     existing = (manifest.read_manifest(settings.candidates_path, DISCOVERY_COLUMNS)
                 if resume else manifest.empty_manifest(DISCOVERY_COLUMNS))
@@ -79,7 +81,10 @@ def discover(client: T3KClient, settings: Settings, *,
             done_tone_ids.add(tid)
             continue
         try:
-            models = client.list_models(tid)
+            # The architecture filter is NOT inherited from the tone search: GET
+            # /models defaults to A1, so omitting it here harvests A1 captures out
+            # of tones the search selected for having A2. Pass it explicitly.
+            models = client.list_models(tid, architecture=architecture)
         except APIError as exc:
             log.warning("list_models(%s) failed: %s", tid, exc)
             continue
@@ -114,7 +119,7 @@ def discover(client: T3KClient, settings: Settings, *,
     return df
 
 
-def _flush(rows: list[dict], settings: Settings) -> pd.DataFrame:
+def _flush(rows: list[dict], settings: Config) -> pd.DataFrame:
     df = manifest.ensure_schema(pd.DataFrame(rows), DISCOVERY_COLUMNS)[DISCOVERY_COLUMNS] \
         if rows else manifest.empty_manifest(DISCOVERY_COLUMNS)
     manifest.write_manifest(df, settings.candidates_path)

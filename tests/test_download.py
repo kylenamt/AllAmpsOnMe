@@ -5,9 +5,9 @@ import pandas as pd
 
 from conftest import make_candidate
 
-from t3k import download as dl
-from t3k import manifest
-from t3k.manifest import STATUS_DOWNLOADED, STATUS_SELECTED
+from openamp.acquire import download as dl
+from openamp.core import manifest
+from openamp.core.manifest import STATUS_DOWNLOADED, STATUS_SELECTED
 
 
 class FakeClient:
@@ -36,7 +36,7 @@ def _df(rows):
 def test_download_success(settings):
     df = _df([make_candidate(tone_id=1, model_id=1, model_url="U1", status=STATUS_SELECTED)])
     client = FakeClient()
-    out = dl.download(client, df, settings, sleep_fn=lambda s: None)
+    out = dl.download(client, df, settings)
     row = out.iloc[0]
     assert row["status"] == STATUS_DOWNLOADED
     assert row["file_bytes"] == len(b"data-U1")
@@ -55,7 +55,7 @@ def test_download_resumable_skips_existing(settings):
         def download_model(self, url, dest):  # must not be called
             raise AssertionError("should not download")
 
-    out = dl.download(NoDownload(), df, settings, sleep_fn=lambda s: None)
+    out = dl.download(NoDownload(), df, settings)
     assert out.iloc[0]["status"] == STATUS_DOWNLOADED
 
 
@@ -67,7 +67,7 @@ def test_download_a2_to_a1_fallback(settings):
         a1_models={(5, 1): [{"id": 51, "name": "A1 sub", "model_url": "A1URL",
                              "architecture_version": 1}]},
     )
-    out = dl.download(client, df, settings, sleep_fn=lambda s: None)
+    out = dl.download(client, df, settings)
     row = out.iloc[0]
     assert row["status"] == STATUS_DOWNLOADED
     assert row["architecture"] == "A1"

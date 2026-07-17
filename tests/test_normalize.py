@@ -1,4 +1,4 @@
-from t3k import normalize
+from openamp.acquire import normalize
 
 
 def test_text_coerces_scalars_and_objects():

@@ -3,7 +3,7 @@ import hashlib
 import os
 import stat
 
-from t3k import auth
+from openamp.acquire import auth
 
 
 def test_generate_pkce_valid_s256():
@@ -16,7 +16,7 @@ def test_generate_pkce_valid_s256():
 
 def test_token_store_roundtrip_and_permissions(tmp_path):
     store = auth.TokenStore(access_token="a", refresh_token="r", expires_at=9e18)
-    path = tmp_path / ".t3k_tokens.json"
+    path = tmp_path / ".openamp_tokens.json"
     store.save(path)
     mode = stat.S_IMODE(os.stat(path).st_mode)
     assert mode == 0o600
@@ -48,10 +48,8 @@ def test_build_authorize_url(settings):
     assert "state=st8" in url
     assert "response_type=code" in url
     # Standard Flow must omit `prompt` so the consent screen (not the tone-picker)
-    # is shown; only an explicit prompt should appear in the URL.
+    # is shown.
     assert "prompt" not in url
-    assert "prompt=select_tone" in auth.build_authorize_url(
-        settings, state="st8", challenge=challenge, prompt="select_tone")
 
 
 def test_exchange_and_refresh(monkeypatch, settings):

@@ -15,12 +15,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import manifest
-from .config import Settings
-from .manifest import STATUS_DUPLICATE, STATUS_VALIDATED
-from .probe import esr
+from openamp.core import manifest
+from openamp.core.config import Config
+from openamp.core.manifest import STATUS_DUPLICATE, STATUS_VALIDATED
+from openamp.dsp.audio import esr
 
-log = logging.getLogger("t3k.dedup")
+log = logging.getLogger("openamp.dedup")
 
 ESR_DUPLICATE_THRESHOLD = 0.01
 
@@ -41,7 +41,7 @@ def _load_probe(path) -> np.ndarray | None:
         return None
 
 
-def dedup(df: pd.DataFrame, settings: Settings, *,
+def dedup(df: pd.DataFrame, settings: Config, *,
           esr_threshold: float = ESR_DUPLICATE_THRESHOLD) -> pd.DataFrame:
     df = manifest.ensure_schema(df).reset_index(drop=True)
     live = df.index[df["status"] == STATUS_VALIDATED].tolist()

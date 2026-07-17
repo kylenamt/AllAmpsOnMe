@@ -4,8 +4,15 @@ import numpy as np
 import pytest
 from conftest import FIXTURES
 
-from t3k import nam_backend, probe as probe_mod, validate
-from t3k.manifest import STATUS_REJECTED, STATUS_VALIDATED
+from openamp.dsp import audio as probe_mod, nam as nam_backend
+from openamp.acquire import validate
+from openamp.core.manifest import STATUS_REJECTED, STATUS_VALIDATED
+
+# The NAM fixtures are not committed (see tests/fixtures/README.md); skip the
+# cases that need them rather than failing on a fresh checkout.
+needs_nam_fixture = pytest.mark.skipif(
+    not (FIXTURES / "tiny_a2.nam").exists(),
+    reason="tests/fixtures/tiny_a2.nam not present (see tests/fixtures/README.md)")
 
 
 def _probe(sr=8000):
@@ -41,6 +48,7 @@ def test_check_output_noise_in_silence():
     assert validate._check_output(out, p) == "noise_in_silence"
 
 
+@needs_nam_fixture
 def test_parse_nam_fixtures():
     a2 = nam_backend.parse_nam(FIXTURES / "tiny_a2.nam")
     assert a2["architecture"] == "WaveNet"
@@ -49,6 +57,7 @@ def test_parse_nam_fixtures():
         nam_backend.parse_nam(FIXTURES / "broken.nam")
 
 
+@needs_nam_fixture
 def test_validate_one_pass_with_injected_renderer(settings):
     dest = settings.captures_dir / "1" / "10.nam"
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -59,11 +68,12 @@ def test_validate_one_pass_with_injected_renderer(settings):
     def good_render(path, signal, sr):
         return np.asarray(signal, dtype=np.float32)
 
-    fields = validate.validate_one(row, settings, good_render, client=None)
+    fields = validate.validate_one(row, settings, good_render)
     assert fields["status"] == STATUS_VALIDATED
     assert (settings.captures_dir / "1" / "10.probe.npy").is_file()
 
 
+@needs_nam_fixture
 def test_validate_one_render_failure_rejects(settings):
     dest = settings.captures_dir / "1" / "11.nam"
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -73,7 +83,7 @@ def test_validate_one_render_failure_rejects(settings):
     def boom(path, signal, sr):
         raise RuntimeError("cannot load")
 
-    fields = validate.validate_one(row, settings, boom, client=None)
+    fields = validate.validate_one(row, settings, boom)
     assert fields["status"] == STATUS_REJECTED
     assert fields["reject_reason"] == "load_or_render_failed"
 

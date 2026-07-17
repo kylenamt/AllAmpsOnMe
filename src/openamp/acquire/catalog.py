@@ -5,6 +5,11 @@ heuristics are easy to audit/tweak.
 
 from __future__ import annotations
 
+# The gain-bucket names are pipeline-wide vocabulary (openamp.core.constants);
+# re-exported here so acquisition code keeps importing them from the catalog
+# next to the keyword heuristic that assigns them.
+from openamp.core.constants import GAIN_CLEAN, GAIN_CRUNCH, GAIN_HIGH, GAIN_UNKNOWN
+
 # --- Discovery keyword passes (spec §5.2) --------------------------------------
 # ~40 brand/model terms to force brand diversity beyond ranking bias.
 AMP_SEARCH_TERMS: list[str] = [
@@ -16,12 +21,7 @@ AMP_SEARCH_TERMS: list[str] = [
     "carvin", "two rock", "revv", "victory", "silvertone", "gibson",
 ]
 
-# --- Gain-style buckets (spec §5.3.3) ------------------------------------------
-GAIN_CLEAN = "clean"
-GAIN_CRUNCH = "crunch"          # crunch / mid-gain
-GAIN_HIGH = "high_gain"
-GAIN_UNKNOWN = "unknown"
-
+# --- Gain-style keyword heuristic (spec §5.3.3) --------------------------------
 # Ordered most-specific-first: high-gain wins over crunch wins over clean when
 # multiple keywords appear (a "high gain lead" is high_gain).
 GAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
@@ -117,6 +117,3 @@ EXCLUDE_KEYWORDS: tuple[str, ...] = (
 # TONE3000 `gear` values we treat as amp-only DI captures. Everything else
 # (full-rig, cab, pedal, ...) is excluded for this phase.
 AMP_GEAR_VALUES: frozenset[str] = frozenset({"amp", "amps", "amplifier"})
-
-# NAM format identifiers.
-NAM_FORMAT_VALUES: frozenset[str] = frozenset({"nam", "neural amp modeler", "neural-amp-modeler"})

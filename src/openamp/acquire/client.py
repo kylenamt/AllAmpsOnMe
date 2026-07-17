@@ -1,30 +1,120 @@
-"""Rate-limited, authenticated HTTP client + typed endpoint wrappers (spec §3).
+"""Rate-limited, authenticated TONE3000 HTTP client.
 
-Every request goes through the :class:`~t3k.ratelimit.TokenBucket` and the
-retry/backoff helper. 401s trigger a single token refresh + retry; 429/5xx are
-retried with exponential backoff honoring ``Retry-After``.
+Every request is spaced by :class:`RateLimiter` and retried with exponential
+backoff honoring ``Retry-After`` (429/5xx, transient network errors, and
+Vercel/WAF 403 blocks). 401s trigger a single token refresh + retry.
 """
 
 from __future__ import annotations
 
 import hashlib
+import random
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator, TypeVar
 
 import requests
 
 from . import auth
-from .config import Settings
-from .ratelimit import (
-    RetryableHTTPError,
-    RetryConfig,
-    TokenBucket,
-    retry_with_backoff,
-)
+from openamp.core.config import Config
+
+T = TypeVar("T")
 
 # Statuses we retry with backoff.
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
+# Transient transport failures worth retrying alongside 429/5xx.
+_NETWORK_ERRORS = (requests.ConnectionError, requests.Timeout,
+                   requests.exceptions.ChunkedEncodingError)
+
+
+# --------------------------------------------------------------------------
+# Rate limiting + retry/backoff
+# --------------------------------------------------------------------------
+
+class RateLimiter:
+    """Spaces calls at least ``60 / rate_per_min`` seconds apart.
+
+    The pipeline is single-threaded, so a plain min-interval sleeper is all
+    the rate cap needs. ``time_fn``/``sleep_fn`` are injectable for tests.
+    """
+
+    def __init__(self, rate_per_min: int,
+                 time_fn: Callable[[], float] = time.monotonic,
+                 sleep_fn: Callable[[float], None] = time.sleep) -> None:
+        if rate_per_min <= 0:
+            raise ValueError("rate_per_min must be positive")
+        self.min_interval = 60.0 / rate_per_min
+        self._time = time_fn
+        self._sleep = sleep_fn
+        self._next_ok = self._time()  # first call passes immediately
+
+    def acquire(self) -> None:
+        now = self._time()
+        if now < self._next_ok:
+            self._sleep(self._next_ok - now)
+            now = self._next_ok
+        self._next_ok = now + self.min_interval
+
+
+@dataclass
+class RetryConfig:
+    max_attempts: int = 5
+    base_delay: float = 1.0       # seconds
+    max_delay: float = 60.0
+    jitter: float = 0.5           # +/- fraction of the computed delay
+
+
+class RetryableHTTPError(Exception):
+    """Signals a transient failure (429/5xx/network) worth retrying.
+
+    Carries an optional ``retry_after`` (seconds) parsed from the response.
+    """
+
+    def __init__(self, status: int, retry_after: float | None = None, message: str = "") -> None:
+        super().__init__(message or f"retryable HTTP {status}")
+        self.status = status
+        self.retry_after = retry_after
+
+
+def compute_delay(attempt: int, cfg: RetryConfig, retry_after: float | None,
+                  rng: random.Random) -> float:
+    """Exponential backoff with jitter; ``Retry-After`` takes precedence."""
+    if retry_after is not None and retry_after >= 0:
+        return min(retry_after, cfg.max_delay)
+    exp = cfg.base_delay * (2 ** (attempt - 1))
+    exp = min(exp, cfg.max_delay)
+    jitter = exp * cfg.jitter
+    return max(0.0, exp + rng.uniform(-jitter, jitter))
+
+
+def retry_with_backoff(fn: Callable[[], T], cfg: RetryConfig | None = None,
+                       sleep_fn: Callable[[float], None] = time.sleep,
+                       rng: random.Random | None = None) -> T:
+    """Call ``fn`` with retries on :class:`RetryableHTTPError`.
+
+    ``fn`` should raise :class:`RetryableHTTPError` for transient failures and
+    any other exception for permanent ones (which propagate immediately).
+    """
+    cfg = cfg or RetryConfig()
+    rng = rng or random.Random()
+    last_exc: RetryableHTTPError | None = None
+    for attempt in range(1, cfg.max_attempts + 1):
+        try:
+            return fn()
+        except RetryableHTTPError as exc:
+            last_exc = exc
+            if attempt >= cfg.max_attempts:
+                break
+            sleep_fn(compute_delay(attempt, cfg, exc.retry_after, rng))
+    assert last_exc is not None
+    raise last_exc
+
+
+# --------------------------------------------------------------------------
+# Client
+# --------------------------------------------------------------------------
 
 def _is_json(resp: requests.Response) -> bool:
     """True if the response advertises a JSON body (checked via Content-Type only,
@@ -50,13 +140,13 @@ class APIError(RuntimeError):
 
 
 class T3KClient:
-    def __init__(self, settings: Settings, token: auth.TokenStore | None = None,
+    def __init__(self, settings: Config, token: auth.TokenStore | None = None,
                  session: requests.Session | None = None,
-                 bucket: TokenBucket | None = None,
+                 limiter: RateLimiter | None = None,
                  retry: RetryConfig | None = None) -> None:
         self.settings = settings
         self.session = session or requests.Session()
-        self.bucket = bucket or TokenBucket(settings.rate_limit_rpm)
+        self.limiter = limiter or RateLimiter(settings.rate_limit_rpm)
         self.retry = retry or RetryConfig()
         self._token = token  # may be None until first authed call
 
@@ -85,10 +175,13 @@ class T3KClient:
         state = {"refreshed": False}
 
         def do() -> requests.Response:
-            self.bucket.acquire()
+            self.limiter.acquire()
             headers = self._token_header() if authed else {}
-            resp = self.session.request(method, url, params=params, headers=headers,
-                                        stream=stream, timeout=timeout)
+            try:
+                resp = self.session.request(method, url, params=params, headers=headers,
+                                            stream=stream, timeout=timeout)
+            except _NETWORK_ERRORS as exc:
+                raise RetryableHTTPError(0, message=f"network error: {exc}") from exc
             if resp.status_code == 401 and authed and not state["refreshed"]:
                 state["refreshed"] = True
                 self._refresh_token()
@@ -119,7 +212,7 @@ class T3KClient:
 
     # --- typed endpoints ------------------------------------------------------
     def get_user(self) -> dict:
-        """GET /user — the authenticated operator's profile (spec §5.1)."""
+        """GET /user — the authenticated operator's profile."""
         return self.get_json("user")
 
     def search_tones(self, *, query: str | None = None, gears: str | None = None,
@@ -151,10 +244,6 @@ class T3KClient:
                 break
             page += 1
 
-    def get_tone(self, tone_id: int | str) -> dict:
-        """GET /tones/{id}."""
-        return self.get_json(f"tones/{tone_id}")
-
     def list_models(self, tone_id: int | str, *, architecture: str | int | None = None,
                     page_size: int = 100, max_pages: int = 20) -> list[dict]:
         """GET /models?tone_id=... — auto-paginated list of Model records."""
@@ -173,29 +262,37 @@ class T3KClient:
             page += 1
         return out
 
-    def get_model(self, model_id: int | str) -> dict:
-        """GET /models/{id}."""
-        return self.get_json(f"models/{model_id}")
-
     def download_model(self, model_url: str, dest: Path,
                        chunk_size: int = 1 << 16) -> tuple[str, int]:
         """Download a model file with Bearer auth. Returns (sha256_hex, n_bytes).
 
         Writes atomically via a ``.part`` file so an interrupted download never
-        leaves a truncated ``.nam`` behind.
+        leaves a truncated ``.nam`` behind. A connection drop mid-stream is
+        retried with backoff (fresh request each attempt).
         """
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(dest.suffix + ".part")
-        sha = hashlib.sha256()
-        n = 0
-        resp = self.request("GET", model_url, stream=True)
-        with tmp.open("wb") as fh:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                if not chunk:
-                    continue
-                fh.write(chunk)
-                sha.update(chunk)
-                n += len(chunk)
+
+        def do() -> tuple[str, int]:
+            sha = hashlib.sha256()
+            n = 0
+            resp = self.request("GET", model_url, stream=True)
+            try:
+                with tmp.open("wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                        if not chunk:
+                            continue
+                        fh.write(chunk)
+                        sha.update(chunk)
+                        n += len(chunk)
+            except _NETWORK_ERRORS as exc:
+                raise RetryableHTTPError(0, message=f"stream interrupted: {exc}") from exc
+            return sha.hexdigest(), n
+
+        try:
+            result = retry_with_backoff(do, self.retry)
+        except RetryableHTTPError as exc:
+            raise APIError(exc.status, str(exc)) from exc
         tmp.replace(dest)
-        return sha.hexdigest(), n
+        return result

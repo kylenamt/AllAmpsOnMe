@@ -6,8 +6,8 @@ Ported from the reference TypeScript client (github.com/tone-3000/api):
                                        &code_challenge&code_challenge_method=S256&state
   token:      POST /oauth/token       grant_type=authorization_code | refresh_token
 
-Tokens are persisted to ``T3K_TOKEN_PATH`` with mode 0600 and auto-refreshed on
-expiry / 401 by :mod:`t3k.client`.
+Tokens are persisted to ``OPENAMP_TOKEN_PATH`` with mode 0600 and auto-refreshed
+on expiry / 401 by :mod:`openamp.acquire.client`.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from pathlib import Path
 
 import requests
 
-from .config import Settings
+from openamp.core.config import Config
 
 # Expiry safety margin: refresh if fewer than this many seconds remain.
 EXPIRY_SKEW_SECONDS = 60
@@ -102,12 +102,10 @@ class TokenStore:
 
 
 # --- URL / endpoint helpers -----------------------------------------------------
-def build_authorize_url(settings: Settings, state: str, challenge: str,
-                        prompt: str | None = None, extra: dict | None = None) -> str:
+def build_authorize_url(settings: Config, state: str, challenge: str) -> str:
     # The "Standard Flow" (full programmatic access) omits ``prompt`` entirely and
-    # shows a consent/authorize screen. Passing ``prompt=select_tone`` instead would
-    # trigger the tone-picker flow, which has nothing to confirm. Only include
-    # ``prompt`` when a caller explicitly asks for a non-standard flow.
+    # shows a consent/authorize screen (``prompt=select_tone`` would instead trigger
+    # the tone-picker flow, which has nothing to confirm).
     params = {
         "client_id": settings.publishable_key,
         "redirect_uri": settings.redirect_uri,
@@ -116,14 +114,10 @@ def build_authorize_url(settings: Settings, state: str, challenge: str,
         "code_challenge_method": "S256",
         "state": state,
     }
-    if prompt is not None:
-        params["prompt"] = prompt
-    if extra:
-        params.update({k: v for k, v in extra.items() if v is not None})
     return f"{settings.base_url}/oauth/authorize?{urllib.parse.urlencode(params)}"
 
 
-def _post_token(settings: Settings, data: dict) -> dict:
+def _post_token(settings: Config, data: dict) -> dict:
     resp = requests.post(
         f"{settings.base_url}/oauth/token",
         data=data,
@@ -135,7 +129,7 @@ def _post_token(settings: Settings, data: dict) -> dict:
     return resp.json()
 
 
-def exchange_code(settings: Settings, code: str, verifier: str) -> TokenStore:
+def exchange_code(settings: Config, code: str, verifier: str) -> TokenStore:
     payload = _post_token(settings, {
         "grant_type": "authorization_code",
         "code": code,
@@ -146,7 +140,7 @@ def exchange_code(settings: Settings, code: str, verifier: str) -> TokenStore:
     return TokenStore.from_token_response(payload)
 
 
-def refresh_tokens(settings: Settings, refresh_token: str) -> TokenStore:
+def refresh_tokens(settings: Config, refresh_token: str) -> TokenStore:
     payload = _post_token(settings, {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -210,7 +204,7 @@ def _parse_pasted_redirect(url: str) -> dict:
 
 
 # --- Top-level flow -------------------------------------------------------------
-def run_standard_flow(settings: Settings, *, headless: bool = False,
+def run_standard_flow(settings: Config, *, headless: bool = False,
                       open_browser: bool = True) -> TokenStore:
     """Run the full standard flow and persist tokens. Returns the store."""
     if not settings.publishable_key:
@@ -248,14 +242,14 @@ def run_standard_flow(settings: Settings, *, headless: bool = False,
     return store
 
 
-def load_or_refresh(settings: Settings) -> TokenStore:
+def load_or_refresh(settings: Config) -> TokenStore:
     """Load persisted tokens, refreshing if expired. Raises if no tokens exist."""
     store = TokenStore.load(settings.token_path)
     if store is None:
-        raise AuthError("Not authenticated. Run `t3k auth` first.")
+        raise AuthError("Not authenticated. Run `openamp auth` first.")
     if store.is_expired():
         if not store.refresh_token:
-            raise AuthError("Access token expired and no refresh token. Re-run `t3k auth`.")
+            raise AuthError("Access token expired and no refresh token. Re-run `openamp auth`.")
         store = refresh_tokens(settings, store.refresh_token)
         store.save(settings.token_path)
     return store
