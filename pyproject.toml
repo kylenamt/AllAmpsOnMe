@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "t3k"
-version = "0.1.0"
-description = "Phase 1 — TONE3000 amp-capture acquisition for the Open-Amp3000 project"
+name = "openamp"
+version = "0.2.0"
+description = "Open-Amp3000: TONE3000 capture acquisition, clean-corpus rendering, and a one-to-many FiLM-TCN amp emulator"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -17,67 +17,33 @@ dependencies = [
     "soundfile==0.12.1",
     "click==8.1.7",
     "tqdm==4.67.1",
-    "python-dotenv==1.0.1",
+    "pyyaml==6.0.2",
+    # Blackwell (RTX 50-series, sm_120) needs the CUDA 12.8 build. The cu124
+    # wheels torch shipped through 2.7 top out at sm_90 and die on the first
+    # kernel launch. torch >=2.8 defaults to cu128 on PyPI, so a plain install
+    # is enough -- no custom index URL.
+    "torch==2.9.1",
+    "torchaudio==2.9.1",
+    # 0.13 is the floor for A2: it is the first release whose WaveNet parses the
+    # A2 layer schema (FiLM/bottleneck/1x1/per-layer kernel sizes). Older releases
+    # cannot build an A2 capture at all. See src/openamp/dsp/nam.py.
+    "neural-amp-modeler==0.13.0",
+    "pytorch-lightning==2.5.2",
+    "auraloss==0.3.0",              # multi-resolution STFT loss for amp emulation
+    "matplotlib==3.9.2",
 ]
 
 [project.optional-dependencies]
-# Heavy NAM/torch validation stack, kept optional so metadata-only stages
-# (auth/discover/select) install fast.
-validate = [
-    "neural-amp-modeler==0.11.0",
-    "torch==2.5.1",
-    "pytorch-lightning==2.5.2",
-    # NAM 0.11 imports `pkg_resources`, which setuptools removed in 81+. Cap
-    # below that or every capture fails validation as `load_or_render_failed`.
-    "setuptools<81",
-]
-# Phase 2 clean-corpus + GPU rendering stack (spec §2). Kept optional so the
-# Phase 1 metadata stages install fast. Avoids pytorch-lightning 2.6.2/2.6.3.
-phase2 = [
-    "pyyaml==6.0.2",
-    "tqdm==4.67.1",
-    "soundfile==0.12.1",
-    "torch==2.5.1",
-    "torchaudio==2.5.1",
-    "neural-amp-modeler==0.11.0",
-    "pytorch-lightning==2.5.2",
-    "typer==0.15.1",
-    "matplotlib==3.9.2",
-    # NAM 0.11 imports `pkg_resources` (removed from setuptools 81+); see [validate].
-    "setuptools<81",
-]
 dev = ["pytest==8.3.4"]
-# Phase 3 contrastive-encoder training + frozen-probe evaluation (spec §5). Reuses
-# the Phase 2 torch/soundfile stack; adds probe/baseline/viz deps.
-phase3 = [
-    "pyyaml==6.0.2",
-    "torch==2.5.1",
-    "torchaudio==2.5.1",
-    "soundfile==0.12.1",
-    "scikit-learn==1.5.2",
-    "umap-learn==0.5.7",
-    "librosa==0.10.2.post1",
-    "matplotlib==3.9.2",
-    "tqdm==4.67.1",
-]
 
 [project.scripts]
-t3k = "t3k.cli:main"
-oa3k = "data.cli:app"
-# Phase 3 entrypoints (also runnable as `python -m train.contrastive` etc.).
-oa3k-train = "train.contrastive:main"
-oa3k-embed = "eval.embed:main"
-oa3k-eval = "eval.probes:main"
-oa3k-report = "eval.report:main"
+openamp = "openamp.cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-t3k = ["assets/*.wav"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

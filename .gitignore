@@ -217,7 +217,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# --- Open-Amp3000 Phase 1 (TONE3000 acquisition) ---
+# --- Open-Amp3000 data (captures, corpus, renders) ---
 # Never commit downloaded captures, probe outputs, tokens, or the publishable key.
 # Ignore everything under data/ EXCEPT the folder skeleton (kept via .gitkeep),
 # so the expected layout exists on a fresh checkout while contents stay private.
@@ -228,22 +228,16 @@ __marimo__/
 !/data/manifests/.gitkeep
 *.nam
 *.probe.npy
-.t3k_tokens.json
+.openamp_tokens.json
 .env
 
-# --- Open-Amp3000 Phase 2 (rendering pipeline) ---
+# --- Open-Amp3000 results (reports, checkpoints, figures) ---
 # Renders + clean corpus are derived from license-restricted captures -> keep
-# private (they live under /data/, already ignored above). QA WAV/spectrogram
-# exports derive from renders too; ignore them but keep the metadata-only report.
+# private (they live under /data/, already ignored above). Track only the
+# metadata-only markdown reports; checkpoints, training logs, and QA exports stay
+# private (derived from license-restricted renders).
 /results/**
 !/results/
-!/results/phase2_report.md
-
-# --- Open-Amp3000 Phase 3 (contrastive encoder) ---
-# Track the metadata-only report + its small figures. Checkpoints, training logs,
-# the crop cache (local /tmp), and embedding dumps stay private (derived from the
-# license-restricted renders / large external eval audio downloaded to /data/raw).
-!/results/phase3_report.md
-!/results/phase3/
-!/results/phase3/figures/
-!/results/phase3/figures/*.png
+!/results/render_report.md
+.claude
+*.out
