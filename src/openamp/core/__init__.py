@@ -1,0 +1,1 @@
+"""openamp.core subpackage."""

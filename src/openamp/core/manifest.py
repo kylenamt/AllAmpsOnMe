@@ -1,8 +1,10 @@
-"""Manifest schema, parquet I/O, and status transitions (spec §5, §6).
+"""Every manifest schema in the pipeline + atomic parquet I/O.
 
-A single DataFrame carries a capture from discovery through finalize. Each stage
-reads it, mutates ``status`` (+ stage-specific columns), and writes it back
-atomically. Re-running a stage is a no-op for rows already past that stage.
+Acquisition: a single DataFrame carries a capture from discovery through
+finalize. Each stage reads it, mutates ``status`` (+ stage-specific columns),
+and writes it back atomically; re-running a stage is a no-op for rows already
+past that stage. Corpus/render manifests (further below) follow the same
+pattern, one row per processed file or per (device, file) render.
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 
-# --- Status vocabulary (spec §5) ------------------------------------------------
+# --- Acquisition status vocabulary ----------------------------------------------
 STATUS_CANDIDATE = "candidate"
 STATUS_SELECTED = "selected"
 STATUS_DOWNLOADED = "downloaded"
@@ -79,20 +81,33 @@ def write_manifest(df: pd.DataFrame, path: Path) -> None:
     tmp.replace(path)
 
 
-def set_status(df: pd.DataFrame, mask, status: str, **fields) -> pd.DataFrame:
-    """Set ``status`` (+ optional extra columns) for rows selected by ``mask``.
-
-    Mutates and returns ``df`` for convenience.
-    """
-    df.loc[mask, "status"] = status
-    for key, value in fields.items():
-        if key not in df.columns:
-            df[key] = pd.NA
-        df.loc[mask, key] = value
-    return df
-
-
 def counts_by_status(df: pd.DataFrame) -> dict[str, int]:
     if "status" not in df.columns or df.empty:
         return {}
     return df["status"].value_counts(dropna=False).to_dict()
+
+
+# --- corpus.parquet: one row per processed clean source file --------------------
+CORPUS_COLUMNS = [
+    "file_id", "split", "source", "orig_path", "duration_s",
+    "applied_gain_db", "sha256",
+]
+
+# --- clips.parquet: the fixed 2 s clip grid --------------------------------------
+CLIPS_COLUMNS = [
+    "clip_id", "file_id", "split", "start_sample", "num_samples",
+]
+
+# --- renders.parquet: one row per (device, file) render --------------------------
+RENDERS_COLUMNS = [
+    "device_id", "file_id", "split", "path", "output_scale",
+    "out_rms_db", "out_peak_db", "render_sha256", "rendered_at",
+    "nam_sha256", "status", "resampled", "fail_reason",
+]
+
+# --- devices_final.parquet: verified devices + render stats ----------------------
+DEVICES_FINAL_COLUMNS = [
+    "device_id", "tone_id", "model_id", "make", "model", "gain_bucket",
+    "architecture", "sample_rate", "file_path", "license", "creator",
+    "n_files", "out_peak_db", "output_scale", "status",
+]

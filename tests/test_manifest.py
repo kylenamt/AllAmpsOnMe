@@ -1,6 +1,6 @@
 import pandas as pd
 
-from t3k import manifest
+from openamp.core import manifest
 
 
 def test_read_missing_returns_empty_schema(tmp_path):
@@ -30,11 +30,10 @@ def test_ensure_schema_adds_missing_columns():
         assert col in out.columns
 
 
-def test_set_status_and_counts():
+def test_counts_by_status():
     df = manifest.ensure_schema(pd.DataFrame([{"model_id": i} for i in range(4)]))
-    manifest.set_status(df, df["model_id"] < 2, manifest.STATUS_DOWNLOADED, sha256="abc")
-    manifest.set_status(df, df["model_id"] >= 2, manifest.STATUS_REJECTED)
+    df.loc[df["model_id"] < 2, "status"] = manifest.STATUS_DOWNLOADED
+    df.loc[df["model_id"] >= 2, "status"] = manifest.STATUS_REJECTED
     counts = manifest.counts_by_status(df)
     assert counts[manifest.STATUS_DOWNLOADED] == 2
     assert counts[manifest.STATUS_REJECTED] == 2
-    assert (df.loc[df["model_id"] < 2, "sha256"] == "abc").all()

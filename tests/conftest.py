@@ -1,7 +1,7 @@
 """Shared pytest fixtures + helpers.
 
 Adds ``src/`` to sys.path so tests run without an editable install, and provides
-factories for Settings and synthetic candidate frames.
+factories for a :class:`Config` and synthetic candidate frames.
 """
 
 from __future__ import annotations
@@ -19,22 +19,23 @@ if str(_SRC) not in sys.path:
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
-from t3k.config import Settings  # noqa: E402
+from openamp.core.config import Config  # noqa: E402
 
 
 @pytest.fixture
-def settings(tmp_path) -> Settings:
-    s = Settings(
+def settings(tmp_path) -> Config:
+    cfg = Config(
+        data_dir=tmp_path / "data",
+        results_dir=tmp_path / "results",
         publishable_key="t3k_pub_test",
         base_url="https://www.tone3000.com/api/v1",
         redirect_uri="http://localhost:3001",
-        token_path=tmp_path / ".t3k_tokens.json",
-        data_dir=tmp_path / "data",
+        token_path=tmp_path / ".openamp_tokens.json",
         rate_limit_rpm=100000,   # effectively unthrottled for tests
         seed=1234,
     )
-    s.ensure_dirs()
-    return s
+    cfg.ensure_dirs()
+    return cfg
 
 
 def make_candidate(**over) -> dict:
