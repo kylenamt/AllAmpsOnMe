@@ -1,4 +1,4 @@
-# Open-Amp3000 pipeline configuration. Every tunable lives here; all randomness
+# AllAmpsOnMe pipeline configuration. Every tunable lives here; all randomness
 # derives from `seed` so a run is reproducible. Data paths are NOT here — they
 # derive from OPENAMP_DATA_DIR (default ./data); API access comes from the
 # environment / .env (OPENAMP_API_KEY etc.). See src/openamp/config.py.

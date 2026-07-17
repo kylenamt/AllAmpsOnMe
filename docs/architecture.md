@@ -1,4 +1,4 @@
-# Open-Amp3000 — architecture
+# AllAmpsOnMe — architecture
 
 This document describes the `openamp` package after the purpose-based
 reorganization: what the pipeline does end to end, and the role of every file.
