@@ -1,0 +1,23 @@
+# FiLM-WaveNet: the corpus's own NAM A2 capture topology (23 dilated layers,
+# channels 8, receptive field 6347 ≈ 132 ms), made one-to-many with the same
+# device-embedding FiLM as the TCN runs. Architecture comparison point against
+# paper/embed256/channels32: what does the capture-native topology buy?
+#
+#   openamp emulate --config configs/emulate/wavenet_a2.yaml --overfit           # sanity #1
+#   openamp emulate --config configs/emulate/wavenet_a2.yaml --limit-devices 10  # mini-run
+#   openamp emulate --config configs/emulate/wavenet_a2.yaml                     # full run
+#
+# Training knobs inherit the paper defaults; only arch selection lives here.
+emulate:
+  arch: film_wavenet
+  wn_channels: 8           # A2 full-width; width sweeps = copy file, change number
+  embedding_dim: 256
+  # NAM trains this exact topology at lr 4e-3; the paper default 5e-4 (tuned for
+  # the TCN) starts it far too cold. 2e-3 splits the difference for 405-device
+  # conditioning + MRSTFT; ReduceLROnPlateau walks it down from there.
+  # Manually halved 4e-3 -> 2e-3 at the epoch-15 best (val 0.2825) and resumed.
+  lr: 2.0e-3
+  # bf16 like channels32: fp16 forward overflow NaN-killed two TCN runs, and
+  # fp32 may not fit next to the neighbor's MPS workers on the shared GPU.
+  amp: true
+  amp_dtype: bf16

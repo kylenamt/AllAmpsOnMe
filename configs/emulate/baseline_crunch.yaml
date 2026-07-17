@@ -1,0 +1,4 @@
+# One-to-one baseline (spec §3): paper-default TCN, n_devices=1, on a single
+# crunch-style device (device 0016, Vox AC100 edge-of-breakup).
+emulate:
+  single_device: 16

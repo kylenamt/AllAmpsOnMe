@@ -1,0 +1,4 @@
+# Embedding-dim sweep: 256 (vs paper 64). Other knobs inherit paper defaults.
+emulate:
+  embedding_dim: 256
+  amp: true                # fp16 is ~1.5x faster here; train.py's nan-guard falls back to fp32 on overflow

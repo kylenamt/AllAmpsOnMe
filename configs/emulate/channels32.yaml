@@ -1,0 +1,7 @@
+# Channel-width sweep: 32 (vs paper 16). Other knobs inherit paper defaults.
+emulate:
+  channels: 32
+  # fp16 overflowed at epoch 39 (same NaN mode as paper's epoch 53) and the fp32
+  # fallback OOMs next to the neighbor's ~4.9 GiB MPS workers; bf16 = fp16 memory,
+  # fp32 range.
+  amp_dtype: bf16

@@ -2,8 +2,8 @@ from collections import Counter
 
 from conftest import make_candidates_frame
 
-from t3k import select
-from t3k.select import MAX_PER_CREATOR, MAX_PER_MAKEMODEL, MAX_PER_TONE
+from openamp.acquire import select
+from openamp.acquire.select import MAX_PER_CREATOR, MAX_PER_MAKEMODEL, MAX_PER_TONE
 
 
 def test_selection_respects_caps(settings):

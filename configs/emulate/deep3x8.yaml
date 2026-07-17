@@ -1,0 +1,4 @@
+# Deeper variant: 3 blocks x 8 layers (vs paper 2 x 8) -> longer receptive field.
+# Other knobs inherit paper defaults.
+emulate:
+  blocks: 3

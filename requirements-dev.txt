@@ -1,4 +1,0 @@
--r requirements.txt
-
-# Test / dev tooling
-pytest==8.3.4

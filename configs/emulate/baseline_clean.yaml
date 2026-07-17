@@ -1,0 +1,5 @@
+# One-to-one baseline (spec §3): paper-default TCN, n_devices=1, trained on a
+# single clean-style device (device 0038, Ampeg V-4B). Reference for the
+# one-to-many gap. Other knobs inherit paper defaults.
+emulate:
+  single_device: 38
