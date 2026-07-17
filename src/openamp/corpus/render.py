@@ -1,4 +1,4 @@
-"""Stage: ``oa3k render run`` — render the clean corpus through every device (spec §4).
+"""Stage: ``openamp render`` — render the clean corpus through every device (spec §4).
 
 Rendering is **whole-file, then sliced** — never per-clip — so there are no
 clip-boundary transients. The core is :func:`chunked_forward`, a pure driver that
@@ -6,7 +6,7 @@ streams a file through a causal model in chunks while carrying R samples of
 left-context and discarding the warmup region, giving output **bit-identical to a
 single full-file forward pass**. That function is unit-tested against a numpy FIR
 stand-in; the surrounding :func:`run` job (GPU load, disk checks, manifest
-bookkeeping, resume) uses the real NAM adapter in :mod:`data.nam_render`.
+bookkeeping, resume) uses the real NAM adapter in :mod:`openamp.nam`.
 
 Model contract for :func:`chunked_forward`: ``model_fn`` is **causal with receptive
 field ≤ R** and returns a **right-aligned** mono float32 array (its last output
@@ -28,14 +28,15 @@ from typing import Callable, Iterable, Iterator, Sequence
 import numpy as np
 import pandas as pd
 
-from t3k.probe import peak_dbfs, rms_dbfs
+from openamp.dsp.audio import peak_dbfs, rms_dbfs
 
-from . import audio_io
-from . import constants as C
-from . import manifests
-from .config import Phase2Config
+from openamp.dsp import audio as audio_io
+from openamp.core import constants as C
+from openamp.core import manifest as manifests
+from openamp.core.config import Config
+from openamp.core.util import sha256_file, utc_now
 
-log = logging.getLogger("oa3k.render")
+log = logging.getLogger("openamp.render")
 
 ModelFn = Callable[[np.ndarray], np.ndarray]
 
@@ -131,7 +132,7 @@ def estimate_bytes(total_clean_seconds: float, n_devices: int) -> int:
     return int(total_clean_seconds * n_devices * FLAC_BYTES_PER_SECOND)
 
 
-def device_is_done(config: Phase2Config, device_id: int, file_ids: Iterable[str],
+def device_is_done(config: Config, device_id: int, file_ids: Iterable[str],
                    renders_df: pd.DataFrame) -> bool:
     """A device is done when every corpus file has an ``render_ok`` row and its
     render exists on disk (spec §4.3 — resumable/idempotent)."""
@@ -150,28 +151,28 @@ def device_is_done(config: Phase2Config, device_id: int, file_ids: Iterable[str]
 
 
 # --- Job orchestration (needs GPU + NAM + data; documented, not run in CI) ------
-def run(config: Phase2Config, *, devices: str | None = None, dry_run: bool = False,
+def run(config: Config, *, devices: str | None = None, dry_run: bool = False,
         device: str = "cuda", flush_every: int = 10,
         io_workers: int = 0) -> pd.DataFrame:
     """Render every selected device's files. Resumable and idempotent.
 
     ``io_workers`` sizes the CPU/disk FLAC pass; ``0`` (or negative) auto-picks
     :data:`DEFAULT_IO_WORKERS`."""
-    from . import nam_render  # local import keeps torch/NAM out of module load
+    from openamp.dsp import nam as nam_render  # local import keeps torch/NAM out of module load
 
     if io_workers <= 0:
         io_workers = DEFAULT_IO_WORKERS
 
     config.ensure_dirs()
-    manifest = manifests.read(config.phase1_manifest_path,
+    manifest = manifests.read_manifest(config.manifest_path,
                               ["device_id", "file_path", "architecture", "sample_rate"])
     if manifest.empty:
         raise RuntimeError(
-            f"Phase 1 manifest not found or empty: {config.phase1_manifest_path}. "
-            "Run Phase 1 (`t3k finalize`) first.")
-    corpus = manifests.read(config.corpus_manifest_path, manifests.CORPUS_COLUMNS)
+            f"Acquisition manifest not found or empty: {config.manifest_path}. "
+            "Run `openamp finalize` first.")
+    corpus = manifests.read_manifest(config.corpus_manifest_path, manifests.CORPUS_COLUMNS)
     if corpus.empty:
-        raise RuntimeError("Empty corpus. Run `oa3k corpus prepare` first.")
+        raise RuntimeError("Empty corpus. Run `openamp corpus` first.")
 
     manifest = manifest.sort_values("device_id").reset_index(drop=True)
     all_ids = [int(d) for d in manifest["device_id"].tolist()]
@@ -182,7 +183,7 @@ def run(config: Phase2Config, *, devices: str | None = None, dry_run: bool = Fal
 
     _check_disk(config, total_clean_seconds, len(selected))
 
-    renders = manifests.read(config.renders_manifest_path, manifests.RENDERS_COLUMNS)
+    renders = manifests.read_manifest(config.renders_manifest_path, manifests.RENDERS_COLUMNS)
     rows: list[dict] = renders.to_dict("records") if not renders.empty else []
 
     for count, device_id in enumerate(selected, start=1):
@@ -207,18 +208,18 @@ def run(config: Phase2Config, *, devices: str | None = None, dry_run: bool = Fal
         rows.extend(new_rows)
 
         if count % flush_every == 0:
-            manifests.write(pd.DataFrame(rows, columns=manifests.RENDERS_COLUMNS),
+            manifests.write_manifest(pd.DataFrame(rows, columns=manifests.RENDERS_COLUMNS),
                             config.renders_manifest_path)
             log.info("rendered %d/%d devices", count, len(selected))
 
     out = pd.DataFrame(rows, columns=manifests.RENDERS_COLUMNS)
-    manifests.write(out, config.renders_manifest_path)
+    manifests.write_manifest(out, config.renders_manifest_path)
     n_failed = int((out["status"] == C.RENDER_FAILED).sum()) if not out.empty else 0
     log.info("render complete: %d devices, %d failed rows", len(selected), n_failed)
     return out
 
 
-def _load_clean_files(config: Phase2Config, corpus: pd.DataFrame) -> list[dict]:
+def _load_clean_files(config: Config, corpus: pd.DataFrame) -> list[dict]:
     files = []
     for r in corpus.itertuples(index=False):
         path = config.clean_split_dir(r.split) / f"{r.file_id}.{config.output_format}"
@@ -252,7 +253,7 @@ def _prefetch(items: Sequence[dict], load_fn: Callable[[dict], object], *,
             yield item, fut.result()
 
 
-def _render_device(config: Phase2Config, device_id: int, nam_path: str,
+def _render_device(config: Config, device_id: int, nam_path: str,
                    clean_files: list[dict], nam_render, device: str,
                    io_workers: int = DEFAULT_IO_WORKERS) -> list[dict]:
     model = nam_render.load_model(nam_path, device=device)
@@ -285,7 +286,7 @@ def _render_device(config: Phase2Config, device_id: int, nam_path: str,
             "device_id": device_id, "file_id": f["file_id"], "split": f["split"],
             "path": str(out_path), "output_scale": round(float(scale), 8),
             "out_rms_db": round(rms_dbfs(y), 3), "out_peak_db": round(peak_dbfs(y), 3),
-            "render_sha256": _sha256(out_path), "rendered_at": _now(),
+            "render_sha256": sha256_file(out_path), "rendered_at": utc_now(),
             "nam_sha256": model.nam_sha256, "status": C.RENDER_OK,
             "resampled": bool(resampled), "fail_reason": pd.NA,
         }
@@ -294,7 +295,7 @@ def _render_device(config: Phase2Config, device_id: int, nam_path: str,
         return list(ex.map(finalize, clean_files))
 
 
-def _render_signal(model, clean: np.ndarray, config: Phase2Config, resampled: bool) -> np.ndarray:
+def _render_signal(model, clean: np.ndarray, config: Config, resampled: bool) -> np.ndarray:
     if not resampled:
         return chunked_forward(model.forward, clean, model.receptive_field, config.chunk_samples)
     # Rare path (spec §4.1.4): resample in -> model rate -> out.
@@ -304,7 +305,7 @@ def _render_signal(model, clean: np.ndarray, config: Phase2Config, resampled: bo
     return audio_io.resample(y, model.sample_rate, config.sample_rate)
 
 
-def _check_disk(config: Phase2Config, total_clean_seconds: float, n_devices: int) -> None:
+def _check_disk(config: Config, total_clean_seconds: float, n_devices: int) -> None:
     need = estimate_bytes(total_clean_seconds, n_devices) * C.DISK_SAFETY_FACTOR
     free = shutil.disk_usage(config.renders_dir).free
     if free < need:
@@ -318,16 +319,8 @@ def _failed_row(device_id: int, f: dict, reason: str) -> dict:
     return {
         "device_id": device_id, "file_id": f["file_id"], "split": f["split"],
         "path": pd.NA, "output_scale": pd.NA, "out_rms_db": pd.NA, "out_peak_db": pd.NA,
-        "render_sha256": pd.NA, "rendered_at": _now(), "nam_sha256": pd.NA,
+        "render_sha256": pd.NA, "rendered_at": utc_now(), "nam_sha256": pd.NA,
         "status": C.RENDER_FAILED, "resampled": pd.NA, "fail_reason": reason[:300],
     }
 
 
-def _sha256(path):
-    from .corpus import sha256_file
-    return sha256_file(path)
-
-
-def _now() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()

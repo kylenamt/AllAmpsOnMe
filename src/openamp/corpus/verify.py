@@ -1,9 +1,9 @@
-"""Stage: ``oa3k render verify`` — completeness + sanity + QA + report (spec §5).
+"""Stage: ``openamp verify`` — completeness + sanity + QA + report (spec §5).
 
 Checks the render manifest and files, then writes the **final device list**
 ``devices_final.parquet`` (devices that fail verification are excluded). Signal
 checks are pure functions (unit-tested with numpy); the wrapper reads audio and
-emits QA WAV/spectrogram exports + ``results/phase2_report.md``.
+emits QA WAV/spectrogram exports + ``results/render_report.md``.
 """
 
 from __future__ import annotations
@@ -14,14 +14,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from t3k.probe import esr, rms_dbfs
+from openamp.dsp.audio import esr, rms_dbfs
 
-from . import audio_io
-from . import constants as C
-from . import manifests
-from .config import Phase2Config
+from openamp.dsp import audio as audio_io
+from openamp.core import constants as C
+from openamp.core import manifest as manifests
+from openamp.core.config import Config
 
-log = logging.getLogger("oa3k.verify")
+log = logging.getLogger("openamp.verify")
 
 QA_SECONDS = 10.0
 N_QA_DEVICES = 8
@@ -36,7 +36,7 @@ def is_pass_through(inp: np.ndarray, out: np.ndarray,
     return esr(out, inp) <= min_esr
 
 
-def is_silent(out: np.ndarray, min_rms_db: float = C.NOT_SILENT_MIN_DBFS) -> bool:
+def is_silent(out: np.ndarray, min_rms_db: float = C.RENDER_MIN_RMS_DBFS) -> bool:
     return rms_dbfs(out) <= min_rms_db
 
 
@@ -73,19 +73,19 @@ def missing_pairs(renders_df: pd.DataFrame, device_ids, file_ids) -> list[tuple]
 
 
 # --- Verification wrapper ------------------------------------------------------
-def verify(config: Phase2Config, *, seed: int | None = None) -> pd.DataFrame:
+def verify(config: Config, *, seed: int | None = None) -> pd.DataFrame:
     """Run all checks, emit QA + report, and write ``devices_final.parquet``."""
     config.ensure_dirs()
     rng = np.random.default_rng(config.seed if seed is None else seed)
 
-    renders = manifests.read(config.renders_manifest_path, manifests.RENDERS_COLUMNS)
-    corpus = manifests.read(config.corpus_manifest_path, manifests.CORPUS_COLUMNS)
-    manifest = manifests.read(config.phase1_manifest_path,
+    renders = manifests.read_manifest(config.renders_manifest_path, manifests.RENDERS_COLUMNS)
+    corpus = manifests.read_manifest(config.corpus_manifest_path, manifests.CORPUS_COLUMNS)
+    manifest = manifests.read_manifest(config.manifest_path,
                               ["device_id", "tone_id", "model_id", "make", "model",
                                "gain_bucket", "architecture", "sample_rate",
                                "file_path", "license", "creator"])
     if renders.empty:
-        raise RuntimeError("No renders found. Run `oa3k render run` first.")
+        raise RuntimeError("No renders found. Run `openamp render` first.")
 
     egdb_file_ids = corpus.loc[corpus["source"] == C.SOURCE_EGDB, "file_id"].astype(str).tolist()
     all_file_ids = corpus["file_id"].astype(str).tolist()
@@ -98,7 +98,7 @@ def verify(config: Phase2Config, *, seed: int | None = None) -> pd.DataFrame:
 
     stats = pd.DataFrame(per_device)
     finals = _build_devices_final(stats, manifest)
-    manifests.write(finals, config.devices_final_path)
+    manifests.write_manifest(finals, config.devices_final_path)
 
     _export_qa(config, stats, corpus, rng)
     _write_report(config, stats, corpus, finals)
@@ -193,7 +193,7 @@ def _spectrogram_png(path: Path, clean: np.ndarray, render: np.ndarray, sr: int)
 
 
 def _write_report(config, stats, corpus, finals) -> None:
-    lines = ["# Phase 2 render report", ""]
+    lines = ["# Render report", ""]
     n_ok = int((stats["status"] == C.RENDER_OK).sum())
     lines += [
         f"- Devices verified: **{len(stats)}**",
@@ -212,9 +212,9 @@ def _write_report(config, stats, corpus, finals) -> None:
     for r in stats.itertuples(index=False):
         lines.append(f"| {int(r.device_id):04d} | {r.status} | {r.n_files} | "
                      f"{r.out_peak_db:.2f} | {r.output_scale:.4f} | {r.reason} |")
-    config.report_path.parent.mkdir(parents=True, exist_ok=True)
-    config.report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    log.info("report -> %s", config.report_path)
+    config.render_report_path.parent.mkdir(parents=True, exist_ok=True)
+    config.render_report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log.info("report -> %s", config.render_report_path)
 
 
 def _read_clean(config, corpus, file_id):

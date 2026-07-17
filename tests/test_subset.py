@@ -1,4 +1,4 @@
-"""Phase 2 render-subset selection: determinism, diversity caps, gain floor, and
+"""Render-subset selection: determinism, diversity caps, gain floor, and
 the persisted id-file round-trip through ``render.parse_device_selection``."""
 
 import math
@@ -6,7 +6,7 @@ import math
 import pandas as pd
 import pytest
 
-from data import render, subset
+from openamp.corpus import render, subset
 
 
 def make_manifest(n_makes=20, per_make=6, buckets=("clean", "crunch", "high_gain")):

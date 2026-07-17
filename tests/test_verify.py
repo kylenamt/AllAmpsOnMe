@@ -1,11 +1,11 @@
-"""Phase 2 verification tests: pure signal-sanity + completeness checks."""
+"""Verification tests: pure signal-sanity + completeness checks."""
 
 import numpy as np
 import pandas as pd
 
-from data import verify
-from data import constants as C
-from data import manifests
+from openamp.corpus import verify
+from openamp.core import constants as C
+from openamp.core import manifest as manifests
 
 
 def test_is_pass_through():
@@ -54,5 +54,5 @@ def test_missing_pairs():
 
 
 def test_missing_pairs_empty_renders():
-    empty = manifests.empty(manifests.RENDERS_COLUMNS)
+    empty = manifests.ensure_schema(pd.DataFrame(), manifests.RENDERS_COLUMNS)
     assert verify.missing_pairs(empty, [0], ["f0"]) == [(0, "f0")]

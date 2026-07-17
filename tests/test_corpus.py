@@ -1,12 +1,12 @@
-"""Phase 2 corpus tests: level normalization, budget selection, split integrity,
+"""Corpus tests: level normalization, budget selection, split integrity,
 and the clip grid — all pure numpy/pandas, no audio backend."""
 
 import numpy as np
 import pandas as pd
 
-from data import corpus
-from data import constants as C
-from t3k.probe import peak_dbfs, rms_dbfs
+from openamp.corpus import build as corpus
+from openamp.core import constants as C
+from openamp.dsp.audio import peak_dbfs, rms_dbfs
 
 
 def test_compute_gain_hits_target_rms_when_unclipped():

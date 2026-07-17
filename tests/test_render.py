@@ -1,13 +1,13 @@
-"""Phase 2 render-core tests: the chunked forward must be bit-identical to a full
+"""Render-core tests: the chunked forward must be bit-identical to a full
 forward, plus output-scale, device-selection, and resume bookkeeping."""
 
 import numpy as np
 import pytest
 
-from data import render
-from data import constants as C
-from data import manifests
-from data.config import load_config
+from openamp.corpus import render
+from openamp.core import constants as C
+from openamp.core import manifest as manifests
+from openamp.core.config import load_config
 
 
 def make_fir(h):

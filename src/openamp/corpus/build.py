@@ -1,4 +1,4 @@
-"""Stage: ``oa3k corpus prepare`` — build the clean input corpus (spec §3).
+"""Stage: ``openamp corpus`` — build the clean input corpus (spec §3).
 
 Scans EGDB direct-input WAVs (+ the NAM standardized sweep), converts to 48 kHz
 mono float32, level-normalizes, selects to a minutes budget, splits **by file**
@@ -6,26 +6,26 @@ mono float32, level-normalizes, selects to a minutes budget, splits **by file**
 
 The signal math (budget selection, split assignment, clip grid, gain) is factored
 into pure functions that unit-test on numpy/pandas without any audio backend; the
-``prepare`` wrapper does the file I/O via :mod:`data.audio_io`.
+``prepare`` wrapper does the file I/O via :mod:`openamp.audio`.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from t3k.probe import peak_dbfs, rms_dbfs
+from openamp.dsp.audio import peak_dbfs, rms_dbfs
 
-from . import audio_io
-from . import constants as C
-from . import manifests
-from .config import Phase2Config
+from openamp.dsp import audio as audio_io
+from openamp.core import constants as C
+from openamp.core import manifest as manifests
+from openamp.core.config import Config
+from openamp.core.util import sha256_file
 
-log = logging.getLogger("oa3k.corpus")
+log = logging.getLogger("openamp.corpus")
 
 
 # --- Pure helpers (unit-tested) ------------------------------------------------
@@ -115,20 +115,12 @@ def clip_grid(num_samples: int, clip_samples: int) -> list[tuple[int, int]]:
     return [(k * clip_samples, clip_samples) for k in range(n)]
 
 
-def sha256_file(path: str | Path, chunk: int = 1 << 20) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(chunk), b""):
-            h.update(block)
-    return h.hexdigest()
-
-
 # --- IO wrapper ----------------------------------------------------------------
 class CorpusInputError(RuntimeError):
     """Raised when required raw inputs are missing."""
 
 
-def _scan_egdb(config: Phase2Config) -> list[dict]:
+def _scan_egdb(config: Config) -> list[dict]:
     """Cheap metadata scan of EGDB WAVs (no full decode); reject too-short files."""
     egdb_dir = config.egdb_dir
     wavs = sorted(p for p in egdb_dir.rglob("*.wav")) if egdb_dir.is_dir() else []
@@ -147,25 +139,25 @@ def _scan_egdb(config: Phase2Config) -> list[dict]:
     return rows
 
 
-def _missing_inputs_message(config: Phase2Config) -> str:
+def _missing_inputs_message(config: Config) -> str:
     return (
-        "Phase 2 corpus inputs are missing. Place them and re-run:\n"
+        "Corpus inputs are missing. Place them and re-run:\n"
         f"  1. EGDB direct-input WAVs under: {config.egdb_dir}\n"
         "     (download from the EGDB GitHub release; use only the clean DI audio)\n"
         f"  2. NAM sweep signal at:          {config.nam_sweep_path}\n"
         "     (v3_0_0.wav from the neural-amp-modeler training resources)\n"
-        "See OA3K.md for the exact links and steps."
+        "See README.md for the exact links and steps."
     )
 
 
-def prepare(config: Phase2Config, *, force: bool = False) -> pd.DataFrame:
+def prepare(config: Config, *, force: bool = False) -> pd.DataFrame:
     """Build the clean corpus + clip grid. Idempotent: a completed corpus with all
     clean files present is a no-op unless ``force`` (spec §8.5)."""
     config.ensure_dirs()
 
     if not force and _corpus_complete(config):
         log.info("corpus already prepared -> %s", config.corpus_manifest_path)
-        return manifests.read(config.corpus_manifest_path, manifests.CORPUS_COLUMNS)
+        return manifests.read_manifest(config.corpus_manifest_path, manifests.CORPUS_COLUMNS)
 
     egdb_rows = _scan_egdb(config)
     have_sweep = config.nam_sweep_path.is_file()
@@ -199,14 +191,14 @@ def prepare(config: Phase2Config, *, force: bool = False) -> pd.DataFrame:
 
     corpus_df = pd.DataFrame(corpus_rows, columns=manifests.CORPUS_COLUMNS)
     clips_df = pd.DataFrame(clip_rows, columns=manifests.CLIPS_COLUMNS)
-    manifests.write(corpus_df, config.corpus_manifest_path)
-    manifests.write(clips_df, config.clips_manifest_path)
+    manifests.write_manifest(corpus_df, config.corpus_manifest_path)
+    manifests.write_manifest(clips_df, config.clips_manifest_path)
     log.info("corpus: %d files (%d clips) -> %s", len(corpus_df), len(clips_df),
              config.corpus_manifest_path)
     return corpus_df
 
 
-def _process_one(config: Phase2Config, row: dict) -> dict | None:
+def _process_one(config: Config, row: dict) -> dict | None:
     """Read → resample → normalize → write one clean file; build manifest rows."""
     orig_path = row["orig_path"]
     signal, sr = audio_io.read_audio(orig_path)
@@ -235,10 +227,10 @@ def _process_one(config: Phase2Config, row: dict) -> dict | None:
     return {"corpus": corpus, "clips": clips}
 
 
-def _corpus_complete(config: Phase2Config) -> bool:
+def _corpus_complete(config: Config) -> bool:
     if not config.corpus_manifest_path.is_file() or not config.clips_manifest_path.is_file():
         return False
-    df = manifests.read(config.corpus_manifest_path, manifests.CORPUS_COLUMNS)
+    df = manifests.read_manifest(config.corpus_manifest_path, manifests.CORPUS_COLUMNS)
     if df.empty:
         return False
     for r in df.itertuples(index=False):
