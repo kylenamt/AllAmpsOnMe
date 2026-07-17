@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "openamp"
 version = "0.2.0"
-description = "Open-Amp3000: TONE3000 capture acquisition, clean-corpus rendering, and a one-to-many FiLM-TCN amp emulator"
+description = "AllAmpsOnMe: TONE3000 capture acquisition, clean-corpus rendering, and a one-to-many FiLM-TCN amp emulator"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }

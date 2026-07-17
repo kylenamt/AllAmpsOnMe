@@ -12,11 +12,16 @@ emulate:
   arch: film_wavenet
   wn_channels: 8           # A2 full-width; width sweeps = copy file, change number
   embedding_dim: 256
+  # Extended past the default 60 to give the annealed run more room; early-stop
+  # (patience 8) still ends it once val ESR plateaus.
+  epochs: 80
   # NAM trains this exact topology at lr 4e-3; the paper default 5e-4 (tuned for
-  # the TCN) starts it far too cold. 2e-3 splits the difference for 405-device
-  # conditioning + MRSTFT; ReduceLROnPlateau walks it down from there.
-  # Manually halved 4e-3 -> 2e-3 at the epoch-15 best (val 0.2825) and resumed.
-  lr: 2.0e-3
+  # the TCN) starts it far too cold. 2e-3 split the difference; ReduceLROnPlateau
+  # then walked it down (4e-3 -> 2e-3 at the epoch-15 best -> 2.5e-4 by epoch 46).
+  # The config lr is authoritative on --resume and the scheduler resets, so this
+  # must carry the *last annealed* lr forward — bumping it back to 2e-3 here would
+  # spike the LR and undo the anneal.
+  lr: 2.5e-4
   # bf16 like channels32: fp16 forward overflow NaN-killed two TCN runs, and
   # fp32 may not fit next to the neighbor's MPS workers on the shared GPU.
   amp: true
