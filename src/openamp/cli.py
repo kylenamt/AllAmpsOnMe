@@ -40,6 +40,19 @@ def _config(config_path: Path | None = None, *, require_key: bool = False):
         raise click.ClickException(str(exc))
 
 
+def _device_names() -> dict[int, str]:
+    """``{device_id: name}`` from the working manifest, or ``{}`` if unavailable.
+
+    Best-effort so exports still work from a bare run dir (falling back to the
+    generic ``device <id>`` label) when no config or manifest is present.
+    """
+    from openamp.emulate.dataset import device_names
+    try:
+        return device_names(load_config())
+    except ConfigError:
+        return {}
+
+
 def _client(cfg):
     from openamp.acquire.client import T3KClient
     return T3KClient(cfg)
@@ -362,6 +375,92 @@ def emulate_enroll(run, devices, pairs, epochs, lr, device, seed) -> None:
     click.echo(f"  enrolled {m['n_enrolled']} devices: test_ESR={m['test_esr_mean']} "
                f"(baseline {m['baseline_test_esr_mean']}, "
                f"trained {m['trained_test_esr_mean']})")
+
+
+@cli.command("emulate-export-bundle")
+@click.argument("run", type=Path)
+@click.option("--out", type=Path, default=None,
+              help="Output path (default: <run>/export/bundle.json).")
+@click.option("--profile-device", "profile_devices", multiple=True, type=int,
+              help="Also embed this trained device's row as a built-in profile "
+                   "(repeatable).")
+@click.option("--profile-pair", "profile_pairs", multiple=True,
+              help="Also embed enroll/pairs/<name>'s embedding as a built-in "
+                   "profile (repeatable).")
+def emulate_export_bundle(run, out, profile_devices, profile_pairs) -> None:
+    """Export the morph-plugin weight bundle (weights + FiLM + profiles)."""
+    import json as _json
+
+    from openamp.emulate import export as emu_export
+
+    if not (run / "checkpoint.pt").is_file():
+        raise click.ClickException(f"No checkpoint.pt under {run}.")
+    out = out or run / "export" / "bundle.json"
+    s = emu_export.export_bundle(run, out, profile_device_ids=list(profile_devices),
+                                 profile_pairs=list(profile_pairs))
+    a = s["arch"]
+    click.echo(f"  {out}  ({s['bytes'] / 1e6:.2f} MB)")
+    click.echo(f"  run {s['run']['name']} sha8={s['run']['sha8']} "
+               f"E={a['embedding_dim']} C={a['channels']} sr={s['sample_rate']} "
+               f"profiles={_json.dumps(s['profiles'])}")
+
+
+@cli.command("emulate-export-profile")
+@click.argument("run", type=Path)
+@click.option("--device", "device_id", type=int, default=None,
+              help="Export this trained device's table row.")
+@click.option("--mean", is_flag=True, help="Export the table-mean embedding.")
+@click.option("--pair", "pair_name", default=None,
+              help="Export enroll/pairs/<name>'s enrolled embedding.")
+@click.option("--name", default=None, help="Display name inside the profile.")
+@click.option("--out", type=Path, default=None,
+              help="Also write the JSON here (always printed to stdout).")
+def emulate_export_profile(run, device_id, mean, pair_name, name, out) -> None:
+    """Print one pasteable embedding profile (JSON) for the morph plugin."""
+    import json as _json
+
+    from openamp.emulate import export as emu_export
+
+    if not (run / "checkpoint.pt").is_file():
+        raise click.ClickException(f"No checkpoint.pt under {run}.")
+    try:
+        p = emu_export.export_profile(run, device_id=device_id, mean=mean,
+                                      pair_name=pair_name, name=name,
+                                      names=_device_names())
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc))
+    text = _json.dumps(p)
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+    click.echo(text)
+
+
+@cli.command("emulate-export-profiles")
+@click.argument("run", type=Path)
+@click.option("--mean", is_flag=True, help="Also prepend the table-mean profile.")
+@click.option("--pairs", is_flag=True,
+              help="Also append every enroll/pairs/<name> enrolled embedding.")
+@click.option("--out", type=Path, default=None,
+              help="Also write the JSON array here (always printed to stdout).")
+def emulate_export_profiles(run, mean, pairs, out) -> None:
+    """Print all trained device embeddings as a JSON list of pasteable profiles."""
+    import json as _json
+
+    from openamp.emulate import export as emu_export
+
+    if not (run / "checkpoint.pt").is_file():
+        raise click.ClickException(f"No checkpoint.pt under {run}.")
+    try:
+        ps = emu_export.export_profiles(run, mean=mean, pairs=pairs,
+                                        names=_device_names())
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc))
+    text = _json.dumps(ps)
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+    click.echo(text)
 
 
 def main() -> None:

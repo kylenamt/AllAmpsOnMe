@@ -425,8 +425,12 @@ def _save_config_copy(run_dir: Path, ecfg) -> None:
 # Shape-defining knobs: frozen for the life of a run because the checkpoint's
 # weights depend on them. Everything else in EmulateConfig is training dynamics
 # and may change on resume. Device count / receptive field are checked separately.
+# ``wn_activation`` is here despite not changing any shape: both activations are
+# parameter-free, so a swapped one would load cleanly and quietly play a
+# different network than the weights were trained for.
 _STRUCTURAL_KEYS = ("arch", "blocks", "layers_per_block", "channels", "kernel_size",
-                    "dilation_growth", "wn_channels", "embedding_dim", "single_device")
+                    "dilation_growth", "wn_channels", "wn_activation",
+                    "embedding_dim", "single_device")
 
 
 def _check_resume_compatible(ck: dict, ecfg, receptive_field: int, n_devices: int) -> None:

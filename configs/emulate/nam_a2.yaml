@@ -1,0 +1,69 @@
+# Base config for the NAM A2 architecture: the capture-native FiLM-WaveNet
+# trained with NAM's *own* A2 recipe rather than the paper's TCN defaults.
+# The a2 counterpart of paper.yaml — copy this file, change numbers.
+# Run name is the file stem ("nam_a2") -> results/emulate/nam_a2/.
+#
+#   openamp emulate --config configs/emulate/nam_a2.yaml --overfit           # sanity #1
+#   openamp emulate --config configs/emulate/nam_a2.yaml --limit-devices 10  # mini-run
+#   openamp emulate --config configs/emulate/nam_a2.yaml                     # full run
+#
+# Source of the training numbers: neural-amp-modeler's
+# `nam/train/_resources/config_model_packed.json` — the config that trained every
+# A2 capture in this corpus (its kernel_sizes/dilations/channels 3+8/LeakyReLU/
+# kernel-16 head match all 775 A2 exports here exactly), plus the trainer defaults
+# in `nam/train/core.py` (batch_size 16, ny 8192, epochs 100).
+#
+# Three parts of NAM's recipe have no knob here; they are code, not config:
+#   - schedule: NAM anneals with ExponentialLR gamma=0.994 (only ~0.55x over 100
+#     epochs). This trainer has ReduceLROnPlateau only, which halves on a 3-epoch
+#     plateau — from lr 4e-3 that can drop ~8x inside 20 epochs. Watch the `lr`
+#     column in train_log.csv: if it collapses before val ESR is near its floor,
+#     raise plateau_patience rather than lowering lr.
+#   - loss: NAM's primary term is plain MSE; here it is (pre-emphasized) ESR.
+#     ESR = MSE / mean(target^2), so the two agree on direction but not on scale
+#     — which is what stft_weight below has to absorb.
+#   - segment: NAM trains on ny=8192 output samples (0.17 s) per datum; the clip
+#     grid here is fixed at 2.0 s, so a step sees ~11x more audio.
+
+emulate:
+  # --- Model -------------------------------------------------------------------
+  arch: film_wavenet
+  wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
+  # No NAM analogue: a capture is single-device (condition_size 1 = the input
+  # signal only). 128 is the wavenet_a2 value; _256/_1024 sweep it off this base.
+  embedding_dim: 128
+  single_device: -1        # -1 = one-to-many over all render-ok devices
+
+  # --- Training ----------------------------------------------------------------
+  holdout_frac: 0.1
+  clip_seconds: 2.0        # must match the corpus clip grid (see note above)
+  batch_size: 16           # NAM train_dataloader.batch_size
+  pairs_per_epoch: 50000
+  epochs: 100              # NAM trainer.max_epochs; early-stop still ends it sooner
+  # NAM optimizer block, verbatim. Keep the decimal point: PyYAML resolves bare
+  # `4e-3` as a *string*, which reaches Adam untyped and dies at construction.
+  lr: 4.0e-3
+  weight_decay: 3.17e-7
+  plateau_patience: 3
+  plateau_factor: 0.5
+  early_stop_patience: 8
+  # NAM runs MRSTFT as a light regularizer at weight 5e-4 *against MSE*. Rescaling
+  # to this trainer's ESR term: loss_NAM / mean(t^2) = ESR + 5e-4/mean(t^2) * MRSTFT,
+  # and the renders in this corpus sit at median RMS -20.2 dBFS -> mean(t^2) 0.0096
+  # (data/manifests/renders.parquet, out_rms_db), so 5e-4/0.0096 ~ 0.05. That is 20x
+  # below the paper default of 1.0, where MRSTFT outweighs the ESR term outright.
+  # The IQR of that estimate is 0.025..0.13, so treat 0.05 as an order, not a value.
+  stft_weight: 0.05
+  # NAM trains without pre-emphasis and validates on plain ESR. Kept at the paper's
+  # 0.85 here because it only weights the ESR term's high end (where amps distort);
+  # set 0.0 for the NAM-faithful version, which also makes val_esr measure exactly
+  # what emulate-compare's test_ESR reports (that metric is always un-pre-emphasized).
+  preemph: 0.85
+  num_workers: 6
+  # NAM trains fp32. bf16 here because fp16 forward overflow NaN-killed two TCN
+  # runs and fp32 may not fit beside other jobs on the shared GPU; bf16 has fp32's
+  # exponent range, so it needs no loss scaling.
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50

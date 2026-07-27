@@ -8,6 +8,11 @@ through a kernel-16 head conv, scaled by ``head_scale``. Verified identical
 across all 774 A2 captures in the corpus; the schedule constants here are read
 straight from those exports.
 
+The per-layer nonlinearity is a knob (``wn_activation`` in config): ``leakyrelu``
+is what the captures use, ``tanh`` is the other activation NAM's A2 schema and
+NeuralAmpModelerCore both implement, so a tanh run still folds into a
+plugin-playable A2 WaveNet (see :mod:`openamp.emulate.export`).
+
 Two deliberate departures from a capture make it one-to-many and trainable here:
 
 - **FiLM conditioning**: NAM's A2 layer schema defines optional FiLM hooks (all
@@ -30,7 +35,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-__all__ = ["FiLMWaveNet", "A2_KERNEL_SIZES", "A2_DILATIONS", "A2_HEAD_KERNEL"]
+__all__ = ["FiLMWaveNet", "make_activation", "normalize_activation", "ACTIVATIONS",
+           "NAM_ACTIVATION_NAMES", "A2_KERNEL_SIZES", "A2_DILATIONS",
+           "A2_HEAD_KERNEL", "A2_ACTIVATION"]
 
 # The one architecture shared by every A2 capture in the corpus (full-width
 # submodel of the SlimmableContainer export): three 7-layer dilation runs at
@@ -41,18 +48,43 @@ A2_HEAD_KERNEL = 16
 A2_CHANNELS = 8
 A2_HEAD_SCALE = 0.02
 
+# --- Activation (``wn_activation``) ---------------------------------------------
+# Both options are parameter-free, so a checkpoint's state_dict is identical
+# either way: switching this on an existing run loads silently and plays the
+# wrong network. Hence "wn_activation" sits in train.py's _STRUCTURAL_KEYS.
+ACTIVATIONS = ("leakyrelu", "tanh")
+A2_ACTIVATION = "leakyrelu"          # what every A2 capture uses
+A2_LEAKY_SLOPE = 0.01
+# NAM's own schema spelling for each option, for the plugin bundle's arch block.
+NAM_ACTIVATION_NAMES = {"leakyrelu": "LeakyReLU", "tanh": "Tanh"}
+
+
+def normalize_activation(name: str) -> str:
+    """Validate a ``wn_activation`` value and return its canonical key."""
+    key = str(name).strip().lower()
+    if key not in ACTIVATIONS:
+        raise ValueError(f"wn_activation must be one of {ACTIVATIONS}, got {name!r}")
+    return key
+
+
+def make_activation(name: str) -> nn.Module:
+    """The activation module for a ``wn_activation`` value (case-insensitive)."""
+    key = normalize_activation(name)
+    return nn.LeakyReLU(A2_LEAKY_SLOPE) if key == "leakyrelu" else nn.Tanh()
+
 
 class FiLMWaveNetLayer(nn.Module):
     """One A2 WaveNet layer, causal, with device FiLM at the pre-activation hook.
 
     ``z = conv(x) + mixin(clean)`` is FiLM-modulated by the device embedding,
-    then LeakyReLU. The activation feeds two paths: ``layer1x1`` back onto the
-    residual trunk, and (head1x1 is inactive in A2) directly out as this layer's
-    skip contribution to the head sum.
+    then passed through ``activation`` (LeakyReLU(0.01) as in the captures, or
+    Tanh). The activation feeds two paths: ``layer1x1`` back onto the residual
+    trunk, and (head1x1 is inactive in A2) directly out as this layer's skip
+    contribution to the head sum.
     """
 
     def __init__(self, channels: int, kernel_size: int, dilation: int,
-                 embedding_dim: int):
+                 embedding_dim: int, activation: str = A2_ACTIVATION):
         super().__init__()
         self.pad = (kernel_size - 1) * dilation          # causal left pad
         self.conv = nn.Conv1d(channels, channels, kernel_size, dilation=dilation)
@@ -64,7 +96,7 @@ class FiLMWaveNetLayer(nn.Module):
         with torch.no_grad():
             self.film.bias[:channels] = 1.0
             self.film.bias[channels:] = 0.0
-        self.act = nn.LeakyReLU(0.01)
+        self.act = make_activation(activation)
         self.layer1x1 = nn.Conv1d(channels, channels, 1)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor,
@@ -88,11 +120,13 @@ class FiLMWaveNet(nn.Module):
     drives it to the silence solution (output 0, ESR 1.0) in the first epochs
     before anything else can fit (observed 0.02 -> -2e-4 by epoch 7).
     The kernel/dilation schedule defaults to the A2 constants; ``channels``
-    (``wn_channels`` in config) is the width sweep knob.
+    (``wn_channels`` in config) is the width sweep knob and ``activation``
+    (``wn_activation``) picks the per-layer nonlinearity.
     """
 
     def __init__(self, *, n_devices: int, channels: int = A2_CHANNELS,
                  embedding_dim: int = 64,
+                 activation: str = A2_ACTIVATION,
                  kernel_sizes: tuple[int, ...] = A2_KERNEL_SIZES,
                  dilations: tuple[int, ...] = A2_DILATIONS,
                  head_kernel: int = A2_HEAD_KERNEL,
@@ -104,6 +138,7 @@ class FiLMWaveNet(nn.Module):
         self.n_devices = int(n_devices)
         self.channels = int(channels)
         self.embedding_dim = int(embedding_dim)
+        self.activation = normalize_activation(activation)
         self.kernel_sizes = tuple(int(k) for k in kernel_sizes)
         self.dilations = tuple(int(d) for d in dilations)
         self.head_kernel = int(head_kernel)
@@ -114,7 +149,7 @@ class FiLMWaveNet(nn.Module):
 
         self.rechannel = nn.Conv1d(1, self.channels, 1, bias=False)
         self.layers = nn.ModuleList(
-            FiLMWaveNetLayer(self.channels, k, d, self.embedding_dim)
+            FiLMWaveNetLayer(self.channels, k, d, self.embedding_dim, self.activation)
             for k, d in zip(self.kernel_sizes, self.dilations))
         self.head_rechannel = nn.Conv1d(self.channels, 1, self.head_kernel)
         self.register_buffer("head_scale", torch.tensor(float(head_scale)))
@@ -123,7 +158,8 @@ class FiLMWaveNet(nn.Module):
     def from_config(cls, ecfg, n_devices: int) -> "FiLMWaveNet":
         """Construct from an :class:`~openamp.core.config.EmulateConfig`."""
         return cls(n_devices=n_devices, channels=ecfg.wn_channels,
-                   embedding_dim=ecfg.embedding_dim)
+                   embedding_dim=ecfg.embedding_dim,
+                   activation=ecfg.wn_activation)
 
     @staticmethod
     def compute_receptive_field(kernel_sizes=A2_KERNEL_SIZES, dilations=A2_DILATIONS,
