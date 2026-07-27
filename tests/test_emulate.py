@@ -125,6 +125,40 @@ def test_wavenet_core_param_count_matches_a2_export():
     assert count_parameters(wider) > count_parameters(m)
 
 
+def test_wavenet_activation_option_swaps_the_nonlinearity():
+    torch.manual_seed(0)
+    leaky = _small_wavenet(n_devices=2).eval()
+    tanh = _small_wavenet(n_devices=2, activation="tanh").eval()
+    assert leaky.activation == "leakyrelu"
+    assert all(isinstance(l.act, torch.nn.LeakyReLU) for l in leaky.layers)
+    assert all(isinstance(l.act, torch.nn.Tanh) for l in tanh.layers)
+    # Both activations are parameter-free, so the two nets have identical
+    # state_dicts — the reason wn_activation must be resume-structural.
+    tanh.load_state_dict(leaky.state_dict())
+    assert count_parameters(leaky) == count_parameters(tanh)
+    x = torch.randn(1, 1500) * 3.0                    # loud enough to saturate tanh
+    assert not torch.allclose(leaky(x, torch.tensor([0])), tanh(x, torch.tensor([0])))
+
+
+def test_wavenet_activation_from_config_and_validation():
+    from openamp.emulate.models import arch_summary
+
+    m = FiLMWaveNet.from_config(
+        EmulateConfig(arch="film_wavenet", wn_channels=4, wn_activation="TanH"), 3)
+    assert m.activation == "tanh"                     # case-insensitive
+    assert isinstance(m.layers[-1].act, torch.nn.Tanh)
+    default = FiLMWaveNet.from_config(EmulateConfig(arch="film_wavenet"), 3)
+    assert default.activation == "leakyrelu"          # the capture default
+    # The comparison CSV tags a non-capture activation onto the topology column.
+    assert arch_summary(EmulateConfig(arch="film_wavenet"))["blocks_x_layers"] == "a2-23L"
+    assert arch_summary(EmulateConfig(arch="film_wavenet", wn_activation="tanh")
+                        )["blocks_x_layers"] == "a2-23L-tanh"
+    with pytest.raises(ValueError, match="wn_activation"):
+        FiLMWaveNet(n_devices=1, activation="relu")
+    with pytest.raises(ValueError, match="wn_activation"):
+        build_model(EmulateConfig(arch="film_wavenet", wn_activation="silu"), 3)
+
+
 def test_build_model_dispatches_on_arch():
     assert isinstance(build_model(EmulateConfig(), 5), FiLMTCN)
     assert isinstance(build_model(EmulateConfig(arch="film_wavenet"), 5), FiLMWaveNet)
@@ -159,9 +193,17 @@ def test_load_model_rebuilds_arch_and_defaults_legacy_to_tcn(tmp_path):
     assert isinstance(loaded2, FiLMTCN)
 
 
-def test_wavenet_matches_nam_a2_reference():
+@pytest.mark.parametrize("activation,nam_activation", [
+    ("leakyrelu", {"name": "LeakyReLU", "negative_slope": 0.01}),
+    ("tanh", "Tanh"),
+])
+def test_wavenet_matches_nam_a2_reference(activation, nam_activation):
     """Weight-for-weight against NAM's own WaveNet: with FiLM at exact identity,
-    our causal net must reproduce NAM's valid-conv output sample-for-sample."""
+    our causal net must reproduce NAM's valid-conv output sample-for-sample.
+
+    Both ``wn_activation`` options are checked, because both must stay a real A2
+    capture after export folds FiLM away — that is what makes the plugin able to
+    run them with NeuralAmpModelerCore."""
     _wavenet = pytest.importorskip("nam.models.wavenet")
 
     torch.manual_seed(0)
@@ -169,12 +211,12 @@ def test_wavenet_matches_nam_a2_reference():
         "layers_configs": [{
             "input_size": 1, "condition_size": 1, "channels": 8,
             "kernel_sizes": list(A2_KERNEL_SIZES), "dilations": list(A2_DILATIONS),
-            "activation": {"name": "LeakyReLU", "negative_slope": 0.01},
+            "activation": nam_activation,
             "head": {"out_channels": 1, "kernel_size": 16, "bias": True},
         }],
         "head": None, "head_scale": 0.02,
     }).eval()
-    ours = FiLMWaveNet(n_devices=1).eval()
+    ours = FiLMWaveNet(n_devices=1, activation=activation).eval()
 
     core = nam_net._net                               # wrapper -> raw valid-conv net
     la = core._layer_arrays[0]
@@ -552,6 +594,36 @@ def test_enroll_pair_end_to_end(tmp_path):
 
 
 # --- Comparison CSV ------------------------------------------------------------
+def test_enroll_pair_batch_size_overrides_the_runs_value(tmp_path):
+    """The fit is fp32, so a run's own batch can exceed the card it trained on."""
+    pytest.importorskip("auraloss")
+    from dataclasses import asdict
+
+    from openamp.emulate.enroll import enroll_pair
+
+    cfg = load_config(data_dir=tmp_path)
+    clip = 8192
+    torch.manual_seed(0)
+    ecfg = EmulateConfig(blocks=1, layers_per_block=2, channels=4, embedding_dim=8,
+                         clip_seconds=clip / cfg.sample_rate, batch_size=4,
+                         num_workers=0, val_pairs=8, log_every=10**9)
+    m = build_model(ecfg, 2).eval()
+    run = tmp_path / "run"; run.mkdir()
+    torch.save({"model": m.state_dict(), "emulate_cfg": asdict(ecfg),
+                "device_ids": [0, 1], "holdout_ids": [], "name": "run",
+                "epoch": 5, "manifest_sha256": ""}, run / "checkpoint.pt")
+
+    rng = np.random.default_rng(0)
+    dry = (0.3 * rng.standard_normal(4 * clip)).astype(np.float32)
+    kw = dict(name="d", pairs=4, epochs=1, lr=5e-2, device="cpu", seed=0,
+              val_frac=0.25, val_pairs=4)
+
+    assert enroll_pair(cfg, run, dry, dry.copy(), **kw)["batch_size"] == 4  # run's
+    assert enroll_pair(cfg, run, dry, dry.copy(), batch_size=2, **kw)["batch_size"] == 2
+    with pytest.raises(ValueError, match="batch_size"):
+        enroll_pair(cfg, run, dry, dry.copy(), batch_size=0, **kw)
+
+
 def test_append_rows_dedups_by_run_name(tmp_path):
     import csv
 

@@ -1,0 +1,56 @@
+
+# nam_a2_tanh_256 at wn_channels 16 — the width sweep point off nam_a2_tanh_256.yaml.
+# Run name is the file stem ("nam_a2_tanh_ch16_256") -> results/emulate/nam_a2_tanh_ch16_256/.
+#
+#   openamp emulate --config configs/emulate/nam_a2_tanh_ch16_256.yaml --overfit           # sanity #1
+#   openamp emulate --config configs/emulate/nam_a2_tanh_ch16_256.yaml --limit-devices 10  # mini-run
+#   openamp emulate --config configs/emulate/nam_a2_tanh_ch16_256.yaml                     # full run
+#
+# This is a FULL copy of nam_a2_tanh_256.yaml with one number changed, not a delta: a
+# per-run file is read *instead of* configs/openamp.yaml, not merged over another
+# emulate config, so anything omitted here falls back to the EmulateConfig
+# dataclass defaults (stft_weight 1.0, weight_decay 0.0, lr 5e-4 — the paper's
+# TCN numbers), silently undoing the NAM recipe. See nam_a2.yaml for the full
+# derivation of every value below.
+
+emulate:
+  # --- Model -------------------------------------------------------------------
+  arch: film_wavenet
+  # The only change from nam_a2_tanh_256.yaml (8). 2x the A2 full-width submodel,
+  # i.e. off NAM's schema — conv weights go as channels^2, so this is the width
+  # arm of the sweep, not a NAM-faithful point.
+  wn_channels: 16
+  embedding_dim: 256
+  single_device: -1        # -1 = one-to-many over all render-ok devices
+  wn_activation: tanh      # "leakyrelu" (the capture default) | "tanh"
+
+
+  # --- Training (NAM's A2 numbers where the knob exists) -----------------------
+  holdout_frac: 0.1
+  clip_seconds: 2.0        # must match the corpus clip grid
+  # NAM uses 16; 32 here on purpose. This model is launch-bound, not compute-bound
+  # (23 layers of 8-channel convs = a few hundred tiny kernels/step, GPU sat at 68%
+  # SM and 127 W of 250 W at batch 16), so halving the step count per epoch buys
+  # wall clock the GPU was idling through anyway. lr is left at NAM's 4e-3: linear
+  # scaling would say 8e-3, but 1e-2 diverged on this topology inside 100 steps.
+  # Kept at 32 here so the width arm differs from nam_a2_tanh_256 in one knob only;
+  # 16 channels is still small enough that the step stays launch-bound.
+  batch_size: 32
+  pairs_per_epoch: 50000
+  epochs: 100              # NAM trainer.max_epochs; early-stop still ends it sooner
+  # NAM optimizer block, verbatim. Keep the decimal point: PyYAML resolves bare
+  # `4e-3` as a *string*, which reaches Adam untyped and dies at construction.
+  lr: 4.0e-3
+  weight_decay: 3.17e-7
+  plateau_patience: 3
+  plateau_factor: 0.5
+  early_stop_patience: 8
+  # NAM's 5e-4 MRSTFT weight rescaled from its MSE term to this trainer's ESR term
+  # (ESR = MSE / mean(t^2); corpus renders sit at median mean(t^2) 0.0096).
+  stft_weight: 0.05
+  preemph: 0.85            # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50

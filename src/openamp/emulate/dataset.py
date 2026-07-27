@@ -93,6 +93,27 @@ def manifest_signature(config) -> str:
     return sha256_file(path) if Path(path).is_file() else ""
 
 
+def device_names(config) -> dict[int, str]:
+    """``{device_id: display name}`` from the working manifest (best-effort).
+
+    The name is the human ``tone_title`` plus the capture's ``model_name`` variant
+    — many devices share a ``tone_title``, so the variant is what tells them apart.
+    Returns ``{}`` when the manifest is absent, letting callers fall back to a
+    generic ``device <id>`` label.
+    """
+    df = manifests.read_manifest(config.manifest_path, manifests.ALL_COLUMNS)
+    if df.empty or "device_id" not in df.columns:
+        return {}
+    df = df.dropna(subset=["device_id"])
+    titles = df["tone_title"].fillna("").astype(str).str.strip()
+    variants = df["model_name"].fillna("").astype(str).str.strip()
+    names: dict[int, str] = {}
+    for did, title, variant in zip(df["device_id"].astype(int), titles, variants):
+        name = f"{title} — {variant}" if title and variant else (title or variant)
+        names[int(did)] = name or f"device {int(did)}"
+    return names
+
+
 class EmulationDataset(Dataset):
     """Random ``(clean-with-context, render-clip, device_row)`` pairs for a split.
 

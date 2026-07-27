@@ -63,6 +63,10 @@ class EmulateConfig:
 
     # --- FiLM-WaveNet model (kernel/dilation schedule is the fixed A2 one) ------
     wn_channels: int = 8             # A2 full-width value; the width sweep knob
+    # Per-layer nonlinearity: "leakyrelu" (slope 0.01 — what every A2 capture
+    # uses) | "tanh" (NAM's other A2-schema activation, so the run still folds
+    # into a plugin-playable capture). Validated in openamp/emulate/wavenet.py.
+    wn_activation: str = "leakyrelu"
 
     # --- Shared model knobs ------------------------------------------------------
     embedding_dim: int = 64          # per-device embedding, FiLM at every layer

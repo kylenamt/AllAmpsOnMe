@@ -140,8 +140,9 @@ layer). Two architectures share the same contract and are selected by
 `blocks`, `layers_per_block`, `channels`, `kernel_size`, `dilation_growth`,
 `embedding_dim` are all plain config knobs) and the FiLM-WaveNet (`wavenet.py` —
 the exact NAM A2 topology every corpus capture uses, 23 dilated layers /
-receptive field 6347, with the device FiLM at the schema's pre-activation hook),
-so a sweep is copy-a-config-and-change-numbers with no code change. `dataset.py`
+receptive field 6347, with the device FiLM at the schema's pre-activation hook;
+`wn_channels` and `wn_activation` — `leakyrelu` (the captures' own) or `tanh` —
+are its knobs), so a sweep is copy-a-config-and-change-numbers with no code change. `dataset.py`
 serves clean-in / render-out pairs with the receptive field of **real left-context**
 prefixed for warmup (loss only on the warmed region). `train.py` optimizes
 pre-emphasized ESR + multi-resolution STFT (auraloss) with Adam + reduce-on-plateau,

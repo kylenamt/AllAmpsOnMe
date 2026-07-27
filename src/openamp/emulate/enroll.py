@@ -146,7 +146,11 @@ def _per_device_esr(model, loader, dev, n_rows: int, *, preemph: float | None = 
 def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
            pairs: int = ENROLL_PAIRS, epochs: int = ENROLL_EPOCHS,
            lr: float = ENROLL_LR, device: str = "cuda", seed: int | None = None,
-           test_pairs: int = TEST_PAIRS_PER_DEVICE) -> dict:
+           test_pairs: int = TEST_PAIRS_PER_DEVICE,
+           early_stop_patience: int = EARLY_STOP_PATIENCE,
+           stft_weight: float | None = None,
+           plateau_patience: int = PLATEAU_PATIENCE,
+           plateau_factor: float = 0.5) -> dict:
     """Enroll unseen devices against a frozen run; returns the summary metrics.
 
     Writes to ``<run_dir>/enroll/``: ``enrolled_embeddings.pt`` (mirrors the
@@ -161,6 +165,8 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
 
     model, ck = load_model(run_dir, str(dev))
     ecfg = EmulateConfig(**ck["emulate_cfg"])
+    if stft_weight is not None:
+        ecfg.stft_weight = float(stft_weight)
     base_name = ck.get("name", run_dir.name)
     manifest_sig = manifest_signature(cfg)
     if ck.get("manifest_sha256") and manifest_sig != ck["manifest_sha256"]:
@@ -214,7 +220,9 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
 
     best_emb, best_val, best_epoch, epochs_run = _fit_embedding(
         model, ecfg, train_ds, val_loader, dev, epochs=epochs, lr=lr, seed=seed,
-        log_path=log_path, init_val=init_val, t0=t0)
+        log_path=log_path, init_val=init_val, t0=t0,
+        early_stop_patience=early_stop_patience,
+        plateau_patience=plateau_patience, plateau_factor=plateau_factor)
 
     # --- Final per-device metrics at the best rows --------------------------------
     with torch.no_grad():
@@ -288,20 +296,25 @@ def _swap_embedding(model, ecfg: EmulateConfig, n: int, dev) -> torch.Tensor:
 
 def _fit_embedding(model, ecfg: EmulateConfig, train_ds, val_loader, dev, *,
                    epochs: int, lr: float, seed: int, log_path: Path,
-                   init_val: float, t0: float):
+                   init_val: float, t0: float,
+                   early_stop_patience: int = EARLY_STOP_PATIENCE,
+                   plateau_patience: int = PLATEAU_PATIENCE,
+                   plateau_factor: float = 0.5):
     """Adam on the swapped-in embedding rows only, early-stopped on val ESR.
 
     ``train_ds`` just needs the EmulationDataset item contract plus a ``seed``
     attribute (bumped per epoch for fresh windows) — WetDryDataset qualifies.
     Best starts at the init rows, so the result is never worse than the prior
-    on val. Appends per-epoch rows to ``log_path`` (train_log.csv columns).
+    on val. Stops after ``early_stop_patience`` epochs with no val-ESR
+    improvement (``<= 0`` disables early stopping — run the full ``epochs``).
+    Appends per-epoch rows to ``log_path`` (train_log.csv columns).
     Returns ``(best_emb, best_val, best_epoch, epochs_run)``.
     """
     R = model.receptive_field
     lossfn = EmulationLoss(ecfg.preemph, ecfg.stft_weight).to(dev)
     opt = torch.optim.Adam(model.embedding.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="min", factor=0.5, patience=PLATEAU_PATIENCE)
+        opt, mode="min", factor=plateau_factor, patience=plateau_patience)
     best_val = init_val                      # never keep rows worse than the prior
     best_emb = model.embedding.weight.detach().clone()
     best_epoch, since_improved, step, epoch = -1, 0, 0, -1
@@ -350,7 +363,7 @@ def _fit_embedding(model, ecfg: EmulateConfig, train_ds, val_loader, dev, *,
                                      f"{time.time() - t0:.1f}"])
         print(f"[enroll epoch {epoch:02d}] val_esr={val_esr:.5f} best={best_val:.5f} "
               f"lr={cur_lr:.1e}{'  *' if improved else ''}", flush=True)
-        if since_improved >= EARLY_STOP_PATIENCE:
+        if early_stop_patience > 0 and since_improved >= early_stop_patience:
             print(f"[enroll stop] no val improvement for {since_improved} epochs")
             break
     return best_emb, best_val, best_epoch, epoch + 1
@@ -510,6 +523,60 @@ def blip_lag(dry: np.ndarray, wet: np.ndarray, *, sample_rate: int = 48_000,
     return int(_leading_edge(wet[:ns], thresh_frac) - _leading_edge(dry[:ns], thresh_frac))
 
 
+# NAM standardized reamp-signal layouts (sdatkinson/neural-amp-modeler,
+# nam/train/core.py). Boundaries are samples at the signal's native 48 kHz;
+# ``validation_start`` is a negative offset from the end, exactly as NAM stores
+# it. NAM's own split is train = signal[train_start : validation_start] and
+# validation = signal[validation_start:], with the lead-in before ``train_start``
+# discarded and the calibration blips left inside the train slice. Only v3.0.0 is
+# listed (the current TONE3000 sweep, verified against source); add older signals
+# here as ``{length, train_start, validation_start, blips}`` when needed.
+_NAM_SIGNALS = {
+    "v3_0_0": {"length": 9_120_000, "train_start": 480_000,      # 3:10 @ 48 kHz
+               "validation_start": -432_000, "blips": (504_000, 552_000)},
+}
+
+
+def nam_signal_regions(n_samples: int, *, sample_rate: int = 48_000,
+                       version: str | None = None, tol: float = 0.005) -> dict | None:
+    """NAM's own train/val regions for a standardized reamp signal, or ``None``.
+
+    Mirrors the split the NAM trainer applies to its capture signal — train on
+    ``[train_start : validation_start]`` (lead-in dropped, blips kept), score ESR
+    on the dedicated tail ``[validation_start:]`` — so a pair fit trains and is
+    validated on the same regions NAM reports, not a blind last-``val_frac``
+    slice. The signal is identified by length (within ``tol`` relative) unless
+    ``version`` forces a layout. Returns absolute sample bounds
+    ``{"version", "train", "val", "lead_in", "blips"}``; ``None`` when
+    ``n_samples`` matches no known signal (e.g. a stitched corpus DI) or the rate
+    is not NAM's 48 kHz standard — callers should then fall back to ``val_frac``.
+    """
+    if sample_rate != 48_000:
+        return None
+    if version is not None and version not in _NAM_SIGNALS:
+        raise ValueError(f"unknown NAM signal version {version!r}; "
+                         f"known: {sorted(_NAM_SIGNALS)}")
+    items = ([(version, _NAM_SIGNALS[version])] if version is not None
+             else _NAM_SIGNALS.items())
+    for name, spec in items:
+        if abs(n_samples - spec["length"]) <= tol * spec["length"]:
+            ts = int(spec["train_start"])
+            vs = n_samples + int(spec["validation_start"])   # negative -> from end
+            return {"version": name, "train": (ts, vs), "val": (vs, n_samples),
+                    "lead_in": (0, ts), "blips": tuple(spec["blips"])}
+    return None
+
+
+def _norm_region(region: tuple[int, int], n: int) -> tuple[int, int]:
+    """Validate a ``(start, stop)`` sample region, resolving negatives from ``n``."""
+    a, b = region
+    a = int(a) if a >= 0 else n + int(a)
+    b = int(b) if b >= 0 else n + int(b)
+    if not 0 <= a < b <= n:
+        raise ValueError(f"region {region} out of bounds for length {n}")
+    return a, b
+
+
 @torch.no_grad()
 def render_dry(model, dry: np.ndarray, *, row: int = 0, device: str = "cpu",
                chunk_samples: int = 480_000) -> np.ndarray:
@@ -540,16 +607,45 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
                 name: str, pairs: int = 500, epochs: int = ENROLL_EPOCHS,
                 lr: float = ENROLL_LR, device: str = "cuda", seed: int | None = None,
                 val_frac: float = 0.1, val_pairs: int = 200,
+                early_stop_patience: int = EARLY_STOP_PATIENCE,
+                stft_weight: float | None = None,
+                batch_size: int | None = None,
+                plateau_patience: int = PLATEAU_PATIENCE,
+                plateau_factor: float = 0.5,
+                train_region: tuple[int, int] | None = None,
+                val_region: tuple[int, int] | None = None,
                 sources: dict | None = None) -> dict:
     """Enroll ONE new device from a sample-aligned wet/dry pair (spec: Phase 5).
 
     ``dry`` is the capture input (e.g. the NAM sweep signal TONE3000 sends to
     every amp), ``wet`` the device's recorded response — align and level them
-    first (see the notebook). The last ``val_frac`` of the pair is the val
-    region; windows never cross the split. Writes to
+    first (see the notebook).
+
+    By default the last ``val_frac`` of the pair is the val region and everything
+    before it is train. Pass ``train_region``/``val_region`` (both, as
+    ``(start, stop)`` sample bounds; negatives resolve from the end) to drive the
+    split explicitly — e.g. :func:`nam_signal_regions` to follow the NAM trainer's
+    own layout for a standardized sweep (skip the lead-in, validate on the
+    dedicated tail) instead of a blind time slice. Windows never cross into the
+    other region; the lead-in gap between them (if any) is simply unused. Writes to
     ``<run_dir>/enroll/pairs/<name>/``: ``enrolled_pair.pt`` (the fitted
     vector + provenance), ``metrics.json``, ``enroll_log.csv`` (epoch -1 is
     the table-mean baseline). Returns the metrics dict.
+
+    ``stft_weight`` overrides the run's multi-res STFT loss weight (``None``
+    keeps the run's trained value). Pass ``0.0`` to fit on pre-emphasized ESR
+    alone: on a single-pair fit the STFT magnitude term can dominate the
+    gradient and drive the embedding to a spectrally-plausible but
+    waveform-uncorrelated optimum (val ESR *rises* while train loss falls —
+    observed on wavenet_a2, where stft_weight=0 fixed it).
+
+    ``batch_size`` overrides the run's training batch size for this fit (``None``
+    keeps the run's value). This fit is fp32 — unlike the trainer, which
+    autocasts under ``amp`` — so enrolling against a run costs roughly twice the
+    activation memory that run's own training did at the same batch size: a
+    batch-32 run needs ~10 GB, which does not fit a 12 GB card alongside a
+    resident ``.nam``. Drop it to 8–16 there. Only memory and steps/epoch move
+    (steps = ``pairs / batch_size``); the fit itself is unchanged.
     """
     run_dir = Path(run_dir)
     dev = torch.device(_resolve_device(device))
@@ -563,21 +659,42 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
 
     model, ck = load_model(run_dir, str(dev))
     ecfg = EmulateConfig(**ck["emulate_cfg"])
+    if stft_weight is not None:
+        ecfg.stft_weight = float(stft_weight)
+    if batch_size is not None:
+        if int(batch_size) < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        ecfg.batch_size = int(batch_size)
     base_name = ck.get("name", run_dir.name)
     _swap_embedding(model, ecfg, 1, dev)
 
     R = model.receptive_field
     clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
+    sr = cfg.sample_rate
     n_total = len(dry)
-    val_len = max(clip, int(round(val_frac * n_total)))
-    if n_total - val_len < clip:
-        raise RuntimeError(f"pair too short: need >= {2 * clip} samples "
-                           f"({2 * ecfg.clip_seconds:.0f} s) for a train+val split, "
-                           f"got {n_total}")
-    train_region, val_region = (0, n_total - val_len), (n_total - val_len, n_total)
+    if train_region is not None or val_region is not None:
+        if train_region is None or val_region is None:
+            raise ValueError("pass both train_region and val_region, or neither")
+        train_region = _norm_region(train_region, n_total)
+        val_region = _norm_region(val_region, n_total)
+        for tag, reg in (("train", train_region), ("val", val_region)):
+            if reg[1] - reg[0] < clip:
+                raise RuntimeError(f"{tag} region {reg} is shorter than one "
+                                   f"{clip}-sample clip ({ecfg.clip_seconds:.0f} s)")
+    else:
+        val_len = max(clip, int(round(val_frac * n_total)))
+        if n_total - val_len < clip:
+            raise RuntimeError(f"pair too short: need >= {2 * clip} samples "
+                               f"({2 * ecfg.clip_seconds:.0f} s) for a train+val split, "
+                               f"got {n_total}")
+        train_region, val_region = (0, n_total - val_len), (n_total - val_len, n_total)
+    val_len = val_region[1] - val_region[0]
     print(f"[enroll-pair] run={base_name} arch={ecfg.arch} name={name} "
-          f"pair={n_total / cfg.sample_rate:.1f}s "
-          f"(val last {val_len / cfg.sample_rate:.1f}s) pairs/epoch={pairs} lr={lr:g}")
+          f"pair={n_total / sr:.1f}s "
+          f"train {train_region[0] / sr:.1f}-{train_region[1] / sr:.1f}s "
+          f"val {val_region[0] / sr:.1f}-{val_region[1] / sr:.1f}s ({val_len / sr:.1f}s) "
+          f"pairs/epoch={pairs} batch={ecfg.batch_size} lr={lr:g} "
+          f"stft_weight={ecfg.stft_weight:g}")
 
     train_ds = WetDryDataset(dry, wet, receptive_field=R, clip_samples=clip,
                              region=train_region, pairs_per_epoch=pairs, seed=seed)
@@ -603,7 +720,9 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
 
     best_emb, best_val, best_epoch, epochs_run = _fit_embedding(
         model, ecfg, train_ds, val_loader, dev, epochs=epochs, lr=lr, seed=seed,
-        log_path=log_path, init_val=init_val, t0=t0)
+        log_path=log_path, init_val=init_val, t0=t0,
+        early_stop_patience=early_stop_patience,
+        plateau_patience=plateau_patience, plateau_factor=plateau_factor)
 
     # Deterministic final check: render the whole val region once (real
     # left-context from the train side) and score it raw + pre-emphasized.
@@ -623,6 +742,7 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
         "base_manifest_sha256": ck.get("manifest_sha256", ""),
         "init": "table_mean", "pairs": int(pairs), "epochs_run": epochs_run,
         "lr": float(lr), "seed": seed, "sample_rate": cfg.sample_rate,
+        "stft_weight": float(ecfg.stft_weight),
         "sources": dict(sources or {}),
         "val_esr_preemph_pooled": _json_num(best_val),
         "val_esr_render_raw": _json_num(val_raw),
@@ -631,10 +751,13 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
 
     metrics = {
         "run": base_name, "name": name, "pairs": int(pairs), "epochs": int(epochs),
+        "batch_size": int(ecfg.batch_size),
         "epochs_run": epochs_run, "best_epoch": best_epoch, "lr": float(lr),
-        "seed": seed, "init": "table_mean",
+        "seed": seed, "init": "table_mean", "stft_weight": float(ecfg.stft_weight),
         "pair_seconds": round(n_total / cfg.sample_rate, 2),
         "val_seconds": round(val_len / cfg.sample_rate, 2),
+        "train_region": [int(train_region[0]), int(train_region[1])],
+        "val_region": [int(val_region[0]), int(val_region[1])],
         "init_val_esr_pooled": _json_num(init_val),
         "best_val_esr_pooled": _json_num(best_val),
         "val_esr_render_raw": _json_num(val_raw),

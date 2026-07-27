@@ -3,20 +3,27 @@
 # device-embedding FiLM as the TCN runs. Architecture comparison point against
 # paper/embed256/channels32: what does the capture-native topology buy?
 #
-#   openamp emulate --config configs/emulate/wavenet_a2.yaml --overfit           # sanity #1
-#   openamp emulate --config configs/emulate/wavenet_a2.yaml --limit-devices 10  # mini-run
-#   openamp emulate --config configs/emulate/wavenet_a2.yaml                     # full run
+#   openamp emulate --config configs/emulate/wavenet_a2_1024.yaml --overfit           # sanity #1
+#   openamp emulate --config configs/emulate/wavenet_a2_1024.yaml --limit-devices 10  # mini-run
+#   openamp emulate --config configs/emulate/wavenet_a2_1024.yaml                     # full run
 #
 # Training knobs inherit the paper defaults; only arch selection lives here.
 emulate:
   arch: film_wavenet
   wn_channels: 8           # A2 full-width; width sweeps = copy file, change number
-  embedding_dim: 256
+  embedding_dim: 1024
   # Extended past the default 60 to give the annealed run more room; early-stop
   # (patience 8) still ends it once val ESR plateaus.
-  epochs: 80
+  epochs: 100
 
-  lr: 2.5e-4
+  # Keep the decimal point: PyYAML resolves bare `1e-2` as a *string*, which
+  # reaches Adam untyped and dies with a TypeError at optimizer construction.
+  #
+  # 1.0e-2 diverged inside 100 steps here (esr 1.1 -> 1e11, oscillating 1e6..1e15
+  # despite grad clipping). 4.0e-3 is what wavenet_a2 uses for this same a2-23L
+  # topology; embedding_dim 1024 is the only structural change from that run.
+  lr: 4.0e-3
+  weight_decay: 3.17e-7
   # bf16 like channels32: fp16 forward overflow NaN-killed two TCN runs, and
   # fp32 may not fit next to the neighbor's MPS workers on the shared GPU.
   amp: true

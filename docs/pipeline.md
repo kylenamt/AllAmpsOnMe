@@ -168,14 +168,19 @@ openamp emulate-demo results/emulate/paper                # clean/target/pred WA
 
 - **Config** — all knobs live in the `emulate:` section; a per-run file under `configs/emulate/<name>.yaml`
   overrides just that section and the **run name is the file stem**. Shipped configs: `paper` (default),
-  `embed16`/`embed256`, `channels32`, `deep3x8`, `wavenet_a2` (the capture-native architecture), and
+  `embed16`/`embed256`, `channels32`, `deep3x8`, `wavenet_a2` (the capture-native architecture),
+  `wavenet_a2_tanh` (the same run with `wn_activation: tanh`), and
   `baseline_{clean,crunch,high_gain}` (one-to-one `single_device` references for the one-to-many gap).
-  Copy one, change numbers, rerun — no code changes.
+  Two bases to copy from: `paper` for FiLM-TCN runs, `nam_a2` for FiLM-WaveNet ones (same A2 topology as
+  `wavenet_a2`, but with NAM's own training numbers — lr 4e-3, weight decay 3.17e-7, 100 epochs, MRSTFT
+  as a light regularizer rather than a 1:1 term). Copy one, change numbers, rerun — no code changes.
 - **Model** — both archs are causal with FiLM (per-channel scale+shift from the device embedding) at
   every layer. `film_tcn`: `blocks × layers_per_block` dilated convs (1021 samples / 21 ms receptive
   field for the paper default). `film_wavenet`: the exact NAM A2 WaveNet topology of the corpus's own
   captures (23 dilated layers, channels 8, 6347 samples / 132 ms), FiLM at the A2 schema's
-  pre-activation hook. Training clips are prefixed with the receptive field of **real left-context** from the
+  pre-activation hook, per-layer nonlinearity chosen by `wn_activation` — `leakyrelu` (slope 0.01, what
+  the captures use) or `tanh`, both A2-schema activations so either stays plugin-playable after export.
+  Training clips are prefixed with the receptive field of **real left-context** from the
   source file, so warmup uses actual audio and the loss covers only conditioned samples.
 - **Device holdout** — `holdout_frac` (default 0.1) excludes a seeded ~10% of render-ok devices from
   training entirely, so Phase 5 can enroll them as truly unseen devices (the reference code's 90/10
