@@ -4,7 +4,7 @@ The whole pipeline is a flat list of verbs, in run order:
 
   acquire :  auth · discover · select · download · validate · dedup · finalize · status
   corpus  :  corpus · subset · render · verify
-  emulate :  emulate · emulate-compare · emulate-demo · emulate-enroll
+  emulate :  emulate · emulate-compare · emulate-validate · emulate-demo · emulate-enroll
 
 Each command is thin: it loads the one :class:`~openamp.core.config.Config`, then calls
 into a stage module. Heavy imports (torch, NAM, soundfile) live inside the command
@@ -73,6 +73,24 @@ def _load_working(cfg):
     return df
 
 
+def _prefixed_out(out: Path, run: Path) -> Path:
+    """Prefix an export filename with the run's name, so exports collected from
+    different runs into one folder don't collide or get mixed up."""
+    name = run.name
+    if out.stem == name or out.stem.startswith(f"{name}_"):
+        return out
+    return out.with_name(f"{name}_{out.name}")
+
+
+def _resolve_run(cfg, run: str) -> Path:
+    """A run name (``results/emulate/<name>/``) or a path to a run dir -> the dir."""
+    for cand in (Path(run), cfg.emulate_run_dir(str(run))):
+        if (cand / "checkpoint.pt").is_file():
+            return cand
+    raise click.ClickException(
+        f"No checkpoint.pt under {Path(run)} or {cfg.emulate_run_dir(str(run))}.")
+
+
 def _print_status(cfg) -> None:
     df = manifest_mod.read_manifest(cfg.manifest_path)
     counts = manifest_mod.counts_by_status(df)
@@ -91,7 +109,8 @@ def cli(verbose: bool) -> None:
     and train the FiLM-TCN amp foundation model.
 
     Run order: auth discover select download validate dedup finalize · corpus
-    subset render verify · emulate emulate-compare emulate-demo emulate-enroll.
+    subset render verify · emulate emulate-compare emulate-validate emulate-demo
+    emulate-enroll.
     """
     _setup_logging(verbose)
 
@@ -338,6 +357,33 @@ def emulate_compare(runs, device, n_pairs) -> None:
                    f"MRSL={r['test_MRSL_mean']:.3f} params={r['params']:,}")
 
 
+@cli.command("emulate-validate")
+@click.argument("run")
+@click.option("--windows", default=128, show_default=True,
+              help="Test windows per device (the same grid for every device).")
+@click.option("--device", default=None, help="cuda/cpu (default: auto).")
+@click.option("--batch-size", type=int, default=None, help="Override the config batch size.")
+@click.option("--seed", type=int, default=None, help="Window-grid seed (default: config).")
+@click.option("--out", type=Path, default=None,
+              help="CSV path (default: <run>/per_device_esr.csv).")
+def emulate_validate(run, windows, device, batch_size, seed, out) -> None:
+    """Per-amp test ESR for one run -> <run>/per_device_esr.csv.
+
+    RUN is a run name (results/emulate/<name>/) or a path to a run dir. Every
+    trained device is scored on the same fixed grid of test windows, so the rows
+    rank amps against each other: what the model learned well, and whether the
+    run's headline ESR is skewed by a few bad devices.
+    """
+    from openamp.emulate import evaluate as emu_eval
+
+    cfg = _config()
+    run_dir = _resolve_run(cfg, run)
+    rows = emu_eval.validate_per_device(cfg, run_dir, device=device or _default_device(),
+                                        n_windows=windows, batch_size=batch_size,
+                                        seed=seed, out_path=out)
+    click.echo(emu_eval.format_per_device_summary(rows))
+
+
 @cli.command("emulate-demo")
 @click.argument("run", type=Path)
 @click.option("--n-devices", default=4, show_default=True)
@@ -380,7 +426,8 @@ def emulate_enroll(run, devices, pairs, epochs, lr, device, seed) -> None:
 @cli.command("emulate-export-bundle")
 @click.argument("run", type=Path)
 @click.option("--out", type=Path, default=None,
-              help="Output path (default: <run>/export/bundle.json).")
+              help="Output path (default: <run>/export/<run-name>_bundle.json). "
+                   "The run's name is prefixed onto the filename either way.")
 @click.option("--profile-device", "profile_devices", multiple=True, type=int,
               help="Also embed this trained device's row as a built-in profile "
                    "(repeatable).")
@@ -395,14 +442,17 @@ def emulate_export_bundle(run, out, profile_devices, profile_pairs) -> None:
 
     if not (run / "checkpoint.pt").is_file():
         raise click.ClickException(f"No checkpoint.pt under {run}.")
-    out = out or run / "export" / "bundle.json"
+    out = _prefixed_out(out or run / "export" / "bundle.json", run)
     s = emu_export.export_bundle(run, out, profile_device_ids=list(profile_devices),
                                  profile_pairs=list(profile_pairs))
     a = s["arch"]
+    # type= matters to the operator: it is the plugin's payload discriminator.
+    cond = (f" cond={a['cond_hidden']}/{a['cond_activation']}" if "cond_hidden" in a
+            else f" rank={a['delta_rank']}" if "delta_rank" in a else "")
     click.echo(f"  {out}  ({s['bytes'] / 1e6:.2f} MB)")
-    click.echo(f"  run {s['run']['name']} sha8={s['run']['sha8']} "
-               f"E={a['embedding_dim']} C={a['channels']} sr={s['sample_rate']} "
-               f"profiles={_json.dumps(s['profiles'])}")
+    click.echo(f"  run {s['run']['name']} sha8={s['run']['sha8']} type={a['type']} "
+               f"E={a['embedding_dim']} C={a['channels']}{cond} "
+               f"sr={s['sample_rate']} profiles={_json.dumps(s['profiles'])}")
 
 
 @cli.command("emulate-export-profile")
@@ -414,7 +464,8 @@ def emulate_export_bundle(run, out, profile_devices, profile_pairs) -> None:
               help="Export enroll/pairs/<name>'s enrolled embedding.")
 @click.option("--name", default=None, help="Display name inside the profile.")
 @click.option("--out", type=Path, default=None,
-              help="Also write the JSON here (always printed to stdout).")
+              help="Also write the JSON here, prefixed with the run's name "
+                   "(always printed to stdout).")
 def emulate_export_profile(run, device_id, mean, pair_name, name, out) -> None:
     """Print one pasteable embedding profile (JSON) for the morph plugin."""
     import json as _json
@@ -431,6 +482,7 @@ def emulate_export_profile(run, device_id, mean, pair_name, name, out) -> None:
         raise click.ClickException(str(exc))
     text = _json.dumps(p)
     if out:
+        out = _prefixed_out(out, run)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(text, encoding="utf-8")
     click.echo(text)
@@ -442,7 +494,8 @@ def emulate_export_profile(run, device_id, mean, pair_name, name, out) -> None:
 @click.option("--pairs", is_flag=True,
               help="Also append every enroll/pairs/<name> enrolled embedding.")
 @click.option("--out", type=Path, default=None,
-              help="Also write the JSON array here (always printed to stdout).")
+              help="Also write the JSON array here, prefixed with the run's name "
+                   "(always printed to stdout).")
 def emulate_export_profiles(run, mean, pairs, out) -> None:
     """Print all trained device embeddings as a JSON list of pasteable profiles."""
     import json as _json
@@ -458,6 +511,7 @@ def emulate_export_profiles(run, mean, pairs, out) -> None:
         raise click.ClickException(str(exc))
     text = _json.dumps(ps)
     if out:
+        out = _prefixed_out(out, run)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(text, encoding="utf-8")
     click.echo(text)

@@ -28,8 +28,27 @@ Two artifacts leave this module:
   ``run`` is the first 8 hex chars of the checkpoint's sha256, so the plugin
   can reject profiles enrolled against a different network.
 
-WaveNet-only: folding into the TCN would work the same way, but the plugin
-ships the A2 topology; exporting a ``film_tcn`` run is a hard error.
+``delta_wavenet`` folds the same way, one step upstream: its generator emits the
+layer's own weight residual, so folding is literally::
+
+    conv.weight  += dW(e)
+    conv.bias    += db(e)
+    mixin.weight += dm(e)
+
+Same guarantee, same stock-A2 result — and no per-channel structure to preserve,
+because the residual is already in weight space.
+
+All three A2 archs export: ``film_wavenet``, ``mlpfilm_wavenet``, ``delta_wavenet``.
+Only *how* the conditioning is computed from ``e`` differs, and that is
+discriminated by ``arch.type`` (``film_wavenet_a2`` / ``mlpfilm_wavenet_a2`` /
+``delta_wavenet_a2``). ``aaom_bundle`` stays 1: the envelope is unchanged, and the
+per-arch layer payload is what ``arch.type`` exists to select. An mlpfilm bundle
+carries ``film_layers``, a delta bundle ``delta_coeff_w``/``delta_coeff_b``/
+``delta_basis``, and both deliberately **omit** ``film_w``/``film_b``, so a reader
+that predates the arch fails on a missing key rather than folding garbage.
+
+WaveNet-only: folding into the TCN would work the same way, but the plugin ships
+the A2 topology; exporting a ``film_tcn`` run is a hard error.
 """
 
 from __future__ import annotations
@@ -42,7 +61,9 @@ import numpy as np
 import torch
 
 from openamp.core.util import sha256_file
-from openamp.emulate.wavenet import NAM_ACTIVATION_NAMES, FiLMWaveNet
+from openamp.emulate.wavenet import (NAM_ACTIVATION_NAMES, DeltaWaveNet, FiLMWaveNet,
+                                     MLPFiLMWaveNet, init_delta_zero,
+                                     init_film_identity)
 
 __all__ = ["export_bundle", "export_profile", "export_profiles", "folded_model",
            "forward_with_embedding", "run_sha8",
@@ -72,20 +93,48 @@ def _unblob(b: dict) -> np.ndarray:
 
 
 def _require_wavenet(model) -> FiLMWaveNet:
-    if not isinstance(model, FiLMWaveNet):
-        raise RuntimeError(
-            f"morph exports support film_wavenet runs only, got {type(model).__name__}")
+    if not isinstance(model, FiLMWaveNet):     # the other A2 archs subclass it
+        raise RuntimeError("morph exports support film_wavenet / mlpfilm_wavenet / "
+                           f"delta_wavenet runs only, got {type(model).__name__}")
     return model
 
 
 # --- Folding + reference forward ------------------------------------------------
 @torch.no_grad()
-def folded_model(model: FiLMWaveNet, emb: torch.Tensor) -> FiLMWaveNet:
-    """Deep copy with FiLM(``emb``) folded into conv/mixin weights.
+def _fold_layer(layer, emb: torch.Tensor, channels: int) -> None:
+    """Fold one layer's conditioning at ``emb`` into its own weights, in place.
 
-    The copy's FiLM layers are neutralized (weight 0, bias = identity), so its
-    forward — with *any* device_idx — is the plain A2 WaveNet the plugin runs.
-    ``emb`` is a ``[embedding_dim]`` vector (any morph point, not just rows).
+    Then neutralize the generator, so the layer's forward ignores its embedding
+    argument entirely — that is what makes the copy a plain A2 layer for *any*
+    device_idx. Two shapes of conditioning, one contract:
+
+    - FiLM (``film_wavenet`` / ``mlpfilm_wavenet``): per-channel affine on the
+      conv output, absorbed by scaling the rows of conv/mixin and shifting the
+      bias. Both generators fold identically; only ``film(emb)`` differs.
+    - Delta (``delta_wavenet``): the generator already speaks in weight space, so
+      the fold is the addition the layer would have done.
+    """
+    if hasattr(layer, "delta"):
+        dw, db, dm = layer.delta(emb)                       # [1,C,C,K], [1,C], [1,C]
+        layer.conv.weight.add_(dw[0])
+        layer.conv.bias.add_(db[0])
+        layer.input_mixer.weight.add_(dm[0].reshape(-1, 1, 1))
+        init_delta_zero(layer.delta)                        # delta -> exact zero
+        return
+    gamma, beta = layer.film(emb).chunk(2, dim=-1)          # [C], [C]
+    layer.conv.weight.mul_(gamma[:, None, None])
+    layer.conv.bias.mul_(gamma).add_(beta)
+    layer.input_mixer.weight.mul_(gamma[:, None, None])
+    init_film_identity(layer.film, channels)                # FiLM -> exact identity
+
+
+@torch.no_grad()
+def folded_model(model: FiLMWaveNet, emb: torch.Tensor) -> FiLMWaveNet:
+    """Deep copy with the conditioning at ``emb`` folded into the conv weights.
+
+    The copy's conditioning generators are neutralized, so its forward — with
+    *any* device_idx — is the plain A2 WaveNet the plugin runs. ``emb`` is a
+    ``[embedding_dim]`` vector (any morph point, not just rows).
     """
     _require_wavenet(model)
     import copy
@@ -95,13 +144,7 @@ def folded_model(model: FiLMWaveNet, emb: torch.Tensor) -> FiLMWaveNet:
                          f"model expects {model.embedding_dim}")
     m = copy.deepcopy(model).eval()
     for layer in m.layers:
-        gamma, beta = layer.film(emb).chunk(2, dim=-1)      # [C], [C]
-        layer.conv.weight.mul_(gamma[:, None, None])
-        layer.conv.bias.mul_(gamma).add_(beta)
-        layer.input_mixer.weight.mul_(gamma[:, None, None])
-        layer.film.weight.zero_()                           # FiLM -> identity
-        layer.film.bias[:m.channels] = 1.0
-        layer.film.bias[m.channels:] = 0.0
+        _fold_layer(layer, emb, m.channels)
     return m
 
 
@@ -128,6 +171,36 @@ def forward_with_embedding(model: FiLMWaveNet, x: torch.Tensor,
 
 
 # --- Bundle --------------------------------------------------------------------
+def _cond_blobs(layer) -> dict:
+    """One layer's conditioning weights, in the shape the plugin's re-fold expects.
+
+    film_wavenet's single Linear ships as ``film_w``/``film_b`` -- the keys that
+    shipped from day one, byte-identical. mlpfilm_wavenet ships ``film_layers``
+    (its Linears in input->output order; apply ``arch.cond_activation`` *between*
+    them and not after the last). delta_wavenet ships its generator instead:
+    ``delta = (coeff_w @ e + coeff_b) @ delta_basis``, split into the kernel residual
+    (first ``C*C*K`` entries, C-order like ``conv_w``), the bias residual (next
+    ``C``) and the mixin-gain residual (last ``C``). Each non-legacy arch
+    deliberately **omits** ``film_w``/``film_b``:
+    ``arch.type`` is the intended discriminator, but a reader that predates the arch
+    and ignores it then dies on a missing key instead of silently folding garbage
+    and playing the wrong amp at full volume.
+    """
+    if hasattr(layer, "delta"):
+        # effective_basis() folds the training-time direction/magnitude split back
+        # into one matrix, so the plugin's re-fold is a plain matmul and the bundle
+        # format is unchanged by that reparameterization.
+        return {"delta_coeff_w": _blob(layer.delta.coeff.weight),
+                "delta_coeff_b": _blob(layer.delta.coeff.bias),
+                "delta_basis": _blob(layer.delta.effective_basis())}
+    film = layer.film
+    if isinstance(film, torch.nn.Linear):
+        return {"film_w": _blob(film.weight), "film_b": _blob(film.bias)}
+    return {"film_layers": [{"w": _blob(l.weight), "b": _blob(l.bias)}
+                            for l in film.modules()
+                            if isinstance(l, torch.nn.Linear)]}
+
+
 @torch.no_grad()
 def export_bundle(run_dir: Path, out_path: Path, *,
                   profile_device_ids: list[int] | None = None,
@@ -146,7 +219,7 @@ def export_bundle(run_dir: Path, out_path: Path, *,
 
     layers = [{"conv_w": _blob(l.conv.weight), "conv_b": _blob(l.conv.bias),
                "mixin_w": _blob(l.input_mixer.weight),
-               "film_w": _blob(l.film.weight), "film_b": _blob(l.film.bias),
+               **_cond_blobs(l),
                "x1_w": _blob(l.layer1x1.weight), "x1_b": _blob(l.layer1x1.bias)}
               for l in model.layers]
 
@@ -164,6 +237,8 @@ def export_bundle(run_dir: Path, out_path: Path, *,
         profiles.append({"name": str(blob.get("name", name)),
                          "embedding": blob["embedding"].reshape(-1).tolist()})
 
+    is_delta = isinstance(model, DeltaWaveNet)
+    is_mlp = isinstance(model, MLPFiLMWaveNet)
     bundle = {
         "aaom_bundle": BUNDLE_VERSION,
         "run": {"name": ck.get("name", run_dir.name), "sha8": run_sha8(run_dir),
@@ -172,12 +247,19 @@ def export_bundle(run_dir: Path, out_path: Path, *,
                 "val_esr": float(ck.get("val_esr", float("nan"))),
                 "n_devices": len(ck["device_ids"])},
         "sample_rate": int(ck["sample_rate"]),
-        "arch": {"type": "film_wavenet_a2",
+        "arch": {"type": ("delta_wavenet_a2" if is_delta else
+                          "mlpfilm_wavenet_a2" if is_mlp else "film_wavenet_a2"),
                  "channels": model.channels,
                  "embedding_dim": model.embedding_dim,
                  # NAM's own spelling, so the plugin can hand it straight to
                  # NeuralAmpModelerCore; absent in pre-knob bundles = LeakyReLU.
                  "activation": NAM_ACTIVATION_NAMES[model.activation],
+                 # Per-arch generator descriptors only, so film_wavenet_a2 bundles
+                 # stay byte-identical to every one already shipped.
+                 **({"delta_rank": model.delta_rank} if is_delta else
+                    {"cond_hidden": model.cond_hidden,
+                     "cond_activation": NAM_ACTIVATION_NAMES[model.cond_activation]}
+                    if is_mlp else {}),
                  "kernel_sizes": list(model.kernel_sizes),
                  "dilations": list(model.dilations),
                  "head_kernel": model.head_kernel,

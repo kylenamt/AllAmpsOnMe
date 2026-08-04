@@ -51,7 +51,10 @@ class EmulateConfig:
 
     # --- Architecture ------------------------------------------------------------
     # "film_tcn" (paper FiLM-TCN) | "film_wavenet" (the corpus's own NAM A2
-    # WaveNet topology, FiLM-conditioned; see openamp/emulate/wavenet.py).
+    # WaveNet topology, FiLM-conditioned) | "mlpfilm_wavenet" (same A2 topology,
+    # but each layer's FiLM generator is a small MLP) | "delta_wavenet" (same A2
+    # topology, no FiLM: the embedding writes a low-rank residual onto each
+    # layer's conv weights). See emulate/wavenet.py.
     arch: str = "film_tcn"
 
     # --- FiLM-TCN model (fully parametric; the paper default is the values below)
@@ -67,6 +70,27 @@ class EmulateConfig:
     # uses) | "tanh" (NAM's other A2-schema activation, so the run still folds
     # into a plugin-playable capture). Validated in openamp/emulate/wavenet.py.
     wn_activation: str = "leakyrelu"
+
+    # --- MLP-FiLM WaveNet ("mlpfilm_wavenet"): the FiLM generator only -----------
+    # Hidden width of the per-layer embedding -> (gamma, beta) MLP
+    # (Linear(E,H) -> cond_activation -> Linear(H,2C), one independent generator per
+    # layer). At embedding_dim 256 / wn_channels 8: 16 is parameter-matched to
+    # film_wavenet's single Linear (4,384 vs 4,112 per layer), 32 is ~2x, 64
+    # quadruples the plugin bundle. Ignored by film_tcn and film_wavenet.
+    cond_hidden: int = 32
+    # Nonlinearity inside that MLP: same two options as wn_activation. Parameter-
+    # free, so it is resume-structural (see train.py's _STRUCTURAL_KEYS).
+    cond_activation: str = "leakyrelu"
+
+    # --- Delta WaveNet ("delta_wavenet"): the weight-residual generator -----------
+    # Rank of the per-layer map from the device embedding to a residual on that
+    # layer's conv kernel, bias and mixin gain (delta = scale * coeff(e) @
+    # normalize(basis), one shared basis of `delta_rank` unit-norm directions). The
+    # arch's only capacity knob. At embedding_dim 256 / wn_channels 8 the generators
+    # cost 16,263 * delta_rank + 23 params: rank 6 is parameter-matched to
+    # film_wavenet's 23 Linears (97,601 vs 94,576) and 8 is ~1.36x them. Ignored by
+    # the other archs.
+    delta_rank: int = 8
 
     # --- Shared model knobs ------------------------------------------------------
     embedding_dim: int = 64          # per-device embedding, FiLM at every layer

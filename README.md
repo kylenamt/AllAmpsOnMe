@@ -13,7 +13,7 @@ sequence of verbs:
 ```
 acquire :  auth · discover · select · download · validate · dedup · finalize · status
 corpus  :  corpus · subset · render · verify
-emulate :  emulate · emulate-compare · emulate-demo
+emulate :  emulate · emulate-compare · emulate-validate · emulate-demo
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the code layout and
@@ -62,6 +62,7 @@ openamp verify                          # completeness + QA -> devices_final.par
 # 3 — Train one FiLM-TCN over all devices
 openamp emulate --config configs/emulate/paper.yaml
 openamp emulate-compare results/emulate/*     # test-split comparison
+openamp emulate-validate paper                # per-amp test ESR -> <run>/per_device_esr.csv
 openamp emulate-demo results/emulate/paper    # listening WAVs
 ```
 

@@ -54,11 +54,11 @@ src/openamp/
 
   emulate/            # one-to-many amp foundation models (FiLM-conditioned)
     tcn.py            #   fully-parametric FiLM-TCN + per-device embedding table
-    wavenet.py        #   the NAM A2 capture topology, FiLM-conditioned (same contract)
+    wavenet.py        #   the NAM A2 capture topology, FiLM-conditioned: linear or MLP generator
     models.py         #   arch selection: `emulate.arch` -> build_model()
     dataset.py        #   clean-in / render-out training pairs (real left-context warmup)
     train.py          #   the one training script (pre-emph ESR + MRSTFT) + sanity ladder
-    evaluate.py       #   size-comparison harness (-> comparison.csv) + demo export
+    evaluate.py       #   size-comparison harness (-> comparison.csv) + per-amp ESR + demo export
 ```
 
 `core` and (mostly) `acquire` load on a bare numpy/pandas stack; `dsp` and
@@ -131,25 +131,46 @@ not the acquisition code.
 |---|---|---|---|
 | `emulate` | `train.py` | `renders/`, `renders.parquet`, `corpus.parquet` | `results/emulate/<name>/{checkpoint,last}.pt`, `config.yaml`, `metrics.json`, `train_log.csv`, `embedding.pt` |
 | `emulate-compare` | `evaluate.py` | run dirs + test renders | `results/emulate/comparison.csv` |
+| `emulate-validate` | `evaluate.py` | one run + test renders | `results/emulate/<name>/per_device_esr.csv` |
 | `emulate-demo` | `evaluate.py` | a run + test renders | `results/emulate/demos/*.wav` |
 
-One FiLM-conditioned model emulates **all**
-devices, steered by a learnable per-device embedding (FiLM scale+shift at every
-layer). Two architectures share the same contract and are selected by
+One conditioned model emulates **all**
+devices, steered by a learnable per-device embedding (conditioning at every
+layer). Four architectures share the same contract and are selected by
 `emulate.arch` (`models.build_model`): the fully-parametric FiLM-TCN (`tcn.py` —
 `blocks`, `layers_per_block`, `channels`, `kernel_size`, `dilation_growth`,
-`embedding_dim` are all plain config knobs) and the FiLM-WaveNet (`wavenet.py` —
+`embedding_dim` are all plain config knobs), the FiLM-WaveNet (`wavenet.py` —
 the exact NAM A2 topology every corpus capture uses, 23 dilated layers /
 receptive field 6347, with the device FiLM at the schema's pre-activation hook;
 `wn_channels` and `wn_activation` — `leakyrelu` (the captures' own) or `tanh` —
-are its knobs), so a sweep is copy-a-config-and-change-numbers with no code change. `dataset.py`
+are its knobs), the MLP-FiLM WaveNet (`mlpfilm_wavenet`, same file and same
+A2 topology, but each layer's embedding → (γ, β) generator is an independent
+`Linear(E, cond_hidden) → cond_activation → Linear(cond_hidden, 2C)` instead of
+one `Linear(E, 2C)`, so a device's position in embedding space steers the network
+nonlinearly), and the Delta WaveNet (`delta_wavenet`, same file and same A2
+topology, no FiLM at all: the embedding generates a rank-`delta_rank` residual on
+each layer's **own weights**, `z = conv_{W + dW(e), b + db(e)}(x) + (mixin_w +
+dm(e))·clean`, so a device can retime a filter rather than only re-gain it — FiLM
+is the special case `dW = (γ − 1)·W`, `db = (γ − 1)·b + β`, `dm = (γ − 1)·mixin_w`,
+which makes this a strict superset of the FiLM hook. The residual is
+`scale · coeff(e) @ normalize(basis)`: unit-norm directions with magnitude held in
+one scalar per layer, because with magnitude spread through `basis` the optimizer
+grows it for free and rebuilds each device's kernel from its own residual —
+measured at 5.1× the base weight before the split was introduced). All four fold into a
+plugin-playable A2 capture — the conditioning generator is never in the real-time
+DSP loop, and for `delta_wavenet` the fold *is* the addition the layer would have
+done. All four also share the one `[N_devices × embedding_dim]` table, so
+enrollment, morphing and profile export are architecture-independent. A sweep is
+copy-a-config-and-change-numbers with no code change. `dataset.py`
 serves clean-in / render-out pairs with the receptive field of **real left-context**
 prefixed for warmup (loss only on the warmed region). `train.py` optimizes
 pre-emphasized ESR + multi-resolution STFT (auraloss) with Adam + reduce-on-plateau,
 runs the sanity ladder (`--overfit`, `--limit-devices`), and saves the embedding
 table + its manifest hash separately (Phase 5 extends it). `evaluate.py` appends
 one test-split row per run to `comparison.csv` — the architecture-exploration
-deliverable — and exports clean/target/prediction listening demos.
+deliverable — breaks a single run back out per amp into `per_device_esr.csv`
+(every device scored on the *same* window grid, so the rows rank amps against
+each other), and exports clean/target/prediction listening demos.
 
 ---
 
@@ -218,6 +239,7 @@ qa/                            clean/render WAV + spectrogram QA pairs
 render_report.md               verify-stage summary
 emulate/<name>/                one emulation run (checkpoint, config, metrics, curves, embedding)
 emulate/comparison.csv         one test-split row per emulation run (size-sweep deliverable)
+emulate/<name>/per_device_esr.csv  one test-split row per device for that run (per-amp breakdown)
 emulate/demos/*.wav            clean/target/prediction listening demos
 ```
 

@@ -9,7 +9,7 @@ semantics, and troubleshooting. For the design rationale behind each stage see
 ```
 acquire :  auth · discover · select · download · validate · dedup · finalize · status
 corpus  :  corpus · subset · render · verify
-emulate :  emulate · emulate-compare · emulate-demo
+emulate :  emulate · emulate-compare · emulate-validate · emulate-demo
 ```
 
 ## Install & configure
@@ -163,23 +163,45 @@ openamp emulate --config configs/emulate/paper.yaml --limit-devices 10
 openamp emulate --config configs/emulate/paper.yaml       # full run -> results/emulate/paper/
 openamp emulate --config configs/emulate/embed16.yaml     # a size-sweep variant
 openamp emulate-compare results/emulate/*                 # test-split rows -> comparison.csv
+openamp emulate-validate paper                            # per-amp test ESR -> <run>/per_device_esr.csv
 openamp emulate-demo results/emulate/paper                # clean/target/pred WAVs (listening check)
 ```
 
 - **Config** — all knobs live in the `emulate:` section; a per-run file under `configs/emulate/<name>.yaml`
   overrides just that section and the **run name is the file stem**. Shipped configs: `paper` (default),
   `embed16`/`embed256`, `channels32`, `deep3x8`, `wavenet_a2` (the capture-native architecture),
-  `wavenet_a2_tanh` (the same run with `wn_activation: tanh`), and
+  `wavenet_a2_tanh` (the same run with `wn_activation: tanh`),
+  `mlpfilm_a2_256` / `mlpfilm_a2_h16_256` (the MLP FiLM generator; the `h16` one is
+  parameter-matched to `nam_a2_256`, so its delta isolates nonlinearity from capacity),
+  `delta_a2_256` / `delta_a2_r6_256` (conditioning moved into the conv weights; the `r6` one is
+  the parameter-matched half of that pair), and
   `baseline_{clean,crunch,high_gain}` (one-to-one `single_device` references for the one-to-many gap).
   Two bases to copy from: `paper` for FiLM-TCN runs, `nam_a2` for FiLM-WaveNet ones (same A2 topology as
   `wavenet_a2`, but with NAM's own training numbers — lr 4e-3, weight decay 3.17e-7, 100 epochs, MRSTFT
   as a light regularizer rather than a 1:1 term). Copy one, change numbers, rerun — no code changes.
-- **Model** — both archs are causal with FiLM (per-channel scale+shift from the device embedding) at
-  every layer. `film_tcn`: `blocks × layers_per_block` dilated convs (1021 samples / 21 ms receptive
+- **Model** — all four archs are causal and conditioned on the device embedding at every layer (FiLM's
+  per-channel scale+shift in three of them, a conv-weight residual in the fourth).
+  `film_tcn`: `blocks × layers_per_block` dilated convs (1021 samples / 21 ms receptive
   field for the paper default). `film_wavenet`: the exact NAM A2 WaveNet topology of the corpus's own
   captures (23 dilated layers, channels 8, 6347 samples / 132 ms), FiLM at the A2 schema's
   pre-activation hook, per-layer nonlinearity chosen by `wn_activation` — `leakyrelu` (slope 0.01, what
   the captures use) or `tanh`, both A2-schema activations so either stays plugin-playable after export.
+  `mlpfilm_wavenet`: that same A2 network, but each layer's FiLM generator is an independent
+  `Linear(E, cond_hidden) → cond_activation → Linear(cond_hidden, 2C)` rather than a single
+  `Linear(E, 2C)`. The conditioning is still per-channel affine, so it folds away to the identical
+  capture at export — `cond_hidden` costs training parameters and plugin bundle bytes, never
+  real-time CPU. At `embedding_dim: 256` / `wn_channels: 8`, `cond_hidden: 16` is parameter-matched to
+  `film_wavenet` (4,384 vs 4,112 per layer) and `32` is roughly double.
+  `delta_wavenet`: that same A2 network with the conditioning one step upstream — no FiLM, instead the
+  embedding generates a rank-`delta_rank` residual on each layer's conv kernel, bias and mixin gain
+  (`delta = scale · coeff(e) @ normalize(basis)`, one shared basis of unit-norm kernel-shaped
+  directions per layer plus one magnitude scalar — the split matters: without it the delta grows for
+  free and stops being a residual). FiLM is inside
+  that family (`dW = (γ − 1)·W`, `db = (γ − 1)·b + β`, `dm = (γ − 1)·mixin_w`), but a residual can also
+  rotate a kernel, so a device retimes a filter instead of only re-levelling it — a strict superset of
+  the FiLM hook, so a null result is about the hook, not capacity. Folds to the identical stock capture — the
+  fold *is* the addition — and at `embedding_dim: 256` / `wn_channels: 8` the generators cost
+  16,263 × `delta_rank` params (+23 scales), so rank 6 is parameter-matched to `film_wavenet` (97,601 vs 94,576).
   Training clips are prefixed with the receptive field of **real left-context** from the
   source file, so warmup uses actual audio and the loss covers only conditioned samples.
 - **Device holdout** — `holdout_frac` (default 0.1) excludes a seeded ~10% of render-ok devices from
@@ -193,11 +215,23 @@ openamp emulate-demo results/emulate/paper                # clean/target/pred WA
   `checkpoint.pt` (best) + `last.pt`, `config.yaml`, `metrics.json`, `train_log.csv`, and `embedding.pt`
   (the table + its manifest hash, saved separately for Phase 5). Every run reports `val_esr_shuffled`
   (val ESR with the embeddings permuted across devices) — it must be **worse** than `val_esr`, which
-  proves the conditioning is doing real work.
+  proves the conditioning is doing real work. Console output belongs in the run dir too — launch a long
+  run as `nohup openamp emulate --config configs/emulate/<name>.yaml > results/emulate/<name>/train_stdout.log 2>&1 &`
+  so the log lands beside the checkpoints instead of as a loose `nohup.out` (a resumed leg goes to
+  `train_stdout_resume.log`).
 - **Compare** — `emulate-compare` evaluates each run on the held-out **test** split and appends one row per
   run to `results/emulate/comparison.csv` (`run_name, params, receptive_field_ms, embedding_dim, channels,
   blocks_x_layers, test_ESR_mean, test_ESR_median, test_MRSL_mean, train_hours`). That CSV is the
   architecture-exploration deliverable; re-evaluating a run replaces its row.
+- **Validate per amp** — `emulate-validate <run-name-or-dir>` takes *one* run and writes
+  `results/emulate/<name>/per_device_esr.csv`: one row per trained device (`device_id, name, make, model,
+  gain_bucket, architecture, n_windows, test_ESR, test_MRSTFT`), sorted best-ESR first, plus a printed
+  summary of the spread, the best/worst amps and the medians per gain bucket. Every device is scored on
+  the **same** grid of `--windows` test windows (drawn once from the seed, silence-screened on the clean
+  side), so differences between rows are the model, not window luck; `test_ESR` is pooled per device
+  (one ratio of summed energies, as in training), so one quiet window cannot dominate an amp's score.
+  Use it to see which amp types the shared model learned well and whether the run's headline ESR is
+  skewed by a few outlier devices.
 
 > `auraloss` (multi-resolution STFT loss) is a dependency; `pip install -e .` pulls it in. GPU strongly
 > recommended — the paper-default run is ~187 K steps; use `--limit-devices` / `--epochs` for quick passes.

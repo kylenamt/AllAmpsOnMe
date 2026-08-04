@@ -1,0 +1,61 @@
+# nam_a2_256 with a nonlinear FiLM generator — the headline mlpfilm_wavenet run.
+# Run name is the file stem ("mlpfilm_a2_256") -> results/emulate/mlpfilm_a2_256/.
+#
+#   openamp emulate --config configs/emulate/mlpfilm_a2_256.yaml --overfit           # sanity #1
+#   openamp emulate --config configs/emulate/mlpfilm_a2_256.yaml --limit-devices 10  # mini-run
+#   openamp emulate --config configs/emulate/mlpfilm_a2_256.yaml                     # full run
+#
+# Identical to nam_a2_256.yaml except the arch and the two cond_* knobs, so the
+# comparison-CSV delta against nam_a2_256 is the FiLM generator and nothing else.
+# Note it is not a parameter-matched comparison — cond_hidden 32 roughly doubles
+# the generator (8,752 vs 4,112 params/layer). Pair it with mlpfilm_a2_h16_256,
+# which is matched, to separate nonlinearity from capacity.
+#
+# This is a FULL copy of nam_a2.yaml with those changes, not a delta: a per-run
+# file is read *instead of* configs/openamp.yaml, not merged over another emulate
+# config, so anything omitted here falls back to the EmulateConfig dataclass
+# defaults (stft_weight 1.0, weight_decay 0.0, lr 5e-4 — the paper's TCN numbers),
+# silently undoing the NAM recipe. See nam_a2.yaml for the derivation of each value.
+
+emulate:
+  # --- Model -------------------------------------------------------------------
+  arch: mlpfilm_wavenet    # A2 topology; per-layer MLP maps embedding -> (gamma, beta)
+  wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
+  embedding_dim: 256
+  single_device: -1        # -1 = one-to-many over all render-ok devices
+  # Generator: Linear(256, 32) -> LeakyReLU -> Linear(32, 16), independently per
+  # layer. Folded away per morph point, so this costs training params and plugin
+  # bundle bytes (~0.57 -> ~1.14 MB), never real-time CPU.
+  cond_hidden: 32
+  # leakyrelu is positively homogeneous, so the generator is curved from step 0.
+  # tanh sits in its linear region at init (measured 0.35% nonlinear) and would
+  # spend early epochs as a re-parameterized film_wavenet — a confound here.
+  cond_activation: leakyrelu
+
+  # --- Training (NAM's A2 numbers where the knob exists) -----------------------
+  holdout_frac: 0.1
+  clip_seconds: 2.0        # must match the corpus clip grid
+  batch_size: 32
+  pairs_per_epoch: 50000
+  epochs: 140              # was 100; hit max_epochs at best=0.09063 (ep95) w/o early-stop ->
+                           # extending 40 more epochs from the 2026-07-30 --resume checkpoint
+  # NAM optimizer block, verbatim. Keep the decimal point: PyYAML resolves bare
+  # `4e-3` as a *string*, which reaches Adam untyped and dies at construction.
+  # lr hand-annealed to 6.25e-5 (train_log.csv's last logged lr) for the --resume
+  # continuation above, per train.py's resume note — config is authoritative on
+  # resume, so leaving this at 4.0e-3 would blow the annealed LR back up 64x.
+  # Restore to 4.0e-3 if this config is ever used to start a fresh run instead.
+  lr: 6.25e-5
+  weight_decay: 3.17e-7
+  plateau_patience: 3
+  plateau_factor: 0.5
+  early_stop_patience: 8
+  # NAM's 5e-4 MRSTFT weight rescaled from its MSE term to this trainer's ESR term
+  # (ESR = MSE / mean(t^2); corpus renders sit at median mean(t^2) 0.0096).
+  stft_weight: 0.05
+  preemph: 0.85            # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50
