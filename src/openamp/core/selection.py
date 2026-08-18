@@ -1,19 +1,16 @@
 """Shared diversity-preserving selection engine (caps + gain floor + round-robin).
 
-Both acquisition selection (:mod:`openamp.acquire.select`, over candidate models)
-and render-subset selection (:mod:`openamp.corpus.subset`, over the finalized manifest)
-pick a diverse, gain-balanced subset under the same policy:
-
-  Phase A — guarantee each known gain bucket at least ``min_fraction`` of ``target``.
-  Phase B — fill the remainder by brand round-robin over everything left.
-
-Both phases respect per-tone / per-creator / per-(make, model) caps so no single
-upload, author, or amp model dominates. The two callers differ only in row schema
-(which column is the identity, and the within-make tie-break), so those are passed
-in as ``id_of`` / ``sort_key`` and the engine here stays schema-agnostic.
-
-Rows are plain dicts carrying at least ``make``, ``model``, ``tone_id``,
-``creator_id``, and ``gain_bucket``.
+- Used by both acquisition selection (:mod:`openamp.acquire.select`, over
+  candidate models) and render-subset selection (:mod:`openamp.corpus.subset`,
+  over the finalized manifest) — same policy, two callers:
+  - Phase A: guarantee each known gain bucket at least ``min_fraction`` of ``target``.
+  - Phase B: fill the remainder by brand round-robin over everything left.
+- Both phases respect per-tone / per-creator / per-(make, model) caps, so no
+  single upload, author, or amp model dominates.
+- Callers differ only in row schema (identity column, within-make tie-break),
+  passed in as ``id_of`` / ``sort_key`` — the engine itself stays schema-agnostic.
+- Rows are plain dicts carrying at least ``make``, ``model``, ``tone_id``,
+  ``creator_id``, ``gain_bucket``.
 """
 
 from __future__ import annotations

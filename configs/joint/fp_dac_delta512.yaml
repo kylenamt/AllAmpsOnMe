@@ -1,0 +1,118 @@
+# Frozen DAC fingerprint -> small adapter -> the delta_a2_tanh_r32_512 generator.
+# Run name is the file stem -> results/joint/fp_dac_delta512/.
+#
+#   OPENAMP_DATA_DIR=data openamp joint --config configs/joint/fp_dac_delta512.yaml --overfit --limit-devices 8
+#   OPENAMP_DATA_DIR=data openamp joint --config configs/joint/fp_dac_delta512.yaml --limit-devices 16 --epochs 3
+#   OPENAMP_DATA_DIR=data openamp joint --config configs/joint/fp_dac_delta512.yaml
+#   OPENAMP_DATA_DIR=data openamp joint-eval results/joint/fp_dac_delta512
+#
+# The question. Every encoder tried here recognizes amps and none of them *places*
+# an unseen one: joint/proto reaches holdout retrieval top-1 0.978 while its
+# holdout ESR is 0.762, against 0.254 for a vector fitted directly on the same
+# held-out amps with the same generator. So the conditioning space generalizes and
+# the encoder's map into it does not.
+#
+# A frozen audio codec is the opposite kind of encoder: it was never trained on
+# this task, so it cannot have overfit to it, and it is measurably reliable at
+# identity -- pooling DAC's pre-quantization latents over the 171 s capture render
+# and matching an amp to itself across two disjoint halves succeeds 99.8% of the
+# time against 449 competitors. This run asks whether that identity converts into
+# placement.
+#
+# Why a lookup, not an encoder over a reference clip. The fingerprint is a
+# statistic over frames and short audio makes it noisy -- own-nearest falls to
+# 61.1% at 22 s and 17.8% at 12 s. A joint reference window is 2 s. So the vector
+# is precomputed once per amp from the full render and looked up by device id;
+# ref_seconds and the A/B disjointness machinery below are inert.
+#
+# What that buys, beyond reliability: this corpus (`data`) is EGDB-only and holds
+# no sweep renders at all, while the fingerprint is pooled from the sweep. The
+# conditioning signal therefore shares no audio whatsoever with any training or
+# evaluation window -- a stronger barrier than the different-file rule proto used.
+# All 450 devices carry identical nam_sha256 across `data` and the corpus the
+# fingerprints were encoded from, so they are the same amps.
+#
+# Baselines to read the result against, both on this generator:
+#   trained table, seen devices      best_val_esr 0.0334   (results/emulate/delta_a2_tanh_r32_512)
+#   fitted vector, unseen devices    <- results/emulate/delta_a2_tanh_r32_512/enroll
+# The second is the placement ceiling: what this generator does when an unseen
+# amp's vector is optimized directly rather than predicted.
+
+emulate:
+  # --- Model: delta_a2_tanh_r32_512, unchanged --------------------------------
+  # FULL copy, not a delta. Anything omitted falls back to the EmulateConfig
+  # dataclass defaults, silently undoing the recipe.
+  arch: delta_wavenet      # A2 topology; embedding -> low-rank residual on each conv
+  wn_channels: 8           # A2 full-width submodel
+  wn_activation: tanh
+  embedding_dim: 512       # widened with the rank so 23*32=736 DOF is not clipped
+  single_device: -1
+  delta_rank: 32
+
+  # --- Training ---------------------------------------------------------------
+  holdout_frac: 0.1
+  clip_seconds: 2.0
+  batch_size: 32
+  pairs_per_epoch: 50000
+  epochs: 150
+  # NOT the 1.25e-4 in configs/emulate/delta_a2_tanh_r32_512.yaml: that value was
+  # hand-annealed to resume a run mid-schedule. This is a fresh run, so it starts
+  # where that one started. Keep the decimal point -- PyYAML resolves bare `4e-3`
+  # as a *string*, which reaches Adam untyped and dies at construction.
+  lr: 4.0e-3
+  weight_decay: 3.17e-7
+  plateau_patience: 3
+  plateau_factor: 0.5
+  early_stop_patience: 15
+  stft_weight: 0.05
+  preemph: 0.85
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50
+
+joint:
+  # --- Conditioning source ----------------------------------------------------
+  enc_kind: fingerprint
+  # DAC (descript/dac_44khz), pre-quantization trunk, mean+std pooled over ~14,700
+  # frames of the 171 s sweep_train render, output_scale undone (how hard a device
+  # pushes is amp information). 450 devices plus the dry null at id -1.
+  fp_path: results/fingerprint/dac/sweep_train
+  # No corpus-scale standardization: per-dimension z-scoring over the amp
+  # population would rescale each axis by how much this particular 450-amp sample
+  # varied along it, which is a property of the corpus rather than of an amp, and
+  # would measure a new amp in units derived from amps it has nothing to do with.
+  # dry_l2 uses only the single fixed dry vector and per-sample arithmetic.
+  # Measured: dry subtraction drops mean pairwise cosine 0.886 -> 0.576, i.e. most
+  # of a raw fingerprint is "what DAC does to this audio", not "what this amp does".
+  fp_preprocess: dry_l2
+  fp_layernorm: false
+
+  # --- Adapter: the only thing learned on the conditioning side ----------------
+  # Same two-layer shape WaveNetEncoder projects with, so this arm differs from an
+  # encoder arm in exactly one place: where the pooled vector comes from.
+  # 2048 -> 128 -> 512 = 327,680 params, against the generator's 928,360. The 128
+  # bottleneck is not a throttle here: the fingerprint cloud's own effective
+  # dimensionality is ~2.8, so the input, not the adapter, is the narrow part.
+  enc_proj_hidden: 128
+  enc_activation: tanh
+  # ON. Nothing else bounds |e| and the reconstruction gradient inflates it: proto
+  # measured |e| -> 123 and total collapse (shuffled ratio exactly 1.00) with it off.
+  enc_normalize: true
+  enc_lr: 5.0e-4
+  # The adapter's own decay. Its deepest failure mode is memorization -- it sees the
+  # identical vector for a given amp on all 50,000 draws per epoch, where an encoder
+  # would see a fresh window each time -- and emulate.weight_decay is 3.17e-7, i.e.
+  # effectively none. Shrinkage is the natural guard.
+  enc_weight_decay: 1.0e-4
+
+  # --- Inert under enc_kind: fingerprint, kept so this is a full copy ----------
+  ref_seconds: 2.0
+  ref_different_file: true
+  ref_min_gap_seconds: 1.0
+  sources: []
+  enc_channels: 16
+  enc_attn_hidden: 64
+  enc_head: stats
+  grad_checkpoint_encoder: false

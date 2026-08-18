@@ -1,20 +1,20 @@
 """Training pairs for amp emulation: clean input -> a device's rendered output.
 
-Consumes the Phase 2 corpus + renders (:mod:`openamp.corpus`): the clean FLACs
-under ``clean/{split}/`` and each device's aligned renders under
-``renders/{device:04d}/`` (same length, sample-aligned — verify enforces it). One
-item is a random ``(device, file, window)`` draw: a 2 s clip of the render as the
-target, and the *same* clip of the clean input **prefixed with the receptive
-field of real left-context** from the source file, so the causal model is fully
-warmed and the loss is computed only on conditioned samples (spec §4.1, warmup).
-
-The per-device **embedding-table index is global and stable**: it is derived once
-from the sorted render-ok device set (:func:`build_device_index`) so a device's
-row is identical across train/val/test and can be saved for Phase 5 to extend.
-
-I/O is a seek-read per clip (:func:`openamp.dsp.audio.seek_read`) — batch 16
-through a real TCN is compute-heavy enough that the simple path keeps pace; add
-a preloaded crop cache only if a run turns out I/O-bound.
+- Consumes the Phase 2 corpus + renders (:mod:`openamp.corpus`): clean FLACs
+  under ``clean/{split}/`` and each device's aligned renders under
+  ``renders/{device:04d}/`` (same length, sample-aligned — verify enforces it).
+- One item is a random ``(device, file, window)`` draw: a 2 s clip of the render
+  as the target, and the *same* clip of the clean input **prefixed with the
+  receptive field of real left-context** from the source file, so the causal
+  model is fully warmed and the loss is computed only on conditioned samples
+  (spec §4.1, warmup).
+- The per-device **embedding-table index is global and stable**: derived once
+  from the sorted render-ok device set (:func:`build_device_index`) so a
+  device's row is identical across train/val/test and can be saved for Phase 5
+  to extend.
+- I/O is a seek-read per clip (:func:`openamp.dsp.audio.seek_read`) — batch 16
+  through a real TCN is compute-heavy enough that the simple path keeps pace;
+  add a preloaded crop cache only if a run turns out I/O-bound.
 """
 
 from __future__ import annotations
@@ -29,6 +29,44 @@ from torch.utils.data import Dataset
 from openamp.core import constants as C
 from openamp.core import manifest as manifests
 from openamp.core.util import sha256_file
+
+
+ITEM_READ_ATTEMPTS = 4          # consecutive failures before a read is called an outage
+
+
+def read_with_retry(draw, read, *, split: str, attempts: int = ITEM_READ_ATTEMPTS):
+    """Draw one item and read it, tolerating transient store failures.
+
+    - The render store lives on NFS, where a rare read flake would otherwise kill
+      a multi-hour run.
+    - ``draw()`` returns ``(slot, tag)``: an opaque item identity and a short
+      string for the log. ``read(slot)`` returns the item or raises.
+    - First retry re-reads the **same** slot after a brief backoff — a passing NFS
+      hiccup clears on its own, and the val set (fixed seed, never redrawn across
+      epochs) stays the intended item instead of silently swapping in an unrelated
+      one. Only once that same-item retry has also failed do we redraw, to route
+      around a file that's genuinely bad rather than just unlucky.
+    - ``attempts`` consecutive failures still raise — that's an outage, not a flake.
+
+    Shared by :class:`EmulationDataset` and :class:`ToneSegmentDataset`; the
+    same-item-then-redraw policy is a bug fix, pinned by tests in
+    ``tests/test_emulate.py``.
+    """
+    slot, tag = draw()
+    last_err: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return read(slot)
+        except Exception as e:
+            last_err = e
+            print(f"[dataset] read failed (attempt {attempt + 1}/{attempts}) "
+                  f"{tag}: {e!r}", flush=True)
+            time.sleep(0.5 * (attempt + 1))
+            if attempt >= 1:        # same-item retry also failed -- could be a bad file
+                slot, tag = draw()
+    raise RuntimeError(
+        f"{attempts} consecutive read failures in split '{split}' "
+        f"(last: {last_err!r}) — check the render store / filesystem")
 
 
 def render_ok_devices(config) -> list[int]:
@@ -129,7 +167,8 @@ class EmulationDataset(Dataset):
 
     def __init__(self, config, split: str, *, receptive_field: int,
                  id_to_idx: dict[int, int], clip_samples: int | None = None,
-                 pairs_per_epoch: int = 50_000, seed: int = 1234):
+                 pairs_per_epoch: int = 50_000, seed: int = 1234,
+                 sources: "tuple[str, ...] | list[str]" = ()):
         from openamp.dsp import audio as audio_io
 
         self.config = config
@@ -140,6 +179,7 @@ class EmulationDataset(Dataset):
         self.pairs_per_epoch = int(pairs_per_epoch)
         self.seed = int(seed)
         self.id_to_idx = dict(id_to_idx)
+        self.sources = tuple(str(s) for s in sources)   # () = every source
 
         corpus = manifests.read_manifest(config.corpus_manifest_path, manifests.CORPUS_COLUMNS)
         renders = manifests.read_manifest(config.renders_manifest_path, manifests.RENDERS_COLUMNS)
@@ -150,6 +190,8 @@ class EmulationDataset(Dataset):
         # Clean source files of this split + their true length (shared by every
         # device's aligned render, so we probe length once per file, not per device).
         files = corpus[corpus["split"] == split]
+        if self.sources:                              # e.g. sweep-only encoder training
+            files = files[files["source"].isin(self.sources)]
         self.files: list[dict] = []
         for r in files.itertuples(index=False):
             clean_path = config.clean_split_dir(split) / f"{r.file_id}.{config.output_format}"
@@ -159,7 +201,8 @@ class EmulationDataset(Dataset):
             if n >= self.clip_samples:                # need at least one full clip
                 self.files.append({"file_id": str(r.file_id), "n": int(n)})
         if not self.files:
-            raise RuntimeError(f"No usable clean files for split '{split}'.")
+            src = f" (sources={list(self.sources)})" if self.sources else ""
+            raise RuntimeError(f"No usable clean files for split '{split}'{src}.")
 
         # Devices available in this split that are also in the (global) table.
         ok = renders[(renders["split"] == split) & (renders["status"] == C.RENDER_OK)]
@@ -172,14 +215,20 @@ class EmulationDataset(Dataset):
     def __len__(self) -> int:
         return self.pairs_per_epoch
 
+    def _clean_path(self, file: dict) -> Path:
+        return self.config.clean_split_dir(self.split) / \
+            f"{file['file_id']}.{self.config.output_format}"
+
     def _read_pair(self, device_id: int, file: dict, rng) -> tuple[np.ndarray, np.ndarray]:
+        c = int(rng.integers(0, file["n"] - self.clip_samples + 1))   # clip start
+        return self._read_window(device_id, file, c)
+
+    def _read_window(self, device_id: int, file: dict, c: int) -> tuple[np.ndarray, np.ndarray]:
+        """The pair at a *given* clip start ``c`` (the draw itself lives in the caller)."""
         from openamp.dsp import audio as audio_io
 
         R, clip = self.receptive_field, self.clip_samples
-        n = file["n"]
-        c = int(rng.integers(0, n - clip + 1))        # clip start in the source file
-        clean_path = self.config.clean_split_dir(self.split) / \
-            f"{file['file_id']}.{self.config.output_format}"
+        clean_path = self._clean_path(file)
         render_path = self.config.device_render_dir(device_id) / \
             f"{file['file_id']}.{self.config.output_format}"
 
@@ -196,29 +245,24 @@ class EmulationDataset(Dataset):
         return clean.astype(np.float32, copy=False), target.astype(np.float32, copy=False)
 
     def item_arrays(self, i: int) -> dict:
-        """One draw, tolerant of transient I/O failures: the render store lives on
-        NFS, where a rare read flake would otherwise kill a multi-hour run. Each
-        failed attempt logs, backs off briefly, and redraws (the rng advances, so
-        a genuinely bad file is also routed around); four consecutive failures
-        still raise — that is an outage, not a flake."""
+        """One ``(device, file, window)`` draw, tolerant of transient I/O failures.
+
+        The draw itself lives here; the flake policy lives in
+        :func:`read_with_retry` (same item twice, then redraw, then raise).
+        """
         rng = np.random.default_rng((self.seed, int(i)))
-        last_err: Exception | None = None
-        for attempt in range(4):
+
+        def draw():
             d = int(rng.integers(0, len(self.device_ids)))
-            device_id = self.device_ids[d]
             file = self.files[int(rng.integers(0, len(self.files)))]
-            try:
-                clean, target = self._read_pair(device_id, file, rng)
-            except Exception as e:
-                last_err = e
-                print(f"[dataset] read failed (attempt {attempt + 1}/4) "
-                      f"device={device_id} file={file['file_id']}: {e!r}", flush=True)
-                time.sleep(0.5 * (attempt + 1))
-                continue
+            return (d, file), f"device={self.device_ids[d]} file={file['file_id']}"
+
+        def read(slot):
+            d, file = slot
+            clean, target = self._read_pair(self.device_ids[d], file, rng)
             return {"input": clean, "target": target, "device_idx": int(self.rows[d])}
-        raise RuntimeError(
-            f"4 consecutive read failures in split '{self.split}' "
-            f"(last: {last_err!r}) — check the render store / filesystem")
+
+        return read_with_retry(draw, read, split=self.split)
 
     def __getitem__(self, i: int) -> dict:
         a = self.item_arrays(i)
@@ -226,4 +270,105 @@ class EmulationDataset(Dataset):
             "input": torch.from_numpy(np.ascontiguousarray(a["input"])),
             "target": torch.from_numpy(np.ascontiguousarray(a["target"])),
             "device_idx": torch.tensor(a["device_idx"], dtype=torch.long),
+        }
+
+
+class DeviceGridDataset(EmulationDataset):
+    """Every device evaluated on the **same** fixed grid of test windows.
+
+    - Per-device ESR is only comparable *between* devices if the audio is held
+      constant — with independent random draws a device can look good or bad on
+      window luck alone. So the grid of ``(file, clip start)`` positions is
+      drawn once from ``seed`` and replayed for every device; item ``i`` is
+      ``(device i // n_windows, window i % n_windows)``, so one sequential pass
+      walks the whole device x window matrix device-major, letting a caller
+      accumulate per-device sums as batches arrive.
+    - Windows are pre-filtered on the **clean** signal's RMS (``silence_dbfs``):
+      a near-silent 2 s window carries no amp behaviour, and screening on the
+      shared clean side (not each device's render) keeps the grid identical
+      across devices.
+    """
+
+    def __init__(self, config, split: str, *, receptive_field: int,
+                 id_to_idx: dict[int, int], device_ids: "list[int] | None" = None,
+                 clip_samples: int | None = None, n_windows: int = 128,
+                 seed: int = 1234, silence_dbfs: float = -50.0):
+        super().__init__(config, split, receptive_field=receptive_field,
+                         id_to_idx=id_to_idx, clip_samples=clip_samples,
+                         pairs_per_epoch=1, seed=seed)
+        if device_ids is not None:                     # keep only what was asked for
+            want = {int(d) for d in device_ids}
+            keep = [i for i, d in enumerate(self.device_ids) if d in want]
+            if not keep:
+                raise RuntimeError(f"None of the requested devices have "
+                                   f"render-ok files in split '{split}'.")
+            self.device_ids = [self.device_ids[i] for i in keep]
+            self.rows = self.rows[keep]
+        self.n_windows = int(n_windows)
+        self.windows = self._draw_windows(self.n_windows, silence_dbfs)
+        self.n_windows = len(self.windows)             # may fall short of the request
+
+    def _draw_windows(self, n_windows: int, silence_dbfs: float) -> list[tuple[int, int]]:
+        """``[(file index, clip start), ...]``, seeded and screened for silence."""
+        from openamp.dsp import audio as audio_io
+
+        rng = np.random.default_rng(self.seed)
+        floor = 10.0 ** (silence_dbfs / 20.0)
+        out: list[tuple[int, int]] = []
+        for _ in range(8 * n_windows):                 # bounded: silence is a minority
+            if len(out) >= n_windows:
+                break
+            f = int(rng.integers(0, len(self.files)))
+            file = self.files[f]
+            c = int(rng.integers(0, file["n"] - self.clip_samples + 1))
+            try:
+                x = audio_io.seek_read(self._clean_path(file), c, self.clip_samples)
+            except Exception as e:  # noqa: BLE001  — a bad file must not sink the grid
+                print(f"[eval] skipping window {file['file_id']}@{c}: {e!r}", flush=True)
+                continue
+            if float(np.sqrt(np.mean(np.square(x, dtype=np.float64)))) >= floor:
+                out.append((f, c))
+        if not out:
+            raise RuntimeError(f"No non-silent test windows in split '{self.split}'.")
+        if len(out) < n_windows:
+            print(f"[eval] only {len(out)} of {n_windows} windows cleared the "
+                  f"{silence_dbfs:g} dBFS floor", flush=True)
+        return out
+
+    def __len__(self) -> int:
+        return len(self.device_ids) * self.n_windows
+
+    def item_arrays(self, i: int) -> dict:
+        """One grid cell, retrying the *same* window on transient I/O failures.
+
+        Unlike the training dataset this never redraws: the grid is the point, so
+        a window that stays unreadable raises rather than silently making one
+        device's ESR mean over different audio than its neighbours'.
+        """
+        d, w = divmod(int(i), self.n_windows)
+        device_id = self.device_ids[d]
+        f, c = self.windows[w]
+        file = self.files[f]
+        last_err: Exception | None = None
+        for attempt in range(4):
+            try:
+                clean, target = self._read_window(device_id, file, c)
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                print(f"[eval] read failed (attempt {attempt + 1}/4) device={device_id} "
+                      f"file={file['file_id']}@{c}: {e!r}", flush=True)
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            return {"input": clean, "target": target,
+                    "device_idx": int(self.rows[d]), "device_id": int(device_id)}
+        raise RuntimeError(f"4 consecutive read failures for device {device_id} "
+                           f"file {file['file_id']}@{c} (last: {last_err!r})")
+
+    def __getitem__(self, i: int) -> dict:
+        a = self.item_arrays(i)
+        return {
+            "input": torch.from_numpy(np.ascontiguousarray(a["input"])),
+            "target": torch.from_numpy(np.ascontiguousarray(a["target"])),
+            "device_idx": torch.tensor(a["device_idx"], dtype=torch.long),
+            "device_id": torch.tensor(a["device_id"], dtype=torch.long),
         }

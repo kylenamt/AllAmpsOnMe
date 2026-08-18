@@ -86,11 +86,11 @@ def full_width_submodel(data: dict) -> dict:
 def _upgrade_legacy_wavenet(data: dict) -> dict:
     """Rewrite a pre-0.7 (A1) WaveNet export into the schema NAM 0.13 parses.
 
-    The old layer schema carries ``head_size``/``head_bias``; the current
-    ``LayerArray`` wants a ``head`` object. The old head conv is a 1x1, so the
-    translation is exact -- verified bit-identical against NAM 0.11 output on the
-    A1 corpus. ``gated`` has no tested mapping onto the new ``gating_mode``, so a
-    gated export is refused rather than silently rendered as something else.
+    - Old schema: ``head_size``/``head_bias``. Current ``LayerArray`` wants a
+      ``head`` object. The old head conv is a 1x1, so the translation is exact --
+      verified bit-identical against NAM 0.11 output on the A1 corpus.
+    - ``gated`` has no tested mapping onto the new ``gating_mode``, so a gated
+      export is refused rather than silently rendered as something else.
     """
     if data.get("architecture") != "WaveNet":
         return data

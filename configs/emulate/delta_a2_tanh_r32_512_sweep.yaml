@@ -1,0 +1,76 @@
+# delta_a2_tanh_r32_512 trained on the SWEEP-ONLY corpus — TONE3000's own recipe,
+# but one network conditioned on 405 amps at once instead of one network per amp.
+# Run name is the file stem -> results/emulate/delta_a2_tanh_r32_512_sweep/.
+#
+#   OPENAMP_DATA_DIR=data_sweep openamp emulate --config configs/emulate/delta_a2_tanh_r32_512_sweep.yaml
+#
+# THE ENV VAR IS PART OF THE RECIPE. Without OPENAMP_DATA_DIR=data_sweep this trains
+# on the EGDB corpus and silently re-runs the control under a different run name.
+#
+# Pairs with nam_a2_256_sweep: that one asks the same corpus question on the FiLM
+# hook, this one on the weight-delta hook (the corpus's best arch, best_val_esr
+# 0.0334 on EGDB). Together they say whether "train on the capture signal" is an
+# architecture-specific effect or a general one.
+#
+# The corpus (data_sweep/, built by scripts/build_sweep_corpus.py) is NAM's own
+# layout, unmodified: train 10.0-181.0 s, val 181.0-190.0 s, and `test` is the SAME
+# 9 s block as val because NAM's protocol defines no test split. Native level — no
+# -18 dBFS normalization — so training input matches what enroll_pair feeds.
+# Held-out evidence comes from evaluating the finished checkpoint against the EGDB
+# data dir, where `test` is unseen songs.
+#
+# TWO VALUES DIFFER FROM delta_a2_tanh_r32_512.yaml, both because that file was
+# edited mid-flight for a --resume and no longer describes a fresh run:
+#
+#   lr      4.0e-3, not the 1.25e-4 that file now carries. The control STARTED at
+#           4.0e-3; ReduceLROnPlateau annealed it to 1.25e-4 by epoch 74, and the
+#           config was then hand-set to that so --resume wouldn't reset it. Starting
+#           a fresh run at 1.25e-4 would begin 32x below the control.
+#   epochs  150 = the control's TOTAL (100, then extended +50), so the optimization
+#           budget matches. Not a change in intent, just stated up front.
+#
+# Everything else is byte-identical to the control, so the corpus is the only
+# variable. Expect ~6.2 min/epoch on an RTX 5070 (delta_wavenet folds the embedding
+# into the conv weights once per batch, so it is ~30% faster per epoch than the
+# film_wavenet runs despite 4x the parameters — this model is launch-bound, not
+# FLOP-bound). 150 epochs ~= 15.5 h; early_stop_patience 15 may end it sooner.
+
+emulate:
+  # --- Model -------------------------------------------------------------------
+  arch: delta_wavenet      # A2 topology; embedding -> low-rank residual on each conv
+  wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
+  wn_activation: tanh      # "leakyrelu" (the capture default) | "tanh"
+  embedding_dim: 512       # widened with the rank so 23*32=736 DOF is not clipped to 256
+  single_device: -1        # -1 = one-to-many over all render-ok devices
+  delta_rank: 32           # generator is the limit only above rank 22 at this E
+
+  # --- Training (NAM's A2 numbers where the knob exists) -----------------------
+  holdout_frac: 0.1
+  clip_seconds: 2.0        # must match the corpus clip grid
+  batch_size: 32
+  pairs_per_epoch: 50000   # held at the control's value so the OPTIMIZATION budget
+                           # matches; note 50k x 2 s = 27.8 h of draws against 19.2 h
+                           # of unique sweep audio = 1.44 passes/epoch, vs 0.13 on
+                           # EGDB. Same wall clock per epoch, ~11x more revisiting.
+  epochs: 150
+  # Keep the decimal point: PyYAML resolves bare `4e-3` as a *string*, which reaches
+  # Adam untyped and dies at construction.
+  lr: 4.0e-3
+  weight_decay: 3.17e-7
+  plateau_patience: 3
+  plateau_factor: 0.5
+  early_stop_patience: 15  # 8 burned delta_a2_256 attempt 1 mid-recovery from a loss spike
+  # NAM's 5e-4 MRSTFT weight rescaled from its MSE term to this trainer's ESR term
+  # as w = 5e-4 / median mean(t^2). 0.05 comes from the EGDB renders (0.0096); these
+  # sweep renders measure 0.00481, so NAM's own rule would give 0.104 here and this
+  # run's STFT term is ~2x weaker than that. Held at 0.05 deliberately — it keeps the
+  # corpus as the only variable, and the STFT term is known to misbehave on this exact
+  # signal (pair enrollment needs stft_weight=0 to descend at all). Matches the choice
+  # made for nam_a2_256_sweep.
+  stft_weight: 0.05
+  preemph: 0.85
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50

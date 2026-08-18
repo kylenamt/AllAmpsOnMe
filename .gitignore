@@ -241,3 +241,17 @@ __marimo__/
 !/results/render_report.md
 .claude
 *.out
+
+# --- Additional corpora (same policy as /data/: derived from license-restricted
+# captures, and 18+ GB besides) ---
+/data_sweep/
+/data_sweep_a1/
+/data_mixed/
+
+# --- Retired experiments (archive/) ---
+# The code is kept under version control; the run outputs are not, matching the
+# /results/ policy above (checkpoints, training logs and QA exports stay private).
+/archive/encoder/encoder/
+/archive/joint_proto/proto/
+/archive/joint_proto/proto_multitap/
+/archive/joint_proto/proto_ref6/

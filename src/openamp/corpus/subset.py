@@ -1,23 +1,22 @@
 """Diversity-preserving device subset for rendering (spec §4, extension).
 
-The acquisition ``finalize`` keeps *every* validated capture, so the manifest can run
-well past the ~400 target (currently 844). Rendering all of them is storage-heavy
-and gain-imbalanced: clean DI-amp captures are rare on TONE3000 (~8.5% of the full
-set) and concentrated in a handful of tones/creators, so more devices actually
-means a *worse* gain balance. This module picks a diverse, gain-balanced subset of
-``device_id``s to render, reusing the acquisition selection policy — per-tone/creator/
-make-model caps, a per-gain-bucket floor, and brand round-robin fill — but on the
-already-validated manifest (no hard filters; those passed at acquisition).
-
-The caps default *looser* than acquisition's (``2/8/6``): we are drawing ~450 from an
-already-curated 844, and the scarce, concentrated clean captures cannot satisfy a
-15% floor under the strict caps (they top out near 267 devices). ``4/12/6`` reaches
-~450 with clean near 12%.
-
-Deterministic given the manifest and parameters: rows are ranked by
-``(downloads desc, device_id)``, and the chosen ids are persisted to a file, so
-``render run --devices @<path>`` and its resumes always see the same set. The
-manifest itself is never modified — enlarge ``size`` later to top up.
+- Acquisition ``finalize`` keeps *every* validated capture, so the manifest runs
+  well past the ~400 target (currently 844). Rendering all of them is
+  storage-heavy and gain-imbalanced: clean DI-amp captures are rare on TONE3000
+  (~8.5% of the full set) and concentrated in a handful of tones/creators, so
+  more devices means a *worse* gain balance.
+- This module picks a diverse, gain-balanced subset of ``device_id``s to render,
+  reusing the acquisition selection policy (per-tone/creator/make-model caps, a
+  per-gain-bucket floor, brand round-robin fill) on the already-validated
+  manifest (no hard filters — those passed at acquisition).
+- Caps default *looser* than acquisition's (``2/8/6``): drawing ~450 from an
+  already-curated 844, the scarce clean captures can't satisfy a 15% floor under
+  the strict caps (top out near 267 devices). ``4/12/6`` reaches ~450 with clean
+  near 12%.
+- Deterministic given the manifest and parameters: rows ranked by
+  ``(downloads desc, device_id)``, chosen ids persisted to a file, so
+  ``render run --devices @<path>`` and its resumes always see the same set. The
+  manifest itself is never modified — enlarge ``size`` later to top up.
 """
 
 from __future__ import annotations

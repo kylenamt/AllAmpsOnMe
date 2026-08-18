@@ -1,18 +1,19 @@
 """Stage: ``openamp render`` — render the clean corpus through every device (spec §4).
 
-Rendering is **whole-file, then sliced** — never per-clip — so there are no
-clip-boundary transients. The core is :func:`chunked_forward`, a pure driver that
-streams a file through a causal model in chunks while carrying R samples of
-left-context and discarding the warmup region, giving output **bit-identical to a
-single full-file forward pass**. That function is unit-tested against a numpy FIR
-stand-in; the surrounding :func:`run` job (GPU load, disk checks, manifest
-bookkeeping, resume) uses the real NAM adapter in :mod:`openamp.nam`.
-
-Model contract for :func:`chunked_forward`: ``model_fn`` is **causal with receptive
-field ≤ R** and returns a **right-aligned** mono float32 array (its last output
-sample corresponds to its last input sample). The driver keeps the last
-``end-pos`` samples of each chunk's output, so both same-length nets (output length
-== input length) and "valid" nets (output shorter by the warmup) work unchanged.
+- Rendering is **whole-file, then sliced** — never per-clip — so there are no
+  clip-boundary transients.
+- Core: :func:`chunked_forward`, a pure driver that streams a file through a
+  causal model in chunks, carrying R samples of left-context and discarding the
+  warmup region — output **bit-identical to a single full-file forward pass**.
+  Unit-tested against a numpy FIR stand-in; the surrounding :func:`run` job (GPU
+  load, disk checks, manifest bookkeeping, resume) uses the real NAM adapter in
+  :mod:`openamp.nam`.
+- Model contract for :func:`chunked_forward`: ``model_fn`` is **causal with
+  receptive field ≤ R** and returns a **right-aligned** mono float32 array (its
+  last output sample corresponds to its last input sample). The driver keeps the
+  last ``end-pos`` samples of each chunk's output, so both same-length nets
+  (output length == input length) and "valid" nets (output shorter by the
+  warmup) work unchanged.
 """
 
 from __future__ import annotations
@@ -232,11 +233,13 @@ def _prefetch(items: Sequence[dict], load_fn: Callable[[dict], object], *,
     """Yield ``(item, load_fn(item))`` in order, running ``load_fn`` up to ``ahead``
     items in advance on ``workers`` background threads.
 
-    Used to hide FLAC decode behind the GPU forward: the render loop consumes
-    already-decoded audio while the next files decode. Order is preserved and the
-    bounded look-ahead caps how much decoded audio is resident at once. A load
-    error surfaces at the point that item would have been consumed (same ordering
-    as a plain serial loop)."""
+    - Hides FLAC decode behind the GPU forward: the render loop consumes
+      already-decoded audio while the next files decode.
+    - Order preserved; bounded look-ahead caps how much decoded audio is
+      resident at once.
+    - A load error surfaces at the point that item would have been consumed
+      (same ordering as a plain serial loop).
+    """
     it = iter(items)
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
         pending: deque[tuple[dict, object]] = deque()
@@ -259,10 +262,9 @@ def _render_device(config: Config, device_id: int, nam_path: str,
     model = nam_render.load_model(nam_path, device=device)
     resampled = model.sample_rate != config.sample_rate
 
-    # First pass: render everything on the GPU, tracking the device's global peak
-    # (spec §4.2). File decode is prefetched on worker threads so it overlaps the
-    # forward instead of stalling it; the GPU forward itself stays serial and
-    # bit-identical (only the surrounding I/O moves off the critical path).
+    # Pass 1: render on the GPU, tracking the device's global peak (spec §4.2).
+    # Decode is prefetched on worker threads so it overlaps the forward instead
+    # of stalling it; the forward itself stays serial and bit-identical.
     outputs: dict[str, np.ndarray] = {}
     global_peak = 0.0
     for f, (clean, _sr) in _prefetch(clean_files, lambda f: audio_io.read_audio(f["path"])):
@@ -274,10 +276,9 @@ def _render_device(config: Config, device_id: int, nam_path: str,
 
     scale = output_scale(global_peak)
 
-    # Second pass: scale, encode, hash. Pure CPU/disk with no GPU dependency, so
-    # fan it across threads — FLAC encode is the per-device cost that rivals the
-    # forward. An order-preserving map keeps the emitted rows deterministic, and
-    # each file writes an independent path so the outputs stay bit-identical.
+    # Pass 2: scale, encode, hash. Pure CPU/disk, no GPU dependency, so fan it
+    # across threads — FLAC encode rivals the forward in cost. Order-preserving
+    # map keeps emitted rows deterministic; each file writes an independent path.
     def finalize(f: dict) -> dict:
         y = (outputs[f["file_id"]] * scale).astype(np.float32)
         out_path = config.device_render_dir(device_id) / f"{f['file_id']}.{config.output_format}"

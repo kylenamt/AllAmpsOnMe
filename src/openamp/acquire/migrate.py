@@ -1,21 +1,18 @@
 """Stage: `openamp migrate-a2` — re-point the finalized devices at their A2 captures.
 
-Rewrites the final manifest in place: each device is paired with the A2 model of
-the same name under the same tone, which is downloaded and re-validated. Runs on
-the final manifest rather than through select/finalize so that ``device_id`` is
-never reassigned -- the rendered audio on disk is addressed by ``device_id``, and
-re-deriving those ids would orphan it.
-
-Pairing is by *exact* model name. TONE3000 did not retrain every model on
-multi-model tones, so a device whose name has no A2 counterpart keeps its A1
-capture and is flagged ``architecture_fallback``. Nothing is paired by
-similarity: the models on one tone are the same amp at different gain settings,
-so a near-miss would silently swap a device's identity, which is the one property
-the whole corpus is built on.
-
-The renders themselves are NOT invalidated. They were produced from the A1
-captures and ``renders.parquet`` records the ``nam_sha256`` they came from, so the
-provenance stays truthful; only future renders pick up A2.
+- Rewrites the final manifest in place: each device is paired with the A2 model
+  of the same name under the same tone, downloaded and re-validated.
+- Runs on the final manifest rather than through select/finalize so
+  ``device_id`` is never reassigned — rendered audio on disk is addressed by
+  ``device_id``, and re-deriving ids would orphan it.
+- Pairing is by *exact* model name, never similarity: the models on one tone are
+  the same amp at different gain settings, so a near-miss would silently swap a
+  device's identity — the one property the corpus is built on. TONE3000 didn't
+  retrain every model on multi-model tones, so a device with no A2 counterpart
+  keeps its A1 capture, flagged ``architecture_fallback``.
+- Renders are NOT invalidated: they came from A1 captures and
+  ``renders.parquet`` records the ``nam_sha256`` they used, so provenance stays
+  truthful; only future renders pick up A2.
 """
 
 from __future__ import annotations

@@ -1,39 +1,37 @@
 """Phase 5 enrollment: fit embeddings for unseen devices against a frozen run.
 
-Loads a finished one-to-many run (``results/emulate/<name>/checkpoint.pt``),
-freezes every network weight, and optimizes ONLY a fresh embedding table — one
-row per enrolled device — on that device's clean/render pairs. This answers
-the generalization question the ``emulate_holdout.txt`` devices exist for: can
-the frozen FiLM stack model an amp it never saw, given just a new conditioning
-vector?
-
-All devices enroll jointly in one loop: row *i* only receives gradient from
-batch items with ``device_idx == i``, so devices cannot interact through the
-frozen network. (Not bit-identical to per-device loops — the pooled ESR
-denominator and dense-Adam momentum couple step *sizes* across devices — but
-that matches the dynamics the trained table itself experienced. Enroll one
-device at a time via ``--devices`` when strict independence matters.)
-
-Rows start at the trained table's mean — the best "generic amp" prior, since
-the FiLM stack was trained on that distribution — and the per-device test ESR
-at that init is the baseline enrollment must beat (the best embedding defaults
-to the init, so an enrolled row is never worse than the prior on val). Training
-is plain fp32: the trainable state is a few KB, so none of train.py's
-AMP/nan-guard machinery applies. ``--pairs`` is an *optimization* budget
-(fresh random windows every epoch), not a unique-audio budget; a fixed-window
-audio-budget mode is deliberate follow-up work.
-
-Two enrollment front doors share the same frozen-net fitting loop:
-
-- :func:`enroll` — corpus holdout devices, from their on-disk renders (the CLI
-  verb ``emulate-enroll``).
-- :func:`enroll_pair` — ONE wet/dry recording pair (e.g. the NAM capture
-  signal and an amp's recorded response — exactly what a TONE3000 model
-  capture asks for), driven from ``notebooks/enroll_new_device.ipynb``. The
-  pair is split by time into train/val regions; :class:`WetDryDataset` draws
-  random warmed windows from it. Real captures carry a fixed reamp latency:
-  :func:`blip_lag` reads it off the capture's leading NAM blip (as NAM's
-  trainer does), with :func:`estimate_lag` as the blip-free fallback.
+- Loads a finished one-to-many run (``results/emulate/<name>/checkpoint.pt``),
+  freezes every network weight, and optimizes ONLY a fresh embedding table —
+  one row per enrolled device — on that device's clean/render pairs. Answers
+  the generalization question the ``emulate_holdout.txt`` devices exist for:
+  can the frozen FiLM stack model an amp it never saw, given just a new
+  conditioning vector?
+- All devices enroll jointly in one loop: row *i* only receives gradient from
+  batch items with ``device_idx == i``, so devices can't interact through the
+  frozen network. (Not bit-identical to per-device loops — the pooled ESR
+  denominator and dense-Adam momentum couple step *sizes* across devices — but
+  that matches the dynamics the trained table itself experienced. Enroll one
+  device at a time via ``--devices`` when strict independence matters.)
+- Rows start where the trained table's own rows started: a uniform draw at the
+  trainer's embedding-init variance (``init="uniform"``, the default;
+  ``init="table_mean"`` starts every row at the trained table's mean instead —
+  see :func:`_swap_embedding`). The per-device test ESR at that init is the
+  baseline enrollment must beat (best embedding defaults to the init, so an
+  enrolled row is never worse on val than where it started). Training is plain
+  fp32: trainable state is a few KB, so none of
+  train.py's AMP/nan-guard machinery applies. ``--pairs`` is an *optimization*
+  budget (fresh random windows every epoch), not a unique-audio budget; a
+  fixed-window audio-budget mode is deliberate follow-up work.
+- Two enrollment front doors share the same frozen-net fitting loop:
+  - :func:`enroll` — corpus holdout devices, from their on-disk renders (the
+    CLI verb ``emulate-enroll``).
+  - :func:`enroll_pair` — ONE wet/dry recording pair (e.g. the NAM capture
+    signal and an amp's recorded response — exactly what a TONE3000 model
+    capture asks for), driven from ``notebooks/enroll_new_device.ipynb``. The
+    pair is split by time into train/val regions; :class:`WetDryDataset` draws
+    random warmed windows from it. Real captures carry a fixed reamp latency:
+    :func:`blip_lag` reads it off the capture's leading NAM blip (as NAM's
+    trainer does), with :func:`estimate_lag` as the blip-free fallback.
 """
 
 from __future__ import annotations
@@ -55,6 +53,7 @@ from openamp.emulate.dataset import EmulationDataset, manifest_signature
 from openamp.emulate.evaluate import _SILENCE_DBFS, _resolve_device, load_model
 from openamp.emulate.train import (GRAD_CLIP_NORM, EmulationLoss, _make_loader,
                                    evaluate_esr, pre_emphasis)
+from openamp.emulate.wavenet import A2_EMBEDDING_STD
 
 ENROLL_LR = 1e-2                 # only embeddings train; the table itself was
                                  # trained at 5e-4-2e-3 *alongside* the network
@@ -63,6 +62,15 @@ ENROLL_PAIRS = 1000              # training pairs per device per epoch
 EARLY_STOP_PATIENCE = 5
 PLATEAU_PATIENCE = 2             # ReduceLROnPlateau (factor 0.5)
 TEST_PAIRS_PER_DEVICE = 200
+
+# Where a fresh enrollment row starts. "uniform" draws U(-a, a) at the same
+# variance as the trained table's own init (every enrollable arch inits normal at
+# std 0.1 — A2_EMBEDDING_STD here, the same literal in FiLMTCN), so a = sqrt(3)*std:
+# a new device starts where every trained device started, with no direction baked
+# in. "table_mean" is the old behaviour (see :func:`_swap_embedding`).
+ENROLL_INITS = ("uniform", "table_mean")
+ENROLL_INIT = "uniform"
+ENROLL_INIT_A = 3 ** 0.5 * A2_EMBEDDING_STD
 
 # One row of enrollment.csv, in order.
 ENROLLMENT_COLUMNS = ["device_id", "pairs", "epochs_run", "val_esr",
@@ -110,11 +118,12 @@ def _per_device_esr(model, loader, dev, n_rows: int, *, preemph: float | None = 
                     silence_dbfs: float | None = None, clip: int | None = None) -> np.ndarray:
     """Per-embedding-row ESR over a loader, keyed on ``batch["device_idx"]``.
 
-    ``preemph`` set: pooled pre-emphasized ratio-of-sums per row — the val
-    semantics of :func:`openamp.emulate.train.evaluate_esr`. Otherwise: mean of
-    per-window *raw* ratios with the ``silence_dbfs`` gate — the test semantics
-    of :func:`openamp.emulate.evaluate.evaluate_run`, directly comparable to
-    ``comparison.csv``. Rows with no surviving windows come back NaN.
+    - ``preemph`` set: pooled pre-emphasized ratio-of-sums per row — the val
+      semantics of :func:`openamp.emulate.train.evaluate_esr`.
+    - Otherwise: mean of per-window *raw* ratios with the ``silence_dbfs`` gate
+      — the test semantics of :func:`openamp.emulate.evaluate.evaluate_run`,
+      directly comparable to ``comparison.csv``.
+    - Rows with no surviving windows come back NaN.
     """
     R = model.receptive_field
     num = torch.zeros(n_rows, dtype=torch.float64, device=dev)
@@ -150,13 +159,17 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
            early_stop_patience: int = EARLY_STOP_PATIENCE,
            stft_weight: float | None = None,
            plateau_patience: int = PLATEAU_PATIENCE,
-           plateau_factor: float = 0.5) -> dict:
+           plateau_factor: float = 0.5,
+           init: str = ENROLL_INIT) -> dict:
     """Enroll unseen devices against a frozen run; returns the summary metrics.
 
     Writes to ``<run_dir>/enroll/``: ``enrolled_embeddings.pt`` (mirrors the
     ``embedding.pt`` schema + provenance), ``enrollment.csv`` (one row per
     device, merged by device_id across re-runs), ``metrics.json``, and
     ``enroll_log.csv`` (per-epoch curves; epoch -1 is the init baseline).
+
+    ``init`` is where the new rows start — ``"uniform"`` (default) or
+    ``"table_mean"``; see :func:`_swap_embedding`.
     """
     run_dir = Path(run_dir)
     dev = torch.device(_resolve_device(device))
@@ -177,12 +190,12 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
     enroll_idx = {d: i for i, d in enumerate(enroll_ids)}
     n = len(enroll_ids)
 
-    _swap_embedding(model, ecfg, n, dev)
+    _swap_embedding(model, ecfg, n, dev, init=init)
 
     R = model.receptive_field
     clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
     print(f"[enroll] run={base_name} arch={ecfg.arch} devices={n} "
-          f"(skipped {len(skipped)}) pairs/device={pairs} lr={lr:g} init=table_mean")
+          f"(skipped {len(skipped)}) pairs/device={pairs} lr={lr:g} init={init}")
 
     train_ds = EmulationDataset(cfg, "train", receptive_field=R, id_to_idx=enroll_idx,
                                 clip_samples=clip, pairs_per_epoch=pairs * n, seed=seed)
@@ -208,7 +221,7 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
         csv.writer(fh).writerow(["epoch", "step", "train_loss", "train_esr",
                                  "train_stft", "val_esr", "lr", "elapsed_s"])
 
-    # --- Baseline: what the generic-amp prior scores before any optimization ----
+    # --- Baseline: what the init rows score before any optimization -------------
     t0 = time.time()
     baseline_test = np.full(n, np.nan) if test_loader is None else _per_device_esr(
         model, test_loader, dev, n, silence_dbfs=_SILENCE_DBFS, clip=clip)
@@ -246,7 +259,7 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
         # enrollment provenance
         "base_run": base_name, "base_epoch": int(ck.get("epoch", -1)),
         "base_manifest_sha256": ck.get("manifest_sha256", ""),
-        "init": "table_mean", "pairs": int(pairs), "epochs_run": epochs_run,
+        "init": init, "pairs": int(pairs), "epochs_run": epochs_run,
         "lr": float(lr), "seed": seed,
         "per_device": {int(d): {"val_esr": _json_num(val_per_dev[i]),
                                 "test_esr": _json_num(test_per_dev[i]),
@@ -259,7 +272,7 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
     metrics = {
         "run": base_name, "n_enrolled": n, "skipped": skipped,
         "pairs": int(pairs), "epochs": int(epochs), "epochs_run": epochs_run,
-        "best_epoch": best_epoch, "lr": float(lr), "seed": seed, "init": "table_mean",
+        "best_epoch": best_epoch, "lr": float(lr), "seed": seed, "init": init,
         "init_val_esr_pooled": _json_num(init_val),
         "best_val_esr_pooled": _json_num(best_val),
         "test_esr_mean": test_mean, "test_esr_median": test_median,
@@ -274,24 +287,73 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
     return metrics
 
 
-def _swap_embedding(model, ecfg: EmulateConfig, n: int, dev) -> torch.Tensor:
+def require_enrollable(ecfg: EmulateConfig) -> None:
+    """Reject archs whose conditioning has no shared structure to enroll into.
+
+    Enrollment's whole premise is that the corpus taught a *shared* map from one
+    embedding space to network behaviour, so an unseen amp is found by locating its
+    point in that space. ``tabledelta_wavenet`` has no such map -- each device owns
+    a free weight blob, and a new device's row would be fitted from scratch against
+    a few minutes of audio, with the trained devices contributing nothing.
+
+    This has to be an explicit check rather than left to fail naturally, because it
+    would *not* fail naturally: :func:`_swap_embedding` would install a fresh table,
+    its "only the embedding trains" assert would pass, and the fit would report a
+    plausible-looking ESR for a table the network never reads. A meaningless number
+    that looks real is worse than a crash.
+    """
+    from openamp.emulate.models import ENROLLABLE_ARCHS
+
+    if ecfg.arch not in ENROLLABLE_ARCHS:
+        raise RuntimeError(
+            f"arch {ecfg.arch!r} cannot be enrolled: its conditioning is a "
+            "per-device weight table, not a shared map from an embedding space, so "
+            "there is nothing an unseen device can be positioned within. Enrollable "
+            f"archs: {', '.join(ENROLLABLE_ARCHS)}.")
+
+
+def _swap_embedding(model, ecfg: EmulateConfig, n: int, dev, *,
+                    init: str = ENROLL_INIT) -> torch.Tensor:
     """Freeze the network and swap in a fresh trainable ``n``-row table.
 
-    Rows start at the trained table's mean (the generic-amp prior). Both archs
-    consume the table only via ``self.embedding(device_idx)``, so nothing else
-    changes. The model stays eval() throughout: no dropout/norm, grads still
-    flow to the new rows. Returns the init (mean) vector.
+    ``init`` decides where the new rows start:
+
+    - ``"uniform"`` (default) — each element drawn U(-a, a) with the variance of
+      the trainer's own embedding init (``a = sqrt(3)*A2_EMBEDDING_STD``). A new
+      device starts exactly where every trained device started: inside the range
+      the conditioning map was trained over, but with no direction baked in.
+    - ``"table_mean"`` — every row at the trained table's mean, the "generic amp"
+      prior. It is a *lower-ESR starting point* but a peculiar one: in 256 dims
+      the mean of 405 rows has ~1/5 the norm of a typical row (0.88 vs 4.87 on
+      nam_a2_256_sweep), so it sits in a region no trained device occupies, and
+      all rows start identical — a joint multi-device fit separates them only
+      through their own gradients.
+
+    Every enrollable arch consumes the table only via ``self.embedding(device_idx)``,
+    so nothing else changes. The model stays eval() throughout: no dropout/norm, grads
+    still flow to the new rows. Draws come from the global RNG (callers seed it), so
+    a given ``seed`` reproduces the init. Returns the ``[n, dim]`` init rows.
+
+    The guard sits here rather than at each caller because this is the function
+    whose success is misleading -- every enrollment path in this module reaches the
+    swap, and past it there is nothing left to notice the arch was wrong.
     """
-    table_mean = model.embedding.weight.detach().mean(dim=0)
+    require_enrollable(ecfg)
+    if init not in ENROLL_INITS:
+        raise ValueError(f"init must be one of {ENROLL_INITS}, got {init!r}")
     model.requires_grad_(False)
     emb = nn.Embedding(n, ecfg.embedding_dim).to(dev)
     with torch.no_grad():
-        emb.weight.copy_(table_mean.expand_as(emb.weight))
+        if init == "uniform":
+            emb.weight.uniform_(-ENROLL_INIT_A, ENROLL_INIT_A)
+        else:
+            table_mean = model.embedding.weight.detach().mean(dim=0)
+            emb.weight.copy_(table_mean.expand_as(emb.weight))
     model.embedding = emb
     model.eval()
     assert {id(p) for p in model.parameters() if p.requires_grad} == \
         {id(model.embedding.weight)}, "only the enrollment embedding may train"
-    return table_mean
+    return emb.weight.detach().clone()
 
 
 def _fit_embedding(model, ecfg: EmulateConfig, train_ds, val_loader, dev, *,
@@ -304,7 +366,7 @@ def _fit_embedding(model, ecfg: EmulateConfig, train_ds, val_loader, dev, *,
 
     ``train_ds`` just needs the EmulationDataset item contract plus a ``seed``
     attribute (bumped per epoch for fresh windows) — WetDryDataset qualifies.
-    Best starts at the init rows, so the result is never worse than the prior
+    Best starts at the init rows, so the result is never worse than the init
     on val. Stops after ``early_stop_patience`` epochs with no val-ESR
     improvement (``<= 0`` disables early stopping — run the full ``epochs``).
     Appends per-epoch rows to ``log_path`` (train_log.csv columns).
@@ -315,7 +377,7 @@ def _fit_embedding(model, ecfg: EmulateConfig, train_ds, val_loader, dev, *,
     opt = torch.optim.Adam(model.embedding.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode="min", factor=plateau_factor, patience=plateau_patience)
-    best_val = init_val                      # never keep rows worse than the prior
+    best_val = init_val                      # never keep rows worse than the init
     best_emb = model.embedding.weight.detach().clone()
     best_epoch, since_improved, step, epoch = -1, 0, 0, -1
     for epoch in range(int(epochs)):
@@ -429,21 +491,20 @@ def estimate_lag(dry: np.ndarray, wet: np.ndarray, *, max_lag: int = 4800,
                  probe_samples: int = 48_000 * 30, preemph: float = 0.95) -> int:
     """Coarse estimate of the samples ``wet`` trails ``dry`` (negative: early).
 
-    Both signals are **pre-emphasized** (``y[n]=x[n]-preemph*x[n-1]``) before an
-    FFT cross-correlation, and the peak is taken on ``|xcorr|`` so a polarity
-    inversion in the reamp chain doesn't flip the sign. Whitening matters: a
-    plain broadband xcorr is pulled tens of samples off by the amp's own
-    frequency shaping — enough to hurt, since embedding-only enrollment is
-    sensitive to sub-millisecond misalignment (a 37-sample error ~tripled the
-    val ESR in testing).
-
-    This still carries a residual bias equal to the device's group delay
-    (order ~10-40 samples), so it is the **fallback** for material without a
-    calibration blip. When the capture opens with the NAM blip, prefer
-    :func:`blip_lag`, which reads latency off first-arrival and isolates the
-    interface delay from the amp's group delay. Align with ``wet[lag:]`` /
-    ``dry[-lag:]`` and trim to the common length before building a
-    :class:`WetDryDataset`.
+    - Both signals are **pre-emphasized** (``y[n]=x[n]-preemph*x[n-1]``) before
+      an FFT cross-correlation; the peak is taken on ``|xcorr|`` so a polarity
+      inversion in the reamp chain doesn't flip the sign. Whitening matters: a
+      plain broadband xcorr is pulled tens of samples off by the amp's own
+      frequency shaping — enough to hurt, since embedding-only enrollment is
+      sensitive to sub-millisecond misalignment (a 37-sample error ~tripled the
+      val ESR in testing).
+    - Still carries a residual bias equal to the device's group delay (order
+      ~10-40 samples), so this is the **fallback** for material without a
+      calibration blip. When the capture opens with the NAM blip, prefer
+      :func:`blip_lag`, which reads latency off first-arrival and isolates the
+      interface delay from the amp's group delay.
+    - Align with ``wet[lag:]`` / ``dry[-lag:]`` and trim to the common length
+      before building a :class:`WetDryDataset`.
     """
     n = int(min(len(dry), len(wet), probe_samples))
     a = np.asarray(dry[:n], dtype=np.float64)
@@ -465,15 +526,15 @@ def _leading_edge(x: np.ndarray, thresh_frac: float, *, noise_mult: float = 8.0,
                   max_ramp: int = 256) -> int:
     """First arrival of the loudest transient in ``x``.
 
-    Two passes, because an amp's blip *response* ramps up over ~10-20 samples
-    (it starts immediately — ``h[0] != 0`` — but ~40 dB below its peak), so a
-    high threshold reports the ramp, not the onset. We coarse-locate the
-    transient at half-peak, estimate the noise floor from the lead-in ahead of
-    it, then take the first crossing of ``max(noise_mult * noise, thresh_frac *
-    peak)`` within ``max_ramp`` samples before the coarse hit. The noise term
-    keeps a hissy high-gain capture from triggering on its own floor; on a clean
-    digital lead-in it stays at ``thresh_frac`` and lands within a sample or two
-    of true first-arrival.
+    Two passes: an amp's blip *response* ramps up over ~10-20 samples (starts
+    immediately, ``h[0] != 0``, but ~40 dB below its peak), so a high threshold
+    reports the ramp, not the onset. Coarse-locate the transient at half-peak,
+    estimate the noise floor from the lead-in ahead of it, then take the first
+    crossing of ``max(noise_mult * noise, thresh_frac * peak)`` within
+    ``max_ramp`` samples before the coarse hit. The noise term keeps a hissy
+    high-gain capture from triggering on its own floor; on a clean digital
+    lead-in it stays at ``thresh_frac`` and lands within a sample or two of
+    true first-arrival.
     """
     seg = np.abs(np.asarray(x, dtype=np.float64) - float(np.mean(x)))
     peak = float(seg.max())
@@ -492,30 +553,28 @@ def blip_lag(dry: np.ndarray, wet: np.ndarray, *, sample_rate: int = 48_000,
              search_seconds: float = 2.0, thresh_frac: float = 0.02) -> int:
     """Latency (samples ``wet`` trails ``dry``) from the leading capture blip.
 
-    The NAM / TONE3000 capture signal opens with a loud broadband blip *for
-    exactly this purpose*. We take the first arrival of that transient in each
-    signal (:func:`_leading_edge`) and return ``wet_onset - dry_onset``.
-
-    Why first-arrival, not cross-correlation: the interface round-trip is a pure
-    delay ``L``, while the amp's impulse response ``h`` starts immediately
-    (``h[0] != 0``) but has its energy centroid a few samples in (its group
-    delay). So the blip *starts* arriving at ``d + L`` regardless of tone —
-    leading-edge recovers ``L`` and leaves the amp's group delay in the target
-    for the model to learn, whereas whole-signal xcorr recovers
-    ``L + group_delay`` and can't separate them (that is the bias in
-    :func:`estimate_lag`). This is essentially NAM's own delay calibration.
-
-    Accuracy is a few samples, not exact: a real amp's blip response ramps up
-    over ~10-20 samples from ~40 dB below its peak, so detection is threshold-
-    and noise-limited. Measured against a known 512-sample latency through a
-    real high-gain capture: ``+2`` at the ``thresh_frac`` default, vs ``+18`` at
-    0.5 and ``+13`` for :func:`estimate_lag`. Lower ``thresh_frac`` tracks first
-    arrival more tightly until the capture's noise floor stops you.
-
-    Requires a real blip at the very start: play the *entire* NAM signal,
-    including the leading blips. If the recording's loudest early transient is
-    not the blip, shrink ``search_seconds`` to isolate it. ``ValueError`` if a
-    window is silent.
+    - The NAM / TONE3000 capture signal opens with a loud broadband blip *for
+      exactly this purpose*. Takes the first arrival of that transient in each
+      signal (:func:`_leading_edge`) and returns ``wet_onset - dry_onset``.
+    - Why first-arrival, not cross-correlation: the interface round-trip is a
+      pure delay ``L``, while the amp's impulse response ``h`` starts
+      immediately (``h[0] != 0``) but has its energy centroid a few samples in
+      (its group delay). The blip *starts* arriving at ``d + L`` regardless of
+      tone — leading-edge recovers ``L`` and leaves the amp's group delay in
+      the target for the model to learn, whereas whole-signal xcorr recovers
+      ``L + group_delay`` and can't separate them (the bias in
+      :func:`estimate_lag`). Essentially NAM's own delay calibration.
+    - Accuracy is a few samples, not exact: a real amp's blip response ramps up
+      over ~10-20 samples from ~40 dB below its peak, so detection is
+      threshold- and noise-limited. Measured against a known 512-sample
+      latency through a real high-gain capture: ``+2`` at the ``thresh_frac``
+      default, vs ``+18`` at 0.5 and ``+13`` for :func:`estimate_lag`. Lower
+      ``thresh_frac`` tracks first arrival more tightly until the capture's
+      noise floor stops you.
+    - Requires a real blip at the very start: play the *entire* NAM signal,
+      including the leading blips. If the recording's loudest early transient
+      isn't the blip, shrink ``search_seconds`` to isolate it. ``ValueError``
+      if a window is silent.
     """
     ns = int(min(len(dry), len(wet), round(search_seconds * sample_rate)))
     if ns < 2:
@@ -526,11 +585,11 @@ def blip_lag(dry: np.ndarray, wet: np.ndarray, *, sample_rate: int = 48_000,
 # NAM standardized reamp-signal layouts (sdatkinson/neural-amp-modeler,
 # nam/train/core.py). Boundaries are samples at the signal's native 48 kHz;
 # ``validation_start`` is a negative offset from the end, exactly as NAM stores
-# it. NAM's own split is train = signal[train_start : validation_start] and
-# validation = signal[validation_start:], with the lead-in before ``train_start``
-# discarded and the calibration blips left inside the train slice. Only v3.0.0 is
-# listed (the current TONE3000 sweep, verified against source); add older signals
-# here as ``{length, train_start, validation_start, blips}`` when needed.
+# it. NAM's own split: train = signal[train_start:validation_start], validation
+# = signal[validation_start:], lead-in before ``train_start`` discarded,
+# calibration blips left inside the train slice. Only v3.0.0 is listed (the
+# current TONE3000 sweep, verified against source); add older signals here as
+# ``{length, train_start, validation_start, blips}`` when needed.
 _NAM_SIGNALS = {
     "v3_0_0": {"length": 9_120_000, "train_start": 480_000,      # 3:10 @ 48 kHz
                "validation_start": -432_000, "blips": (504_000, 552_000)},
@@ -541,15 +600,17 @@ def nam_signal_regions(n_samples: int, *, sample_rate: int = 48_000,
                        version: str | None = None, tol: float = 0.005) -> dict | None:
     """NAM's own train/val regions for a standardized reamp signal, or ``None``.
 
-    Mirrors the split the NAM trainer applies to its capture signal — train on
-    ``[train_start : validation_start]`` (lead-in dropped, blips kept), score ESR
-    on the dedicated tail ``[validation_start:]`` — so a pair fit trains and is
-    validated on the same regions NAM reports, not a blind last-``val_frac``
-    slice. The signal is identified by length (within ``tol`` relative) unless
-    ``version`` forces a layout. Returns absolute sample bounds
-    ``{"version", "train", "val", "lead_in", "blips"}``; ``None`` when
-    ``n_samples`` matches no known signal (e.g. a stitched corpus DI) or the rate
-    is not NAM's 48 kHz standard — callers should then fall back to ``val_frac``.
+    - Mirrors the split the NAM trainer applies to its capture signal — train
+      on ``[train_start:validation_start]`` (lead-in dropped, blips kept),
+      score ESR on the dedicated tail ``[validation_start:]`` — so a pair fit
+      trains and validates on the same regions NAM reports, not a blind
+      last-``val_frac`` slice.
+    - Signal identified by length (within ``tol`` relative) unless ``version``
+      forces a layout.
+    - Returns absolute sample bounds ``{"version", "train", "val", "lead_in",
+      "blips"}``; ``None`` when ``n_samples`` matches no known signal (e.g. a
+      stitched corpus DI) or the rate isn't NAM's 48 kHz standard — callers
+      should then fall back to ``val_frac``.
     """
     if sample_rate != 48_000:
         return None
@@ -614,38 +675,42 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
                 plateau_factor: float = 0.5,
                 train_region: tuple[int, int] | None = None,
                 val_region: tuple[int, int] | None = None,
+                init: str = ENROLL_INIT,
                 sources: dict | None = None) -> dict:
     """Enroll ONE new device from a sample-aligned wet/dry pair (spec: Phase 5).
 
-    ``dry`` is the capture input (e.g. the NAM sweep signal TONE3000 sends to
-    every amp), ``wet`` the device's recorded response — align and level them
-    first (see the notebook).
-
-    By default the last ``val_frac`` of the pair is the val region and everything
-    before it is train. Pass ``train_region``/``val_region`` (both, as
-    ``(start, stop)`` sample bounds; negatives resolve from the end) to drive the
-    split explicitly — e.g. :func:`nam_signal_regions` to follow the NAM trainer's
-    own layout for a standardized sweep (skip the lead-in, validate on the
-    dedicated tail) instead of a blind time slice. Windows never cross into the
-    other region; the lead-in gap between them (if any) is simply unused. Writes to
-    ``<run_dir>/enroll/pairs/<name>/``: ``enrolled_pair.pt`` (the fitted
-    vector + provenance), ``metrics.json``, ``enroll_log.csv`` (epoch -1 is
-    the table-mean baseline). Returns the metrics dict.
-
-    ``stft_weight`` overrides the run's multi-res STFT loss weight (``None``
-    keeps the run's trained value). Pass ``0.0`` to fit on pre-emphasized ESR
-    alone: on a single-pair fit the STFT magnitude term can dominate the
-    gradient and drive the embedding to a spectrally-plausible but
-    waveform-uncorrelated optimum (val ESR *rises* while train loss falls —
-    observed on wavenet_a2, where stft_weight=0 fixed it).
-
-    ``batch_size`` overrides the run's training batch size for this fit (``None``
-    keeps the run's value). This fit is fp32 — unlike the trainer, which
-    autocasts under ``amp`` — so enrolling against a run costs roughly twice the
-    activation memory that run's own training did at the same batch size: a
-    batch-32 run needs ~10 GB, which does not fit a 12 GB card alongside a
-    resident ``.nam``. Drop it to 8–16 there. Only memory and steps/epoch move
-    (steps = ``pairs / batch_size``); the fit itself is unchanged.
+    - ``dry`` is the capture input (e.g. the NAM sweep signal TONE3000 sends to
+      every amp), ``wet`` the device's recorded response — align and level
+      them first (see the notebook).
+    - By default the last ``val_frac`` of the pair is the val region and
+      everything before it is train. Pass ``train_region``/``val_region``
+      (both, as ``(start, stop)`` sample bounds; negatives resolve from the
+      end) to drive the split explicitly — e.g. :func:`nam_signal_regions` to
+      follow the NAM trainer's own layout for a standardized sweep (skip the
+      lead-in, validate on the dedicated tail) instead of a blind time slice.
+      Windows never cross into the other region; the lead-in gap between them
+      (if any) is simply unused.
+    - Writes to ``<run_dir>/enroll/pairs/<name>/``: ``enrolled_pair.pt`` (the
+      fitted vector + provenance), ``metrics.json``, ``enroll_log.csv``
+      (epoch -1 is the init baseline). Returns the metrics dict.
+    - ``init`` is where the row starts — ``"uniform"`` (default, the trainer's
+      own init scale) or ``"table_mean"``; see :func:`_swap_embedding`. The
+      table mean starts at a much lower ESR, but it is not a point any trained
+      device occupies, so a better baseline does not imply a better optimum.
+    - ``stft_weight`` overrides the run's multi-res STFT loss weight (``None``
+      keeps the run's trained value). Pass ``0.0`` to fit on pre-emphasized ESR
+      alone: on a single-pair fit the STFT magnitude term can dominate the
+      gradient and drive the embedding to a spectrally-plausible but
+      waveform-uncorrelated optimum (val ESR *rises* while train loss falls —
+      observed on wavenet_a2, where stft_weight=0 fixed it).
+    - ``batch_size`` overrides the run's training batch size for this fit
+      (``None`` keeps the run's value). This fit is fp32 — unlike the trainer,
+      which autocasts under ``amp`` — so enrolling against a run costs roughly
+      twice the activation memory that run's own training did at the same
+      batch size: a batch-32 run needs ~10 GB, which doesn't fit a 12 GB card
+      alongside a resident ``.nam``. Drop it to 8-16 there. Only memory and
+      steps/epoch move (steps = ``pairs / batch_size``); the fit itself is
+      unchanged.
     """
     run_dir = Path(run_dir)
     dev = torch.device(_resolve_device(device))
@@ -666,7 +731,7 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         ecfg.batch_size = int(batch_size)
     base_name = ck.get("name", run_dir.name)
-    _swap_embedding(model, ecfg, 1, dev)
+    _swap_embedding(model, ecfg, 1, dev, init=init)
 
     R = model.receptive_field
     clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
@@ -713,7 +778,7 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
 
     t0 = time.time()
     init_val = evaluate_esr(model, val_loader, dev, ecfg.preemph)
-    print(f"[enroll-pair] baseline val_esr={init_val:.5f} (init=table_mean)")
+    print(f"[enroll-pair] baseline val_esr={init_val:.5f} (init={init})")
     with log_path.open("a", newline="", encoding="utf-8") as fh:
         csv.writer(fh).writerow([-1, 0, "", "", "", f"{init_val:.6f}",
                                  f"{lr:.2e}", f"{time.time() - t0:.1f}"])
@@ -740,7 +805,7 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
         "name": name, "embedding_dim": int(ecfg.embedding_dim),
         "base_run": base_name, "base_epoch": int(ck.get("epoch", -1)),
         "base_manifest_sha256": ck.get("manifest_sha256", ""),
-        "init": "table_mean", "pairs": int(pairs), "epochs_run": epochs_run,
+        "init": init, "pairs": int(pairs), "epochs_run": epochs_run,
         "lr": float(lr), "seed": seed, "sample_rate": cfg.sample_rate,
         "stft_weight": float(ecfg.stft_weight),
         "sources": dict(sources or {}),
@@ -753,7 +818,7 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
         "run": base_name, "name": name, "pairs": int(pairs), "epochs": int(epochs),
         "batch_size": int(ecfg.batch_size),
         "epochs_run": epochs_run, "best_epoch": best_epoch, "lr": float(lr),
-        "seed": seed, "init": "table_mean", "stft_weight": float(ecfg.stft_weight),
+        "seed": seed, "init": init, "stft_weight": float(ecfg.stft_weight),
         "pair_seconds": round(n_total / cfg.sample_rate, 2),
         "val_seconds": round(val_len / cfg.sample_rate, 2),
         "train_region": [int(train_region[0]), int(train_region[1])],

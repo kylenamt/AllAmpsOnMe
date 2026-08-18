@@ -1,0 +1,152 @@
+# proto.yaml with a 6 s reference. THE ONLY INTENDED VARIABLE IS `joint.ref_seconds`
+# (2.0 -> 6.0): how much of an amp the encoder gets to look at before it commits to
+# one embedding. Everything the generator sees is untouched — `clip_seconds` is still
+# 2.0, so window A is identical and the two runs' val ESR are directly comparable.
+#
+# `grad_checkpoint_encoder` also flips, and that is not a second variable: a WaveNet
+# never downsamples, so a 6 s reference stays 288,000 frames wide through all 23
+# layers and 3x the activations do not fit beside the generator on a 12 GB card.
+# Checkpointing recomputes those activations in backward instead of storing them —
+# same arithmetic, same gradients, only slower (`test_grad_checkpointing_changes_
+# nothing_but_memory` asserts the outputs match). It is the one knob that buys memory
+# without changing the experiment, which is why it and not `batch_size` absorbs the cost.
+#
+# Note 6 s is past guidelines §7's 2-4 s range for L_ref. That range is about giving
+# pooling enough content to average over; going beyond it is the open question this
+# run exists to answer, and the cost is paid in epoch time, not correctness.
+#
+# Measured on the 12 GB card at batch 16 / enc_channels 16, with MRSTFT in the loop:
+#     ref 2 s, checkpointing off   7.02 GB   30.1 smp/s   (= configs/joint/proto.yaml)
+#     ref 6 s, checkpointing off      OOM
+#     ref 6 s, checkpointing on    8.79 GB   15.7 smp/s   (= this config)
+# So the reference length costs ~2x throughput here, i.e. ~27 min/epoch against
+# proto's ~11. `pairs_per_epoch` deliberately stays at 25000 so an epoch means the
+# same number of training samples in both runs and the two curves stay comparable
+# epoch-for-epoch; only wall-clock differs.
+#
+# Run with:
+#   OPENAMP_DATA_DIR=data_mixed openamp joint --config configs/joint/proto_ref6.yaml
+#
+# WHAT THIS IS
+# The generator half is a normal FiLM NAM (A2 WaveNet, ch16, tanh) — the same
+# network as results/emulate/nam_a2_tanh_ch16_512, with one difference: its
+# embedding no longer comes from an nn.Embedding table indexed by device, but
+# from an encoder reading a 2 s (dry, wet) reference clip of the amp. Both halves
+# train from scratch, together, on reconstruction loss alone.
+#
+# BASELINE TO BEAT
+#   results/emulate/nam_a2_tanh_ch16_512  val_esr 0.05188, shuffled 1.881 (x36)
+# Same corpus (manifest c97d68…), same 404 train / 46 holdout devices, same arch
+# and width of network — that run is this one's "fixed code per amp" control
+# (guidelines Phase 0), which is exactly what a learned table is. It reached that
+# in 21.3 h / 100 epochs at batch 32.
+#
+# READ THE TRIPWIRE, NOT THE ESR
+# There is no contrastive term here, so nothing supervises the embedding directly
+# and a respectable val_esr is NOT evidence the thing works: an encoder emitting a
+# constant vector plus a generator that learned one average amp produces exactly
+# that. Watch instead, per epoch:
+#   shuffled  — val ESR with embeddings permuted across the batch. Must be MUCH
+#               worse than val_esr (the table baseline sits at x36).
+#   emb_spread— across-batch std of e. Goes to ~0 on collapse, long before ESR
+#               shows anything. If it does, add the contrastive term (SupCon is
+#               already written and tested in encoder/train.py:69).
+#
+# NOTE ON WIDTHS
+# embedding_dim 256 is the generator's FiLM input width. The encoder's *pooled*
+# vector is 2 * enc_channels = 32 numbers, so that is the real bottleneck on what
+# can be said about an amp; 256 is how wide it is written, not how much it says.
+# Guidelines §7 puts C_enc at 16-32 and its own default De at 16, so 32 pooled is
+# already generous. enc_channels is the knob to raise if the model underfits amps.
+#
+# WHY THESE TRAINING NUMBERS DIFFER FROM THE emulate/ CONFIGS
+#   batch_size 16      — 32 does not fit: encoder + generator peak at 7.0 GB of
+#                        the card's 11.5 GB at 16 (measured, with MRSTFT).
+#   pairs_per_epoch    — halved with the batch, so an epoch stays ~14 min and the
+#     25000              val/checkpoint/tripwire cadence matches the baseline's.
+#   plateau_patience 5 — raised with early_stop_patience, since a half-size epoch
+#   early_stop 15        means the same patience would give up on half the data.
+#
+# A per-run file REPLACES configs/openamp.yaml's sections wholesale — anything
+# omitted silently falls back to the dataclass defaults in core/config.py, so
+# these are full copies, never deltas.
+# Keep the decimal point in `4.0e-3`: PyYAML resolves a bare `4e-3` as a *string*.
+
+emulate:
+  # --- Generator: identical to nam_a2_tanh_ch16_512 except the embedding width -
+  arch: film_wavenet
+  wn_channels: 16
+  wn_activation: tanh      # "leakyrelu" (the capture default) | "tanh"
+  embedding_dim: 256       # width of e; the encoder projects to exactly this
+  single_device: -1        # -1 = one-to-many over all render-ok devices
+
+  # --- Training ---------------------------------------------------------------
+  holdout_frac: 0.1        # 46 unseen devices; the zero-shot number is on these
+  clip_seconds: 2.0        # generator window A
+  batch_size: 16
+  pairs_per_epoch: 25000
+  epochs: 120
+  lr: 4.0e-3               # generator lr; the encoder's is joint.enc_lr
+  weight_decay: 3.17e-7
+  plateau_patience: 5
+  plateau_factor: 0.5
+  early_stop_patience: 15
+  stft_weight: 0.05        # NAM's 5e-4, rescaled to this ESR term
+  preemph: 0.85            # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
+  num_workers: 8           # 4 FLAC seek-reads per item (window A + reference B)
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50
+
+joint:
+  # --- Reference segment (window B) --------------------------------------------
+  ref_seconds: 6.0
+  # THE mechanism: window B comes from a different corpus file than window A, so
+  # the encoder cannot pass content forward — only what is shared across two
+  # different recordings of the same amp survives, and that is the amp. Free here:
+  # data_mixed has 71 train / 10 val files. The dry side is shared across every
+  # device anyway, so a reference is only informative through its wet channel.
+  ref_different_file: true
+  ref_min_gap_seconds: 1.0   # same-file fallback only; unused on this corpus
+  sources: []                # [] = egdb + sweep, both content types
+
+  # --- Encoder ------------------------------------------------------------------
+  enc_channels: 16         # 30.2 smp/s at 7.0 GB; 32 costs 35% speed for 64-d pooled
+  enc_activation: tanh     # matches the generator
+  enc_attn_hidden: 64
+  enc_proj_hidden: 128
+  # ON: nothing else bounds ||e||, and the reconstruction gradient will happily
+  # inflate it — growing ||e|| is a cheap way to grow FiLM gain early, and it ends
+  # by saturating the generator's tanh into an amp-independent solution. Measured
+  # on a fixed batch of 8 devices, 900 steps (final ESR / shuffled ratio / ||e||):
+  #     normalize  enc_lr    ESR     shuffled   ||e||   spread
+  #     true       4.0e-3    0.0116     38.1x    1.00   0.054   <- this config
+  #     true       1.0e-3    0.0121     36.6x    1.00   0.050
+  #     true       2.5e-4    0.0147     31.3x    1.00   0.046
+  #     false      4.0e-3    0.6964      1.0x  123.01   0.0000  <- collapsed
+  #     false      1.0e-3    0.0100     43.8x    3.21   0.156
+  #     false      2.5e-4    0.0109     40.9x    2.39   0.096
+  # The unnormalized row at 4e-3 diverged at ~step 500 and never recovered: a
+  # shuffled ratio of 1.0 means true and wrong embeddings render identically.
+  # Unnormalized at 1e-3 fits slightly better, but the runaway direction is still
+  # there — it just wasn't found within 900 steps. Normalizing removes it outright
+  # rather than staying one learning rate away from it, at the same quality, and
+  # the resulting 38x is what the table baseline gets (0.052 -> 1.88 = 36x).
+  enc_normalize: true
+  grad_checkpoint_encoder: true    # REQUIRED at 6 s; mathematically a no-op (see header)
+
+  # --- Optimization -------------------------------------------------------------
+  # NOT the generator's 4e-3. This is the knob guidelines §9 warns about ("encoder/
+  # generator LR imbalance -> dead encoder"), and it is the difference between a
+  # model and nothing. Measured over 32 devices on real (varying) references, 600
+  # steps at gen_lr 4e-3 — train ESR / embedding spread / shuffled ratio:
+  #     enc_lr 4.0e-3   0.976   0.0000    1.00x   <- collapsed to silence
+  #     enc_lr 5.0e-4   0.285   0.0396    7.11x   <- this config
+  #     enc_lr 5.0e-4 + 200-step warmup
+  #                     0.279   0.0419    7.33x   <- no better; not worth the machinery
+  # At 4e-3 the encoder collapses first (spread -> 0) and the generator follows it
+  # into the output-silence solution (ESR ~1.0), which is why the fixed-batch
+  # sanity check missed it: memorizing 8 clips is not the same problem as reading
+  # a reference it has never seen. The generator's own 4e-3 is untouched and fine.
+  enc_lr: 5.0e-4

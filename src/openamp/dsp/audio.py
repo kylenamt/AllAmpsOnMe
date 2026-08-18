@@ -1,17 +1,13 @@
 """Audio I/O, level/error metrics, and the deterministic validation probe.
 
-The one place that depends on ``soundfile`` and ``torchaudio``. Every heavy
-import is local so the rest of the package (and its unit tests) load on a bare
-numpy stack. If these deps are missing, a clear install hint is raised — the
-same pattern ``openamp.nam`` uses for torch/NAM.
-
-The probe is a fixed, deterministic 5 s test signal used by the acquisition
-``validate`` and ``dedup`` stages:
-
-    2 s log sine sweep 20 Hz–20 kHz @ -12 dBFS  +  1 s silence  +  2 s DI snippet
-
-It is synthesized deterministically (same array every run) so validation and
-ESR-based dedup are reproducible.
+- The one place that depends on ``soundfile`` and ``torchaudio``. Every heavy
+  import is local so the rest of the package (and its unit tests) load on a bare
+  numpy stack. Missing deps raise a clear install hint — same pattern as
+  ``openamp.nam`` for torch/NAM.
+- The probe: a fixed, deterministic 5 s signal used by acquisition `validate`/`dedup`:
+  2 s log sine sweep 20 Hz–20 kHz @ -12 dBFS + 1 s silence + 2 s DI snippet.
+  Synthesized deterministically (same array every run) so validation and
+  ESR-based dedup are reproducible.
 """
 
 from __future__ import annotations
