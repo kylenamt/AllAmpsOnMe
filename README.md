@@ -2,26 +2,20 @@
 
 A general-purpose guitar amp model trained on data captured from [TONE3000](https://www.tone3000.com).
 
-Following the [Open-Amp paper](https://arxiv.org/abs/2411.14972), a single FiLM-conditioned TCN
-emulates hundreds of amps at once. Each amp is a diverse **amp-only (DI)**
-[NAM](https://www.neuralampmodeler.com/) capture from the TONE3000 community — one "device" the
-model learns to emulate.
-
-Everything lives in one Python package and CLI (`openamp`) that runs the whole pipeline as a
-sequence of verbs:
+- Follows the [Open-Amp paper](https://arxiv.org/abs/2411.14972): one FiLM-conditioned TCN emulates hundreds of amps at once.
+- Each amp is a diverse **amp-only (DI)** [NAM](https://www.neuralampmodeler.com/) capture from the TONE3000 community — one "device" the model learns to emulate.
+- Everything lives in one Python package and CLI (`openamp`), run as a sequence of verbs:
 
 ```
 acquire :  auth · discover · select · download · validate · dedup · finalize · status
 corpus  :  corpus · subset · render · verify
-emulate :  emulate · emulate-compare · emulate-validate · emulate-demo
+emulate :  emulate · emulate-compare · emulate-validate · emulate-demo · emulate-enroll
+encoder :  encode · encode-eval
 ```
 
-See [docs/architecture.md](docs/architecture.md) for the code layout and
-[docs/pipeline.md](docs/pipeline.md) for the full operator guide.
+See [docs/architecture.md](docs/architecture.md) for the code layout and [docs/pipeline.md](docs/pipeline.md) for the full operator guide.
 
 ## Setup
-
-The project uses **conda** (Python 3.10):
 
 ```bash
 conda create -n open-amp3000 python=3.10
@@ -30,18 +24,14 @@ pip install -e ".[dev]"      # deps + pytest
 cp .env.example .env         # add your TONE3000 key (OPENAMP_API_KEY)
 ```
 
-> **NAM version:** `neural-amp-modeler>=0.13` is required — it is the first release that can parse
-> an **A2** capture. On older versions every A2 capture fails validation.
-
-Tunables live in [`configs/openamp.yaml`](configs/openamp.yaml) (pipeline) and
-[`configs/emulate/`](configs/emulate/) (per-run emulator); API access and the data root come from
-`.env` (`OPENAMP_*`).
+- Requires `neural-amp-modeler>=0.13` — the first release that can parse an **A2** capture. Older versions fail validation on every A2 capture.
+- Tunables: [`configs/openamp.yaml`](configs/openamp.yaml) (pipeline), [`configs/emulate/`](configs/emulate/) (per-run emulator).
+- API access + data root: `.env` (`OPENAMP_*`).
 
 ## Pipeline
 
-Run `openamp --help` for the full command list, or `openamp <command> --help` for any one. Every
-stage reads and writes the parquet manifests under `data/manifests/` and is idempotent, so you can
-stop and resume at any point.
+- `openamp --help` for the full command list, `openamp <command> --help` for any one.
+- Every stage reads/writes the parquet manifests under `data/manifests/` and is idempotent — stop and resume anytime.
 
 ```bash
 # 1 — Acquire diverse DI amp captures from TONE3000 into data/
@@ -64,15 +54,19 @@ openamp emulate --config configs/emulate/paper.yaml
 openamp emulate-compare results/emulate/*     # test-split comparison
 openamp emulate-validate paper                # per-amp test ESR -> <run>/per_device_esr.csv
 openamp emulate-demo results/emulate/paper    # listening WAVs
+
+# 4 — (experiment) Train the tone encoder: (dry, wet) capture audio -> 512-d tone vector.
+# Standalone — nothing above consumes its output yet; `encode-eval` is the gate that decides.
+OPENAMP_DATA_DIR=data_mixed openamp encode --config configs/encoder/sweep_base.yaml
+OPENAMP_DATA_DIR=data_mixed openamp encode-eval sweep_base
 ```
 
 ## Data & licensing
 
-Downloaded `.nam` captures, OAuth tokens, and API keys are **never committed**, and captures are
-**never redistributed** — only per-capture metadata and license terms are recorded in the manifest.
-The clean corpus and rendered audio are derived data that stay under the git-ignored `data/` tree
-and are never published. Acquisition uses the official TONE3000 API only (no scraping), rate-limited
-at all times.
+- Downloaded `.nam` captures, OAuth tokens, and API keys are **never committed**.
+- Captures are **never redistributed** — only per-capture metadata and license terms go in the manifest.
+- The clean corpus and rendered audio are derived data, stay under the git-ignored `data/` tree, never published.
+- Acquisition uses the official TONE3000 API only (no scraping), rate-limited at all times.
 
 ## Development
 
@@ -81,8 +75,7 @@ python -m pytest              # run the test suite
 python -m openamp --help      # the CLI (also the `openamp` console script)
 ```
 
-Some `test_validate.py` / `test_finalize.py` tests are skipped unless small `.nam` fixtures exist
-under `tests/fixtures/` — see [`tests/fixtures/README.md`](tests/fixtures/README.md).
+Some `test_validate.py` / `test_finalize.py` tests are skipped unless small `.nam` fixtures exist under `tests/fixtures/` — see [`tests/fixtures/README.md`](tests/fixtures/README.md).
 
 ## License
 

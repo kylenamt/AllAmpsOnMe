@@ -1,0 +1,50 @@
+# configs/joint/proto.yaml shrunk to a few minutes — wiring check, not a result.
+#
+#   OPENAMP_DATA_DIR=data_mixed openamp joint --config configs/joint/smoke.yaml \
+#       --limit-devices 8
+#
+# Everything structural matches proto.yaml so the two are comparable; only the
+# epoch size, epoch count and worker count change. Expect nothing from the ESR
+# here — 400 pairs over 3 epochs is far too little to fit an amp, let alone 8.
+# What it proves is that data flows, gradients reach the encoder, the tripwire
+# reports, and the run directory is written.
+
+emulate:
+  arch: film_wavenet
+  wn_channels: 16
+  wn_activation: tanh
+  embedding_dim: 256
+  single_device: -1
+
+  holdout_frac: 0.1
+  clip_seconds: 2.0
+  batch_size: 8
+  pairs_per_epoch: 400
+  epochs: 3
+  lr: 4.0e-3
+  weight_decay: 3.17e-7
+  plateau_patience: 5
+  plateau_factor: 0.5
+  early_stop_patience: 15
+  stft_weight: 0.05
+  preemph: 0.85
+  num_workers: 2
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 160
+  log_every: 10
+
+joint:
+  ref_seconds: 2.0
+  ref_different_file: true
+  ref_min_gap_seconds: 1.0
+  sources: []
+
+  enc_channels: 16
+  enc_activation: tanh
+  enc_attn_hidden: 64
+  enc_proj_hidden: 128
+  enc_normalize: true
+  grad_checkpoint_encoder: false
+
+  enc_lr: 4.0e-3

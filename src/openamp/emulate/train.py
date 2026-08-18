@@ -1,19 +1,18 @@
 """One training script for the amp foundation models (spec §4.2).
 
-Trains the configured architecture (``emulate.arch``: FiLM-TCN or the A2
-FiLM-WaveNet, built by :func:`openamp.emulate.models.build_model`) on
-:class:`openamp.emulate.dataset.EmulationDataset`: pre-emphasized ESR +
-multi-resolution STFT (auraloss), 1:1; Adam lr 5e-4, reduce-on-plateau, early
-stopped at the val-ESR plateau. Plain single-GPU PyTorch — no Lightning. Every
-run writes to ``results/emulate/<name>/``: best/last checkpoints, a copy of the
-config, ``metrics.json`` (param count, receptive field, train hours), and
-``train_log.csv`` (per-epoch train/val curves).
-
-Sanity ladder (cheap, run before any long job):
+- Trains the configured architecture (``emulate.arch``: FiLM-TCN or the A2
+  FiLM-WaveNet, built by :func:`openamp.emulate.models.build_model`) on
+  :class:`openamp.emulate.dataset.EmulationDataset`: pre-emphasized ESR +
+  multi-resolution STFT (auraloss), 1:1; Adam lr 5e-4, reduce-on-plateau, early
+  stopped at the val-ESR plateau. Plain single-GPU PyTorch — no Lightning.
+- Every run writes to ``results/emulate/<name>/``: best/last checkpoints, a
+  copy of the config, ``metrics.json`` (param count, receptive field, train
+  hours), ``train_log.csv`` (per-epoch train/val curves).
+- Sanity ladder (cheap, run before any long job):
   1. ``overfit_one_batch`` — a single batch should drive ESR to ~0.
-  2. mini-run (``--limit-devices 10``) — devices sound distinct, and shuffling the
-     embeddings across devices should *hurt* val ESR (proves conditioning works;
-     reported as ``val_esr_shuffled`` at the end of every run).
+  2. mini-run (``--limit-devices 10``) — devices sound distinct, and shuffling
+     the embeddings across devices should *hurt* val ESR (proves conditioning
+     works; reported as ``val_esr_shuffled`` at the end of every run).
 """
 
 from __future__ import annotations
@@ -55,7 +54,7 @@ def esr(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Te
 
     Pooled as one ratio of sums, not a mean of per-window ratios: window target
     energy spans ~8 orders of magnitude (near-silent passages in clean guitar),
-    so per-window ratios let a handful of quiet windows dominate the batch.
+    so per-window ratios would let a handful of quiet windows dominate the batch.
     """
     num = torch.sum((pred - target) ** 2, dim=-1)
     den = torch.sum(target ** 2, dim=-1)
@@ -116,11 +115,12 @@ def evaluate_esr(model, loader, device, coeff: float, *, n_batches: int | None =
                  shuffle_devices: bool = False) -> float:
     """Energy-weighted pre-emphasized ESR over the loader (warmed region only).
 
-    Accumulates error and signal energy across every window and divides once, to
-    match :func:`esr`; a mean of per-window ratios is dominated by quiet windows.
-
-    ``shuffle_devices`` permutes the conditioning within each batch — the control
-    that should make ESR *worse* if the embeddings actually steer the model.
+    - Accumulates error and signal energy across every window and divides once,
+      matching :func:`esr` (a mean of per-window ratios would be dominated by
+      quiet windows).
+    - ``shuffle_devices`` permutes the conditioning within each batch — the
+      control that should make ESR *worse* if the embeddings actually steer the
+      model.
     """
     was_training = model.training
     model.eval()
@@ -206,11 +206,13 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
     n_params = count_parameters(model)
     clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
     rf_ms = 1000.0 * R / cfg.sample_rate
-    arch = arch_summary(ecfg)
+    arch = arch_summary(ecfg, model)
     print(f"[model] name={name} arch={arch['arch']} params={n_params:,} "
           f"devices={len(ids)} holdout={len(holdout_ids)} "
           f"channels={arch['channels']} layers={arch['blocks_x_layers']} "
-          f"embed={ecfg.embedding_dim}")
+          # Model, not config: tabledelta_wavenet derives its width from the
+          # schedule, so ecfg.embedding_dim would print a number nothing uses.
+          f"embed={getattr(model, 'embedding_dim', ecfg.embedding_dim)}")
     print(f"[model] receptive_field={R} samples ({rf_ms:.1f} ms)  clip={clip}")
 
     # --- Data -------------------------------------------------------------------
@@ -255,10 +257,10 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         start_epoch = resumed_from + 1
         best_val = float(ck.get("best_val_esr", float("inf")))
         # Config is authoritative on resume: opt.load_state_dict just restored the
-        # checkpoint's own lr/weight_decay, but edits to the config file must win so
-        # a resumed run can be hand-annealed (read the last lr from train_log.csv,
-        # set the config to that or lower, then resume). The Adam moment buffers are
-        # preserved — that, not the lr value, is the point of resuming.
+        # checkpoint's own lr/weight_decay, but config-file edits must win so a
+        # resumed run can be hand-annealed (read the last lr from train_log.csv,
+        # set the config to that or lower, then resume). The Adam moment buffers
+        # are preserved -- that, not the lr value, is the point of resuming.
         for g in opt.param_groups:
             g["lr"], g["weight_decay"] = ecfg.lr, ecfg.weight_decay
         print(f"[resume] from epoch {start_epoch}, best_val_esr={best_val:.5f}; "
@@ -325,10 +327,11 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         val_esr = evaluate_esr(model, val_loader, dev, ecfg.preemph)
 
         # NaN guard: fp16 forward overflow (activations > 65504) once NaN-killed a
-        # 52-epoch run — recover instead of dying. Non-finite val ESR means the
-        # weights themselves are poisoned: reload best and drop to fp32 (or halve
-        # the lr if already fp32). Non-finite train loss with finite val means the
-        # GradScaler absorbed the overflow: just drop to fp32 and keep everything.
+        # 52-epoch run -- recover instead of dying.
+        # - Non-finite val ESR: weights are poisoned. Reload best, drop to fp32
+        #   (or halve lr if already fp32).
+        # - Non-finite train loss with finite val: GradScaler absorbed the
+        #   overflow. Drop to fp32 and keep everything.
         if not np.isfinite(val_esr):
             if not ckpt_path.is_file():
                 raise RuntimeError(
@@ -388,12 +391,15 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
           f"(shuffle should be worse){' OK' if val_shuf > val_true else ' — weak conditioning'}")
 
     _save_config_copy(run_dir, ecfg)
-    save_embedding(run_dir / "embedding.pt", model, ids, manifest_sig, ecfg.embedding_dim, name,
+    # The model is authoritative on width, not the config: tabledelta_wavenet
+    # derives its embedding_dim from the schedule and ignores ecfg.embedding_dim.
+    emb_dim = getattr(model, "embedding_dim", ecfg.embedding_dim)
+    save_embedding(run_dir / "embedding.pt", model, ids, manifest_sig, emb_dim, name,
                    holdout_ids=holdout_ids)
     metrics = {
         "name": name, "arch": arch["arch"], "params": n_params,
         "receptive_field_samples": R, "receptive_field_ms": round(rf_ms, 3),
-        "embedding_dim": ecfg.embedding_dim, "channels": arch["channels"],
+        "embedding_dim": emb_dim, "channels": arch["channels"],
         "blocks_x_layers": arch["blocks_x_layers"], "n_devices": len(ids),
         "single_device": ecfg.single_device, "best_val_esr": best_val,
         "val_esr": val_true, "val_esr_shuffled": val_shuf,
@@ -422,12 +428,12 @@ def _save_config_copy(run_dir: Path, ecfg) -> None:
         yaml.safe_dump({"emulate": asdict(ecfg)}, sort_keys=False), encoding="utf-8")
 
 
-# Shape-defining knobs: frozen for the life of a run because the checkpoint's
+# Shape-defining knobs: frozen for the life of a run since the checkpoint's
 # weights depend on them. Everything else in EmulateConfig is training dynamics
-# and may change on resume. Device count / receptive field are checked separately.
-# ``wn_activation`` and ``cond_activation`` are here despite not changing any
-# shape: the activations are parameter-free, so a swapped one would load cleanly
-# and quietly play a different network than the weights were trained for.
+# and may change on resume. Device count / receptive field checked separately.
+# ``wn_activation``/``cond_activation`` are here despite changing no shape: both
+# are parameter-free, so a swap would load cleanly and quietly play a different
+# network than the weights were trained for.
 _STRUCTURAL_KEYS = ("arch", "blocks", "layers_per_block", "channels", "kernel_size",
                     "dilation_growth", "wn_channels", "wn_activation",
                     "cond_hidden", "cond_activation", "delta_rank",
@@ -436,9 +442,10 @@ _STRUCTURAL_KEYS = ("arch", "blocks", "layers_per_block", "channels", "kernel_si
 
 def _check_resume_compatible(ck: dict, ecfg, receptive_field: int, n_devices: int) -> None:
     """Fail fast (before the strict state_dict load) if the config changed a
-    structural knob that would make the checkpoint weights incompatible, turning a
-    cryptic ``load_state_dict`` shape error into a clear message. Training dynamics
-    (lr, weight_decay, plateau_*, epochs, losses, batch_size) are free to change."""
+    structural knob that would make the checkpoint weights incompatible --
+    turns a cryptic ``load_state_dict`` shape error into a clear message.
+    Training dynamics (lr, weight_decay, plateau_*, epochs, losses, batch_size)
+    are free to change."""
     saved = ck.get("emulate_cfg", {})
     cur = asdict(ecfg)
     changed = [f"{k}: {saved[k]!r} -> {cur.get(k)!r}"
@@ -459,8 +466,8 @@ def _append_config_history(run_dir: Path, ecfg, *, mode: str, start_epoch: int,
                            resumed_from, best_val: float, max_epochs: int,
                            applied_lr: float, applied_wd: float) -> None:
     """Append one JSON line per training session (start or resume) to
-    ``config_history.jsonl`` — a never-overwritten audit trail of how each run and
-    each resume was configured. Complements the end-of-run ``config.yaml`` copy
+    ``config_history.jsonl`` — a never-overwritten audit trail of how each run
+    and resume was configured. Complements the end-of-run ``config.yaml`` copy
     (the as-finished snapshot)."""
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),

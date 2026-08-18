@@ -1,0 +1,92 @@
+# The original sketch: every device owns a free, unconstrained weight residual.
+# Run name is the file stem ("table_a2_256") -> results/emulate/table_a2_256/.
+#
+#   openamp emulate --config configs/emulate/table_a2_256.yaml --overfit           # sanity #1
+#   openamp emulate --config configs/emulate/table_a2_256.yaml --limit-devices 10  # mini-run
+#   openamp emulate --config configs/emulate/table_a2_256.yaml                     # full run
+#
+# Why this run exists: delta_wavenet conditions the conv weights, but through a
+# deliberately *low-rank* residual (scale * coeff(e) @ normalize(basis), one small
+# bank of directions shared by all 405 devices). That constraint was a design
+# decision made while implementing, never a measured one — the original idea gave
+# each device its own free per-layer weight table, and it was replaced before it
+# was ever trained. This is that idea, and the control that settles whether the
+# constraint helps or hurts: the full-rank limit of delta_wavenet, identical in
+# every other respect (same hook, same audio path, same dW/db/dm layout), so the
+# comparison isolates the low-rank basis and nothing else.
+#
+# Read it against the delta_a2_* ladder as the ceiling on what per-device weight
+# conditioning can buy at this hook. If a completely free table barely beats
+# rank 8, capacity was never the limit.
+#
+# ---------------------------------------------------------------------------------
+# Three things about this arch are unlike every other config here:
+#
+#   1. embedding_dim is DERIVED, not configured. A device's "embedding" is its
+#      whole weight residual, so the width falls out of the A2 schedule:
+#      64*156 kernel + 23*8 bias + 23*8 mixin = 10,352 per device. The
+#      `embedding_dim` key is ignored by this arch (kept out of this file
+#      entirely rather than set to a lie). There is no capacity knob — full rank
+#      is the definition.
+#   2. Parameters scale with the device count: 10,352 * 405 = 4,192,560, plus the
+#      12,145-weight A2 core they steer. ~17x delta_a2_256's total. `--limit-devices`
+#      shrinks the model, so mini-run numbers are NOT comparable with the full run.
+#   3. It CANNOT be enrolled. Held-out devices have no row, and there is no shared
+#      structure to position an unseen amp within, so `openamp emulate-enroll`
+#      refuses this arch outright rather than fitting a table the network never
+#      reads. Val ESR here is over *trained* devices: this run measures a capacity
+#      ceiling, not generalization, and its comparison row should be read that way.
+#
+# It does still fold and export — a device's row IS its delta, so the plugin's
+# re-fold is a slice-and-add with no generator. Profiles are ~10k floats (~40 KB)
+# instead of 256.
+#
+# Inference-time part masking: the three slices are addressable, so one trained
+# checkpoint answers "is the amp in the filter shape, or just in the levels?" —
+#   model.set_delta_parts(kernel=True, bias=False, mixin=False)
+# Export's fold honours the same mask, so a masked capture plays what you heard.
+# ---------------------------------------------------------------------------------
+#
+# WATCH: this arch has no magnitude constraint whatsoever — no scale, no normalized
+# basis. delta_a2_256's first attempt drifted to 5.1x the base kernel and shrank the
+# shared filter into irrelevance; that is what the scale split was added to prevent,
+# and nothing here prevents it. If it happens, it is a finding (direct evidence for
+# why the low-rank parameterization exists), not a bug. The table starts at exactly
+# zero, so every device begins as the plain A2 net.
+#
+# This is a FULL copy of nam_a2.yaml semantics, not a delta: a per-run file is read
+# *instead of* configs/openamp.yaml, so anything omitted falls back to the
+# EmulateConfig dataclass defaults (stft_weight 1.0, weight_decay 0.0, lr 5e-4 — the
+# paper's TCN numbers), silently undoing the NAM recipe. See nam_a2.yaml for the
+# derivation of each value.
+
+emulate:
+  # --- Model -------------------------------------------------------------------
+  arch: tabledelta_wavenet # A2 topology; free per-device weight residual, no generator
+  wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
+  single_device: -1        # -1 = one-to-many over all render-ok devices
+  # NOTE: no embedding_dim / delta_rank here — see the header. Both are meaningless
+  # for this arch and are ignored if set.
+
+  # --- Training (NAM's A2 numbers where the knob exists) -----------------------
+  holdout_frac: 0.1        # drawn as usual, but these devices can never be enrolled
+  clip_seconds: 2.0        # must match the corpus clip grid
+  batch_size: 32
+  pairs_per_epoch: 50000
+  epochs: 100              # NAM trainer.max_epochs; early-stop still ends it sooner
+  # NAM optimizer block, verbatim. Keep the decimal point: PyYAML resolves bare
+  # `4e-3` as a *string*, which reaches Adam untyped and dies at construction.
+  lr: 4.0e-3
+  weight_decay: 3.17e-7
+  plateau_patience: 3
+  plateau_factor: 0.5
+  early_stop_patience: 15   # 8 burned delta_a2_256 attempt 1 mid-recovery from a spike
+  # NAM's 5e-4 MRSTFT weight rescaled from its MSE term to this trainer's ESR term
+  # (ESR = MSE / mean(t^2); corpus renders sit at median mean(t^2) 0.0096).
+  stft_weight: 0.05
+  preemph: 0.85            # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50

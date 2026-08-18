@@ -1,8 +1,10 @@
 """Emulation models (FiLM-TCN + A2 FiLM-WaveNet): receptive field / causality /
 conditioning, arch dispatch, training-pair construction (alignment + real
-left-context warmup), losses, and the size-comparison CSV. torch-guarded like
-the other model tests; the dataset cases additionally need soundfile (they
-write tiny real FLACs in tmp_path); the A2 reference check needs NAM."""
+left-context warmup), losses, and the size-comparison CSV.
+
+torch-guarded like the other model tests; the dataset cases additionally need
+soundfile (they write tiny real FLACs in tmp_path); the A2 reference check
+needs NAM."""
 
 import numpy as np
 import pytest
@@ -14,7 +16,10 @@ from openamp.emulate.models import build_model
 from openamp.emulate.tcn import FiLMTCN, count_parameters
 from openamp.emulate.wavenet import (A2_DILATIONS, A2_KERNEL_SIZES, DeltaWaveNet,
                                      DeltaWaveNetLayer, FiLMWaveNet, MLPFiLMWaveNet,
-                                     film_output_linear)
+                                     TableDeltaWaveNet, film_output_linear)
+
+# A shrunken A2-shaped schedule shared by the weight-conditioned arch tests.
+SMALL_SCHEDULE = dict(kernel_sizes=(3, 3, 3), dilations=(1, 2, 4), head_kernel=4)
 
 # The two A2-topology archs differ only in the FiLM generator, so every WaveNet
 # case below is parametrized over both: cond_hidden 0 = film_wavenet's single
@@ -243,13 +248,13 @@ def test_delta_generator_shape_accounting_and_rejects_degenerate_rank():
 def test_delta_magnitude_lives_only_in_scale():
     """Regression guard on what killed the first delta_a2_256 run.
 
-    With magnitude spread diffusely through ``basis``, ``coeff`` and ``basis`` can
-    trade it back and forth at zero cost, and the optimizer took that trade: by epoch
-    12 the delta was 5.1x the base kernel, i.e. the shared filter had been shrunk to
-    irrelevance and each device's conv rebuilt from its own residual — the per-device
-    weight table this arch exists to avoid. Normalizing the rows makes ``basis``
-    direction-only, so a layer's deviation from the shared kernel is exactly one
-    number that can be watched and decayed.
+    With magnitude spread diffusely through ``basis``, ``coeff``/``basis`` could
+    trade it back and forth at zero cost -- the optimizer took that trade: by
+    epoch 12 the delta was 5.1x the base kernel (shared filter shrunk to
+    irrelevance, each device's conv rebuilt from its own residual, the
+    per-device weight table this arch exists to avoid). Normalizing the rows
+    makes ``basis`` direction-only, so a layer's deviation from the shared
+    kernel is exactly one number that can be watched and decayed.
     """
     torch.manual_seed(0)
     m = _small_delta_wavenet()
@@ -341,6 +346,191 @@ def test_delta_step_moves_both_the_shared_conv_and_the_embedding():
     after = (m.layers[0].conv.weight, m.embedding.weight, m.layers[0].delta.coeff.weight)
     for b, a in zip(before, after):
         assert torch.linalg.norm(b - a) > 1e-5
+
+
+# --- Table-delta WaveNet (the unconstrained per-device weight table) -------------
+def _small_table_wavenet(**kw):
+    kw.setdefault("n_devices", 4)
+    return TableDeltaWaveNet(channels=4, **SMALL_SCHEDULE, **kw)
+
+
+def test_tabledelta_derives_its_embedding_dim_from_the_schedule():
+    # No configured width: a device's "embedding" IS its whole weight residual, so
+    # the table is as wide as the schedule needs. 23 A2 layers at C=8 ->
+    # 64*156 kernel + 23*8 bias + 23*8 mixin.
+    m = TableDeltaWaveNet(n_devices=10, channels=8)
+    assert m.embedding_dim == 8 * 8 * sum(A2_KERNEL_SIZES) + 2 * 8 * len(A2_DILATIONS)
+    assert m.embedding_dim == 10_352
+    assert m.embedding.weight.shape == (10, 10_352)
+    assert m.receptive_field == 6347                  # the A2 schedule, untouched
+    # ecfg.embedding_dim is ignored rather than silently honoured.
+    cfg = build_model(EmulateConfig(arch="tabledelta_wavenet", embedding_dim=256), 10)
+    assert cfg.embedding_dim == 10_352
+    assert m(torch.randn(3, 4000), torch.tensor([0, 1, 2])).shape == (3, 1, 4000)
+
+
+def test_tabledelta_zero_init_is_unconditioned_then_the_table_steers():
+    torch.manual_seed(0)
+    m = _small_table_wavenet().eval()
+    x = torch.randn(1, 1500)
+    # Zero table = every device is the shared A2 net. No vanishing-gradient trap
+    # here (unlike the low-rank generator): the table *is* the delta.
+    assert torch.equal(m.embedding.weight, torch.zeros_like(m.embedding.weight))
+    assert torch.allclose(m(x, torch.tensor([0])), m(x, torch.tensor([3])))
+    with torch.no_grad():
+        m.embedding.weight.normal_(0.0, 0.05)
+    assert not torch.allclose(m(x, torch.tensor([0])), m(x, torch.tensor([3])))
+
+
+def test_tabledelta_causality_and_per_sample_weights():
+    torch.manual_seed(0)
+    m = _small_table_wavenet(n_devices=4).eval()
+    with torch.no_grad():
+        m.embedding.weight.normal_(0.0, 0.05)
+    R = m.receptive_field
+    x = torch.randn(1, 3000)
+    xb = x.clone(); xb[..., 2000:] += 5.0             # perturb only the future
+    assert torch.allclose(m(x, torch.tensor([0]))[..., :2000 - R],
+                          m(xb, torch.tensor([0]))[..., :2000 - R], atol=1e-6)
+    # A batch mixes devices, so each item must use its own row's kernel.
+    xs = torch.randn(3, 1200)
+    batched = m(xs, torch.tensor([0, 2, 3]))
+    for b, row in enumerate([0, 2, 3]):
+        assert torch.allclose(batched[b:b + 1], m(xs[b:b + 1], torch.tensor([row])),
+                              atol=1e-6)
+
+
+def test_tabledelta_equals_delta_wavenet_at_full_rank():
+    """The claim the whole comparison rests on: these two archs differ *only* in
+    whether the residual is low-rank. Generate delta_wavenet's residuals, drop them
+    into the table verbatim, and the two networks must be the same function — so a
+    difference in trained ESR is attributable to the constraint and nothing else.
+    """
+    torch.manual_seed(0)
+    d = DeltaWaveNet(n_devices=4, channels=4, embedding_dim=8, delta_rank=3,
+                     **SMALL_SCHEDULE).eval()
+    with torch.no_grad():                              # make its delta non-trivial
+        for layer in d.layers:
+            layer.delta.basis.normal_(0.0, 0.3)
+            layer.delta.scale.fill_(0.4)
+    t = _small_table_wavenet().eval()
+    with torch.no_grad():
+        t.rechannel.load_state_dict(d.rechannel.state_dict())
+        t.head_rechannel.load_state_dict(d.head_rechannel.state_dict())
+        for tl, dl in zip(t.layers, d.layers):
+            for part in ("conv", "input_mixer", "layer1x1"):
+                getattr(tl, part).load_state_dict(getattr(dl, part).state_dict())
+        for row in range(4):
+            e = d.embedding.weight[row:row + 1]
+            t.embedding.weight[row] = torch.cat(
+                [torch.cat([p.reshape(-1) for p in dl.delta(e)]) for dl in d.layers])
+
+    x = torch.randn(2, 900)
+    idx = torch.tensor([0, 3])
+    assert torch.allclose(d(x, idx), t(x, idx), atol=1e-6)
+
+
+@pytest.mark.parametrize("parts", [(True, False, False), (False, True, False),
+                                   (False, False, True), (True, True, False),
+                                   (True, False, True), (False, True, True)])
+def test_tabledelta_part_masking_changes_the_sound(parts):
+    torch.manual_seed(0)
+    m = _small_table_wavenet().eval()
+    with torch.no_grad():
+        m.embedding.weight.normal_(0.0, 0.05)
+    x, idx = torch.randn(1, 1200), torch.tensor([2])
+    full = m(x, idx).clone()
+    masked = m.set_delta_parts(**dict(zip(("kernel", "bias", "mixin"), parts)))(x, idx)
+    assert not torch.allclose(full, masked)
+    assert m.delta_parts == parts
+
+
+@pytest.mark.parametrize("parts", [(True, False, False), (False, True, False),
+                                   (False, False, True), (True, True, False),
+                                   (True, False, True), (False, True, True)])
+def test_tabledelta_part_masking_batches(parts):
+    # Every mask above runs at batch 1, which never exercises per_sample_conv1d's
+    # reshape by B: a masked-off bias residual must still be handed in [B,C]-shaped
+    # or the kernel branch dies at any real evaluation batch. A batch must also give
+    # each item exactly what that item gets alone.
+    torch.manual_seed(0)
+    m = _small_table_wavenet().eval()
+    with torch.no_grad():
+        m.embedding.weight.normal_(0.0, 0.05)
+    m.set_delta_parts(**dict(zip(("kernel", "bias", "mixin"), parts)))
+    x, idx = torch.randn(3, 900), torch.tensor([0, 3, 1])
+    batched = m(x, idx)
+    for i in range(len(idx)):
+        assert torch.allclose(batched[i], m(x[i:i + 1], idx[i:i + 1])[0], atol=1e-6)
+
+
+def test_tabledelta_all_parts_off_is_the_plain_a2_net():
+    # The mask must gate *only* the residual: with everything off the net has to be
+    # bit-identical to the same weights with an empty table, or a masked listening
+    # test is comparing against something that isn't the base amp.
+    torch.manual_seed(0)
+    m = _small_table_wavenet().eval()
+    with torch.no_grad():
+        m.embedding.weight.normal_(0.0, 0.05)
+    x, idx = torch.randn(1, 1000), torch.tensor([1])
+    off = m.set_delta_parts(kernel=False, bias=False, mixin=False)(x, idx)
+    with torch.no_grad():
+        m.embedding.weight.zero_()
+    assert torch.allclose(off, m.set_delta_parts()(x, idx), atol=1e-7)
+
+
+def test_tabledelta_masking_is_not_in_the_state_dict():
+    # One checkpoint, evaluated every way: the mask must never be persisted, or a
+    # reload would silently resurrect whatever mask was last set.
+    m = _small_table_wavenet()
+    keys = set(m.state_dict())
+    m.set_delta_parts(kernel=False, bias=True, mixin=False)
+    assert set(m.state_dict()) == keys
+    assert not any("delta_parts" in k for k in keys)
+    assert _small_table_wavenet().delta_parts == (True, True, True)   # default
+
+
+def test_tabledelta_refuses_enrollment():
+    """A per-device table has nothing an unseen amp can be positioned within. This
+    must raise rather than 'work': _swap_embedding's own assert would pass, and the
+    fit would report a plausible ESR for a table the network never reads."""
+    from openamp.emulate.enroll import require_enrollable
+
+    require_enrollable(EmulateConfig(arch="delta_wavenet"))       # enrollable
+    require_enrollable(EmulateConfig(arch="film_wavenet"))
+    with pytest.raises(RuntimeError, match="cannot be enrolled"):
+        require_enrollable(EmulateConfig(arch="tabledelta_wavenet"))
+
+
+def test_tabledelta_dispatch_summary_and_checkpoint_roundtrip(tmp_path):
+    from dataclasses import asdict
+
+    from openamp.emulate.evaluate import load_model
+    from openamp.emulate.models import arch_summary
+
+    assert arch_summary(EmulateConfig(arch="tabledelta_wavenet")
+                        )["blocks_x_layers"] == "a2-23L-table"
+    # A masked evaluation is a different measurement and must not share a row label.
+    masked = TableDeltaWaveNet(n_devices=2, channels=4, **SMALL_SCHEDULE)
+    masked.set_delta_parts(kernel=True, bias=False, mixin=False)
+    assert arch_summary(EmulateConfig(arch="tabledelta_wavenet"), masked
+                        )["blocks_x_layers"] == "a2-23L-table-kernel"
+
+    torch.manual_seed(0)
+    ecfg = EmulateConfig(arch="tabledelta_wavenet", wn_channels=4)
+    m = build_model(ecfg, 3).eval()
+    assert type(m) is TableDeltaWaveNet
+    run = tmp_path / "table"; run.mkdir()
+    torch.save({"model": m.state_dict(), "emulate_cfg": asdict(ecfg),
+                "device_ids": [1, 2, 3]}, run / "checkpoint.pt")
+    loaded, _ = load_model(run)
+    assert type(loaded) is TableDeltaWaveNet
+    x = torch.randn(1, 500)
+    assert torch.allclose(loaded(x, torch.tensor([1])), m(x, torch.tensor([1])))
+    # Incompatible with the generator archs in both directions.
+    with pytest.raises(RuntimeError, match="state_dict"):
+        DeltaWaveNet(n_devices=3, channels=4, embedding_dim=8).load_state_dict(
+            m.state_dict())
 
 
 def test_wavenet_activation_option_swaps_the_nonlinearity():
@@ -683,6 +873,57 @@ def test_warmup_zero_pads_at_file_start(tmp_path):
     assert np.allclose(a["input"][R:], a["target"], atol=1e-4)
 
 
+# --- Read retry: the NFS flake policy (same item twice, then redraw) ------------
+# Pinned because the semantics are a bug fix, not an accident: an earlier version
+# redrew on the *first* failure, which silently swapped items in the fixed-seed val
+# set. Any refactor of the retry loop has to keep all three properties below.
+def test_retry_repeats_same_item_before_redrawing(tmp_path, monkeypatch):
+    pytest.importorskip("soundfile")
+    cfg = load_config(data_dir=tmp_path)
+    R, clip = 8, 32
+    sig = np.linspace(-0.5, 0.5, clip * 10, dtype=np.float32)
+    _build_corpus(cfg, [("f0", "train", sig), ("f1", "train", sig)], devices=[0, 1, 2])
+    ds = _dataset(cfg, "train", R=R, clip=clip, pairs_per_epoch=8, seed=3)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+    seen: list[tuple[int, str]] = []
+    real = ds._read_pair
+
+    def failing(device_id, file, rng):
+        seen.append((device_id, file["file_id"]))
+        if len(seen) <= 2:                              # fail the first two attempts
+            raise OSError("simulated NFS flake")
+        return real(device_id, file, rng)
+
+    monkeypatch.setattr(ds, "_read_pair", failing)
+    item = ds.item_arrays(0)
+    assert item["input"].shape == (R + clip,)
+    # attempts 1 and 2 are the SAME (device, file); only the 3rd may be a redraw.
+    assert seen[0] == seen[1]
+    assert len(seen) == 3
+
+
+def test_retry_gives_up_after_four_consecutive_failures(tmp_path, monkeypatch):
+    pytest.importorskip("soundfile")
+    cfg = load_config(data_dir=tmp_path)
+    R, clip = 8, 32
+    sig = np.linspace(-0.5, 0.5, clip * 10, dtype=np.float32)
+    _build_corpus(cfg, [("f0", "train", sig)], devices=[0, 1])
+    ds = _dataset(cfg, "train", R=R, clip=clip, pairs_per_epoch=8, seed=3)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+    calls = []
+
+    def always_fails(device_id, file, rng):
+        calls.append(device_id)
+        raise OSError("store is down")
+
+    monkeypatch.setattr(ds, "_read_pair", always_fails)
+    with pytest.raises(RuntimeError, match="4 consecutive read failures"):
+        ds.item_arrays(0)
+    assert len(calls) == 4                              # an outage, not a flake
+
+
 # --- Per-device validation: one shared window grid, one ESR per amp -------------
 def _grid(cfg, *, R, clip, **kw):
     from openamp.emulate.dataset import DeviceGridDataset, build_device_index
@@ -824,7 +1065,7 @@ def test_enroll_end_to_end(tmp_path):
     metrics = enroll(cfg, run, pairs=16, epochs=6, lr=5e-2, device="cpu", seed=0,
                      test_pairs=8)
 
-    # optimizing the embedding must actually help vs the table-mean prior
+    # optimizing the embedding must actually help vs where the rows started
     assert metrics["n_enrolled"] == 2 and metrics["skipped"] == []
     assert metrics["best_val_esr_pooled"] < metrics["init_val_esr_pooled"]
 
@@ -837,9 +1078,11 @@ def test_enroll_end_to_end(tmp_path):
     ep = torch.load(run / "enroll" / "enrolled_embeddings.pt", weights_only=False)
     assert ep["embedding"].shape == (2, 8)
     assert ep["device_ids"] == [2, 3]
-    assert ep["base_run"] == "run" and ep["init"] == "table_mean"
+    assert ep["base_run"] == "run" and ep["init"] == "uniform"
+    # the uniform init starts the rows apart (the old table-mean init tied them)
     table_mean = before["embedding.weight"].mean(dim=0)
     assert not torch.allclose(ep["embedding"], table_mean.expand(2, 8))
+    assert not torch.allclose(ep["embedding"][0], ep["embedding"][1])
     assert set(ep["per_device"]) == {2, 3}
 
     # one CSV row per enrolled device, with finite metrics (test renders exist)
@@ -851,6 +1094,41 @@ def test_enroll_end_to_end(tmp_path):
         assert np.isfinite(float(r["val_esr"]))
         assert np.isfinite(float(r["test_esr"]))
         assert np.isfinite(float(r["baseline_test_esr"]))
+
+
+def test_swap_embedding_init_modes():
+    """New rows start at the trainer's own init scale by default, not the mean."""
+    from openamp.emulate.enroll import ENROLL_INIT_A, _swap_embedding
+
+    ecfg = EmulateConfig(blocks=1, layers_per_block=2, channels=4, embedding_dim=8,
+                         num_workers=0)
+    dev = torch.device("cpu")
+
+    torch.manual_seed(0)
+    m = build_model(ecfg, 4)
+    with torch.no_grad():                              # a table with a nonzero mean
+        m.embedding.weight.add_(torch.arange(1.0, 5.0)[:, None])
+    mean = m.embedding.weight.detach().mean(dim=0).clone()
+
+    torch.manual_seed(1)
+    rows = _swap_embedding(m, ecfg, 3, dev)            # default: uniform
+    assert rows.shape == (3, 8)
+    assert torch.equal(rows, m.embedding.weight.detach())
+    assert rows.abs().max() <= ENROLL_INIT_A           # inside U(-a, a)
+    assert not torch.allclose(rows[0], rows[1])        # rows start apart...
+    assert not torch.allclose(rows, mean.expand_as(rows))   # ...and not at the mean
+
+    m2 = build_model(ecfg, 4)                          # same seed -> same init
+    torch.manual_seed(1)
+    assert torch.equal(_swap_embedding(m2, ecfg, 3, dev), rows)
+
+    m3 = build_model(ecfg, 4)                          # opt back into the old prior
+    mean3 = m3.embedding.weight.detach().mean(dim=0).clone()
+    rows3 = _swap_embedding(m3, ecfg, 3, dev, init="table_mean")
+    assert torch.equal(rows3, mean3.expand(3, 8))
+
+    with pytest.raises(ValueError, match="init must be one of"):
+        _swap_embedding(build_model(ecfg, 4), ecfg, 3, dev, init="normal")
 
 
 def test_enrollment_csv_merges_by_device(tmp_path):

@@ -1,15 +1,16 @@
 """The one ``openamp`` command-line entry point.
 
-The whole pipeline is a flat list of verbs, in run order:
+- The whole pipeline is a flat list of verbs, in run order:
 
-  acquire :  auth · discover · select · download · validate · dedup · finalize · status
-  corpus  :  corpus · subset · render · verify
-  emulate :  emulate · emulate-compare · emulate-validate · emulate-demo · emulate-enroll
+    acquire :  auth · discover · select · download · validate · dedup · finalize · status
+    corpus  :  corpus · subset · render · verify
+    emulate :  emulate · emulate-compare · emulate-validate · emulate-demo · emulate-enroll
+    encoder :  encode · encode-eval
 
-Each command is thin: it loads the one :class:`~openamp.core.config.Config`, then calls
-into a stage module. Heavy imports (torch, NAM, soundfile) live inside the command
-bodies so ``openamp --help`` stays fast, and stage modules are imported with a
-``_mod`` suffix so they never shadow a verb of the same name.
+- Each command is thin: loads the one :class:`~openamp.core.config.Config`, then
+  calls into a stage module. Heavy imports (torch, NAM, soundfile) live inside
+  the command bodies so ``openamp --help`` stays fast, and stage modules import
+  with a ``_mod`` suffix so they never shadow a verb of the same name.
 """
 
 from __future__ import annotations
@@ -110,7 +111,7 @@ def cli(verbose: bool) -> None:
 
     Run order: auth discover select download validate dedup finalize · corpus
     subset render verify · emulate emulate-compare emulate-validate emulate-demo
-    emulate-enroll.
+    emulate-enroll · encode encode-eval.
     """
     _setup_logging(verbose)
 
@@ -408,7 +409,11 @@ def emulate_demo(run, n_devices, seconds, device) -> None:
 @click.option("--lr", default=1e-2, show_default=True)
 @click.option("--device", default=None, help="cuda/cpu (default: auto).")
 @click.option("--seed", type=int, default=None, help="Override the config seed.")
-def emulate_enroll(run, devices, pairs, epochs, lr, device, seed) -> None:
+@click.option("--init", type=click.Choice(["uniform", "table_mean"]),
+              default="uniform", show_default=True,
+              help="Where new rows start: the trainer's own init scale, or the "
+                   "trained table's mean.")
+def emulate_enroll(run, devices, pairs, epochs, lr, device, seed, init) -> None:
     """Enroll unseen devices: freeze a trained run, fit new embeddings only."""
     from openamp.emulate import enroll as emu_enroll
 
@@ -417,7 +422,7 @@ def emulate_enroll(run, devices, pairs, epochs, lr, device, seed) -> None:
         raise click.ClickException(f"No checkpoint.pt under {run}.")
     ids = [int(x) for x in devices.split(",") if x.strip()] if devices else None
     m = emu_enroll.enroll(cfg, run, device_ids=ids, pairs=pairs, epochs=epochs, lr=lr,
-                          device=device or _default_device(), seed=seed)
+                          device=device or _default_device(), seed=seed, init=init)
     click.echo(f"  enrolled {m['n_enrolled']} devices: test_ESR={m['test_esr_mean']} "
                f"(baseline {m['baseline_test_esr_mean']}, "
                f"trained {m['trained_test_esr_mean']})")
@@ -515,6 +520,65 @@ def emulate_export_profiles(run, mean, pairs, out) -> None:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(text, encoding="utf-8")
     click.echo(text)
+
+
+# =============================== Tone encoder ==================================
+@cli.command()
+@click.option("--config", "config_path", type=Path, default=None,
+              help="configs/joint/<name>.yaml; run name is the file stem.")
+@click.option("--device", default=_default_device)
+@click.option("--epochs", type=int, default=None, help="Override max epochs.")
+@click.option("--resume", is_flag=True, help="Continue from the run's last.pt; the "
+                                             "config is re-read and its training knobs take "
+                                             "effect — structural knobs must not change.")
+@click.option("--overfit", is_flag=True,
+              help="Sanity #1: drive one batch's ESR to ~0 through the encoder.")
+@click.option("--overfit-batch", type=int, default=None,
+              help="Batch size for --overfit (default: emulate.batch_size).")
+@click.option("--limit-devices", type=int, default=None,
+              help="Mini-run on the first N training devices (sanity #2).")
+def joint(config_path, device, epochs, resume, overfit, overfit_batch,
+          limit_devices) -> None:
+    """Train the reference encoder and the FiLM generator jointly, from scratch."""
+    from openamp.joint_model import train as joint_train
+
+    cfg = _config(config_path)
+    name = _emulate_name(config_path)
+    if overfit:
+        joint_train.overfit_one_batch(cfg, name=name, device=device,
+                                      limit_devices=limit_devices or 8,
+                                      batch_size=overfit_batch)
+        return
+    joint_train.train(cfg, name=name, device=device, epochs=epochs, resume=resume,
+                      limit_devices=limit_devices)
+
+
+@cli.command("joint-eval")
+@click.argument("run", type=Path)
+@click.option("--device", default=_default_device)
+@click.option("--pairs", type=int, default=None, help="Val pairs per check (default 2000).")
+@click.option("--windows", type=int, default=None,
+              help="Reference segments per capture for the geometry pass (default 8).")
+def joint_eval(run, device, pairs, windows) -> None:
+    """Collapse and leakage diagnostics: does the embedding actually mean anything?"""
+    from openamp.joint_model import evaluate as joint_eval_mod
+
+    cfg = _config()
+    for cand in (Path(run), cfg.joint_run_dir(str(run))):
+        if (cand / "checkpoint.pt").is_file():
+            run_dir = cand
+            break
+    else:
+        raise click.ClickException(
+            f"No checkpoint.pt under {Path(run)} or {cfg.joint_run_dir(str(run))}.")
+    kw = {}
+    if pairs is not None:
+        kw["pairs"] = int(pairs)
+    if windows is not None:
+        kw["n_windows"] = int(windows)
+    r = joint_eval_mod.diagnose(cfg, run_dir, device=device, **kw)
+    click.echo(f"  wrote {run_dir / 'diagnostics.json'}")
+    click.echo(f"  {r['verdict']}")
 
 
 def main() -> None:

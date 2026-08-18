@@ -11,7 +11,8 @@ torch = pytest.importorskip("torch")
 
 from openamp.emulate.export import (_blob, _unblob, folded_model,
                                     forward_with_embedding)
-from openamp.emulate.wavenet import DeltaWaveNet, FiLMWaveNet, MLPFiLMWaveNet
+from openamp.emulate.wavenet import (DeltaWaveNet, FiLMWaveNet, MLPFiLMWaveNet,
+                                     TableDeltaWaveNet)
 
 # Small-but-real schedule: mixed kernels like A2, a few hundred samples of RF.
 KW = dict(n_devices=4, channels=4, embedding_dim=8,
@@ -20,13 +21,21 @@ KW = dict(n_devices=4, channels=4, embedding_dim=8,
 # Folding must be exact for every conditioning hook: 0 = film_wavenet's single
 # Linear, > 0 = mlpfilm_wavenet's per-layer MLP (the fold math is identical for
 # those two — conditioning is per-channel affine either way), "delta" =
-# delta_wavenet's weight residual, which folds by addition instead. Every case is
-# parametrized over all three, since all three must leave a stock A2 capture.
-COND_HIDDEN = [0, 6, "delta"]
+# delta_wavenet's low-rank weight residual and "table" = tabledelta_wavenet's free
+# per-device one, which both fold by addition instead. Every case is parametrized
+# over all four, since all four must leave a stock A2 capture.
+COND_HIDDEN = [0, 6, "delta", "table"]
 
 
 def _model(seed=0, cond_hidden=0, **kw):
     torch.manual_seed(seed)
+    if cond_hidden == "table":
+        # embedding_dim is derived from the schedule for this arch, not passed.
+        m = TableDeltaWaveNet(**{k: v for k, v in KW.items() if k != "embedding_dim"},
+                              **kw).eval()
+        # Zero is the training init; a zero delta would make the fold test vacuous.
+        torch.nn.init.normal_(m.embedding.weight, std=0.2)
+        return m
     if cond_hidden == "delta":
         m = DeltaWaveNet(**KW, delta_rank=3, **kw).eval()
         # Un-neutralize the near-zero training init: a zero delta would make the
@@ -115,6 +124,56 @@ def test_folded_model_ignores_device_idx(cond_hidden):
     x = torch.randn(1, 600)
     f = folded_model(m, m.embedding.weight[2])
     assert torch.equal(f(x, torch.tensor([0])), f(x, torch.tensor([3])))
+
+
+@pytest.mark.parametrize("parts", [(True, False, False), (False, True, True),
+                                   (False, False, False)])
+@torch.no_grad()
+def test_fold_honours_the_tabledelta_part_mask(parts):
+    """A masked capture must play what the masked model plays. If the fold ignored
+    the mask, a listening test done with kernel-only conditioning would export a
+    capture with the full residual baked in — silently a different amp."""
+    m = _model(7, cond_hidden="table")
+    m.set_delta_parts(**dict(zip(("kernel", "bias", "mixin"), parts)))
+    x = torch.randn(1, 1200)
+    for row in range(KW["n_devices"]):
+        e = m.embedding.weight[row]
+        want = forward_with_embedding(m, x, e)
+        got = folded_model(m, e)(x, torch.tensor([0]))
+        assert torch.allclose(want, got, atol=1e-5), \
+            f"parts={parts} row={row}: {(want - got).abs().max().item():.2e}"
+
+
+def test_bundle_tabledelta_ships_no_generator(tmp_path):
+    """A profile row *is* the delta for this arch, so the bundle carries only the
+    slice widths — and must omit every generator key, so a reader that predates it
+    dies on a missing key rather than folding garbage."""
+    import json
+
+    from openamp.core.config import EmulateConfig
+    from openamp.emulate import export as ex
+    from openamp.emulate.models import build_model
+
+    ecfg = EmulateConfig(arch="tabledelta_wavenet", wn_channels=4)
+    mm = build_model(ecfg, 2).eval()
+    run = tmp_path / "table"
+    run.mkdir()
+    torch.save({"model": mm.state_dict(), "emulate_cfg": ecfg.__dict__.copy(),
+                "device_ids": [1, 2], "id_to_idx": {1: 0, 2: 1},
+                "sample_rate": 48000, "name": "table"}, run / "checkpoint.pt")
+    ex.export_bundle(run, run / "b.json")
+    b = json.loads((run / "b.json").read_text(encoding="utf-8"))
+
+    assert b["aaom_bundle"] == 1 and b["arch"]["type"] == "tabledelta_wavenet_a2"
+    assert b["arch"]["delta_parts"] == ["kernel", "bias", "mixin"]
+    assert "delta_rank" not in b["arch"] and "cond_hidden" not in b["arch"]
+    l0 = b["weights"]["layers"][0]
+    assert not {"film_w", "film_b", "film_layers", "delta_coeff_w", "delta_basis"} & set(l0)
+    C, K = mm.channels, mm.kernel_sizes[0]
+    assert l0["delta_split"] == [C * C * K, C, C]
+    # The split widths must actually tile a profile row, or the plugin can't slice it.
+    assert sum(sum(lay["delta_split"]) for lay in b["weights"]["layers"]) == \
+        len(b["profiles"][0]["embedding"]) == mm.embedding_dim
 
 
 def test_blob_roundtrip_exact():

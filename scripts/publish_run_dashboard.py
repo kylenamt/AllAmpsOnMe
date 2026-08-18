@@ -246,7 +246,22 @@ def nice_ticks(lo: float, hi: float, count: int = 4) -> list[float]:
 
 
 def tick_label(v: float) -> str:
-    return f"{v:.3f}".rstrip("0").rstrip(".") if abs(v) < 1 else f"{v:g}"
+    return f"{v:.4g}" if abs(v) < 1 else f"{v:g}"
+
+
+def log_ticks(lo: float, hi: float) -> list[float]:
+    """Tick values at 1/2/5 x a power of ten, spanning [lo, hi] on a log axis."""
+    if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo or lo <= 0:
+        return [lo]
+    ticks = []
+    mag = 10 ** math.floor(math.log10(lo))
+    while mag <= hi:
+        for m in (1, 2, 5):
+            t = m * mag
+            if lo <= t <= hi:
+                ticks.append(t)
+        mag *= 10
+    return ticks or [lo]
 
 
 # --- The chart -----------------------------------------------------------------
@@ -283,16 +298,22 @@ def render_chart(run: dict, uid: int) -> str:
     top = min(hi_v, bound) if bound > lo_v else hi_v
     n_clipped = sum(1 for v in ys if v > top)
 
-    y0, y1 = lo_v, top
-    pad = (y1 - y0) * 0.08 or (abs(y1) * 0.1 or 0.01)
-    y0, y1 = y0 - pad, y1 + pad
+    # Log axis: ESR is non-negative and often spans decades within one run, so the
+    # floor is clamped just above zero rather than sitting at it.
+    floor = max(lo_v, 1e-6)
+    ceil_ = max(top, floor * 1.0001)
+    log_lo, log_hi = math.log10(floor), math.log10(ceil_)
+    pad = (log_hi - log_lo) * 0.08 or 0.05
+    log_lo, log_hi = log_lo - pad, log_hi + pad
+    v_top = 10 ** log_hi
     span_x = (x1 - x0) or 1
 
     def px(e: float) -> float:
         return ML + (e - x0) / span_x * (CW - ML - MR)
 
     def py(v: float) -> float:
-        return MT + (y1 - v) / (y1 - y0) * (CH - MT - MB)
+        v = max(v, 10 ** log_lo)
+        return MT + (log_hi - math.log10(v)) / (log_hi - log_lo) * (CH - MT - MB)
 
     plot_l, plot_r, plot_t, plot_b = ML, CW - MR, MT, CH - MB
     out = [f'<svg class="chart" viewBox="0 0 {CW} {CH}" role="img" '
@@ -301,7 +322,7 @@ def render_chart(run: dict, uid: int) -> str:
            f'width="{plot_r - plot_l}" height="{plot_b - plot_t + 2}"/></clipPath>']
 
     # Gridlines: solid hairlines one step off the surface, never dashed.
-    for t in nice_ticks(y0, y1):
+    for t in log_ticks(10 ** log_lo, 10 ** log_hi):
         y = py(t)
         if not plot_t - 1 <= y <= plot_b + 1:
             continue
@@ -325,7 +346,7 @@ def render_chart(run: dict, uid: int) -> str:
         out.append(f'<path class="line" d="{d}" stroke="{colour}" clip-path="url(#plot{uid})"/>')
         ex, ey = seq[-1]
         last = vals[-1][1]
-        if last <= y1:                              # a run ending on a spike has no
+        if last <= v_top:                            # a run ending on a spike has no
             # 2px surface ring keeps the end dot legible where the two lines cross.
             out.append(f'<circle class="dot" cx="{ex:.1f}" cy="{ey:.1f}" r="4" fill="{colour}"/>')
             ends.append((key, ex, ey, last))        # in-frame endpoint to label
@@ -752,12 +773,15 @@ def publish(page: str, out_dir: Path) -> Path:
 
     The rename means a reader never fetches a half-written page, and the 0o644 mode
     matters: the web server reads as `other`, and the default umask on a fresh temp
-    file can leave it unreadable.
+    file can leave it unreadable. The tmp name carries the PID so a second publisher
+    process -- e.g. an updated script started on another machine against the same
+    shared-home --out dir before this one is retired -- never collides with it;
+    each rename is independently atomic and the last one to land simply wins.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(out_dir, 0o755)                        # the server traverses as `other`
     target = out_dir / "index.html"
-    tmp = out_dir / ".index.html.tmp"
+    tmp = out_dir / f".index.html.tmp.{os.getpid()}"
     tmp.write_text(page, encoding="utf-8")
     os.chmod(tmp, 0o644)
     os.replace(tmp, target)

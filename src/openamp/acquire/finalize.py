@@ -32,11 +32,10 @@ def _s(value) -> str:
 def _is_complete(row: pd.Series) -> bool:
     """Acceptance: non-empty creator and tone_url (attribution).
 
-    License is recorded verbatim but NOT required for acceptance: the TONE3000
+    License is recorded verbatim but NOT required for acceptance — TONE3000's
     API returns an empty ``license`` for every candidate, and the pipeline only
-    records metadata (it never redistributes the capture files). Requiring a
-    license here would reject the entire corpus; see the missing-license note in
-    docs/history/design-01-acquisition.md.
+    records metadata (never redistributes capture files). Requiring one here
+    would reject the entire corpus; see docs/history/design-01-acquisition.md.
     """
     def ok(v) -> bool:
         s = _s(v).lower()

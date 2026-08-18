@@ -1,21 +1,21 @@
 """Size-comparison harness + listening demos for the emulation runs (spec §3, §4).
 
-The comparison CSV **is** the architecture-exploration deliverable: point
-:func:`compare` at any set of ``results/emulate/<name>/`` run dirs and it
-evaluates each checkpoint on the held-out **test** split and appends one row per
-run to ``results/emulate/comparison.csv``:
+- The comparison CSV **is** the architecture-exploration deliverable: point
+  :func:`compare` at any set of ``results/emulate/<name>/`` run dirs and it
+  evaluates each checkpoint on the held-out **test** split and appends one row
+  per run to ``results/emulate/comparison.csv``:
 
-    run_name, arch, params, receptive_field_ms, embedding_dim, channels,
-    blocks_x_layers, test_ESR_mean, test_ESR_median, test_MRSL_mean, train_hours
+      run_name, arch, params, receptive_field_ms, embedding_dim, channels,
+      blocks_x_layers, test_ESR_mean, test_ESR_median, test_MRSL_mean, train_hours
 
-Arch/timing columns are read from the run's ``metrics.json`` (written by
-training); only the test metrics are recomputed here.
-
-:func:`validate_per_device` breaks one run's test ESR back out **per amp** into
-``<run>/per_device_esr.csv`` — which devices the shared model learned well, and
-whether the headline mean is skewed by a few outliers. :func:`export_demos`
-writes clean/target/prediction WAVs for a handful of devices — five minutes of
-listening catches failure modes ESR misses (spec §4, mandatory before "good").
+  Arch/timing columns are read from the run's ``metrics.json`` (written by
+  training); only the test metrics are recomputed here.
+- :func:`validate_per_device` breaks one run's test ESR back out **per amp**
+  into ``<run>/per_device_esr.csv`` — which devices the shared model learned
+  well, and whether the headline mean is skewed by a few outliers.
+- :func:`export_demos` writes clean/target/prediction WAVs for a handful of
+  devices — five minutes of listening catches failure modes ESR misses (spec
+  §4, mandatory before "good").
 """
 
 from __future__ import annotations
@@ -106,10 +106,11 @@ def evaluate_run(cfg: Config, run_dir: Path, *, device: str = "cpu",
     meta = _run_metrics(run_dir)
     return {
         "run_name": ck.get("name", run_dir.name),
-        **arch_summary(ecfg),
+        **arch_summary(ecfg, model),
         "params": int(meta.get("params", ck.get("params", 0))),
         "receptive_field_ms": round(1000.0 * R / cfg.sample_rate, 3),
-        "embedding_dim": ecfg.embedding_dim,
+        # model, not ecfg: tabledelta_wavenet derives its width from the schedule.
+        "embedding_dim": getattr(model, "embedding_dim", ecfg.embedding_dim),
         "test_ESR_mean": round(float(esrs.mean()), 6),
         "test_ESR_median": round(float(esrs.median()), 6),
         "test_MRSL_mean": round(float(np.mean(mrsls)), 6),
@@ -168,9 +169,9 @@ def _text(value) -> str:
 def _device_metadata(cfg: Config) -> dict[int, dict]:
     """``{device_id: {name, make, model, gain_bucket, architecture}}`` (best-effort).
 
-    The working manifest is preferred — it carries the human title — with
-    ``devices_final`` as the fallback for a workspace trimmed down to renders.
-    Absent metadata just leaves the columns empty; it must not fail a validation.
+    - The working manifest is preferred (carries the human title), with
+      ``devices_final`` as the fallback for a workspace trimmed to renders.
+    - Absent metadata just leaves the columns empty; must not fail a validation.
     """
     from openamp.core import manifest as manifests
     from openamp.emulate.dataset import device_names
@@ -201,16 +202,15 @@ def validate_per_device(cfg: Config, run_dir: Path, *, device: str = "cpu",
                         ) -> list[dict]:
     """Per-amp test ESR for one run -> ``<run>/per_device_esr.csv`` (one row per device).
 
-    Where :func:`evaluate_run` collapses a run to a single test number, this keeps
-    the per-device breakdown: which amps the shared model actually learned, and
-    whether the headline mean is being dragged by a handful of outliers. Every
-    device is scored on the *same* window grid (:class:`DeviceGridDataset`), so
-    the rows are comparable to each other.
-
-    ``test_ESR`` is pooled per device — one ratio of summed energies over that
-    device's windows, the same definition training optimizes
-    (:func:`openamp.emulate.train.esr`) — so a quiet window cannot dominate a
-    device's score. Rows come back sorted best-ESR first.
+    - Where :func:`evaluate_run` collapses a run to a single test number, this
+      keeps the per-device breakdown: which amps the shared model actually
+      learned, whether the headline mean is dragged by a handful of outliers.
+    - Every device scored on the *same* window grid (:class:`DeviceGridDataset`),
+      so rows are comparable to each other.
+    - ``test_ESR`` is pooled per device — one ratio of summed energies over that
+      device's windows, the same definition training optimizes
+      (:func:`openamp.emulate.train.esr`) — so a quiet window can't dominate a
+      device's score. Rows come back sorted best-ESR first.
     """
     import auraloss
     from collections import defaultdict

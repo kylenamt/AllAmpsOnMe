@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from openamp.core.config import Config, ConfigError, EmulateConfig, load_config
+from openamp.core.config import (Config, ConfigError, EmulateConfig,
+                                 load_config)
 
 
 # --- Defaults & derived paths --------------------------------------------------
@@ -65,6 +66,7 @@ def test_emulate_defaults_and_overrides(tmp_path):
     cfg = load_config(p, data_dir=tmp_path)
     assert cfg.emulate.channels == 32 and cfg.emulate.embedding_dim == 256
     assert cfg.emulate.batch_size == 8
+
 
 
 # --- Validation & rejection ----------------------------------------------------

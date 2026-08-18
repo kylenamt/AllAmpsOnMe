@@ -1,8 +1,8 @@
 """Global constants for the pipeline (spec §2, §3).
 
-Fixed audio facts and vocabulary shared across corpus prep, rendering,
-verification, and the dataset classes. Kept in one place so the clip grid, the
-render slicing, and the datasets all agree by construction.
+Fixed audio facts + vocabulary shared across corpus prep, rendering,
+verification, and the dataset classes — kept in one place so the clip grid,
+render slicing, and datasets all agree by construction.
 """
 
 from __future__ import annotations
@@ -38,10 +38,9 @@ SPLIT_TEST = "test"
 SPLITS = (SPLIT_TRAIN, SPLIT_VAL, SPLIT_TEST)
 
 # --- Gain-style buckets (spec §5.3.3) ------------------------------------------
-# Pipeline-wide vocabulary: the ``gain_bucket`` value on every capture/device.
-# Shared by acquisition selection and the render subset, so it lives here rather
-# than in the acquisition-only catalog. (The keyword heuristic that assigns these
-# stays in ``openamp.acquire.catalog``.)
+# Pipeline-wide vocabulary for ``gain_bucket``. Lives here (not in the
+# acquisition-only catalog) since selection and the render subset both use it;
+# the keyword heuristic that assigns it stays in ``openamp.acquire.catalog``.
 GAIN_CLEAN = "clean"
 GAIN_CRUNCH = "crunch"          # crunch / mid-gain
 GAIN_HIGH = "high_gain"

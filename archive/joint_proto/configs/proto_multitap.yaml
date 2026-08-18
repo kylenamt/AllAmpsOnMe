@@ -1,0 +1,135 @@
+# proto.yaml with the multitap pooling head. THE ONLY INTENDED VARIABLE IS THE
+# HEAD (`joint.enc_head` and the five knobs that only exist under it). Everything
+# else — generator, corpus, reference, lrs, schedule — is byte-identical to
+# configs/joint/proto.yaml, so this is a clean A/B against that run.
+#
+# Run with:
+#   OPENAMP_DATA_DIR=data_mixed openamp joint --config configs/joint/proto_multitap.yaml
+#
+# WHY
+# proto's pooled vector is 2 * enc_channels = 32 numbers. Measured on its own
+# results/joint/proto/capture_embeddings.npz, the held-out capture embeddings span
+# 8.55 effective dimensions (participation ratio), while the lookup table that
+# reaches val_esr 0.052 on this same corpus and these same 404 devices
+# (results/emulate/nam_a2_tanh_ch16_512) spans 51.8. Two readings of that, both
+# true: 32 is a real ceiling below what the task needs, AND the encoder was not
+# filling even the 32 it had. Cross-amp cosine was 0.973 (a narrow cone) against
+# the table's 0.036 (near-orthogonal).
+#
+# Reference *length* is not the constraint and this config does not change it:
+# two 2 s segments of the same amp from different files already agree at cosine
+# 0.9985, and a single 2 s segment picks the right amp out of 46 unseen ones
+# 97.8% of the time (chance 2.2%). The identity estimate has converged; what
+# fails is how much of it survives pooling.
+#
+# THE HEAD
+# Three levers, each independent of backbone width:
+#   taps [6, 13, 22]  — the trunk after each of the A2 schedule's three dilation
+#                       runs. Early taps see ~ms structure, the last sees the full
+#                       132 ms where sag and compression time constants live.
+#                       Concat width = 3 * enc_channels = 48. All taps are one
+#                       length and one width here (every layer same-pads and holds
+#                       enc_channels), so no trimming is involved.
+#   expand_dim 256    — 1x1 conv to E, so pooling width stops tracking enc_channels.
+#   n_heads 2         — K attention heads; the same channel can be read under
+#                       several weightings instead of having to pick one.
+# pooled_dim = K * 2 * E = 1024, versus proto's 32. De stays 256, so the
+# projection is now the deliberate bottleneck and pooling is not throttling —
+# the ratio to watch is pooled_dim / embedding_dim = 4x.
+#
+# MEMORY
+# The attention tensor is (B, K*E, T) and a 2 s reference is 96 000 frames, so the
+# unstrided head would want tens of GB on an 11.5 GB card. tap_stride 8 average-
+# pools to 12 000 frames (6 kHz) before the expansion, which is where the whole
+# cost lives. Tone does not need sample-rate time resolution; average-pooling
+# rather than plain striding is what keeps that true (striding aliases).
+# Budget: B * K * E * T' * 4 bytes, plus the (B, 3E, T') attention context.
+#
+# A per-run file REPLACES configs/openamp.yaml's sections wholesale — anything
+# omitted silently falls back to the dataclass defaults in core/config.py, so
+# these are full copies, never deltas.
+# Keep the decimal point in `4.0e-3`: PyYAML resolves a bare `4e-3` as a *string*.
+
+emulate:
+  # --- Generator: identical to nam_a2_tanh_ch16_512 except the embedding width -
+  arch: film_wavenet
+  wn_channels: 16
+  wn_activation: tanh      # "leakyrelu" (the capture default) | "tanh"
+  embedding_dim: 256       # width of e; the head projects to exactly this
+  single_device: -1        # -1 = one-to-many over all render-ok devices
+
+  # --- Training ---------------------------------------------------------------
+  holdout_frac: 0.1        # 46 unseen devices; the zero-shot number is on these
+  clip_seconds: 2.0        # generator window A
+  batch_size: 16
+  pairs_per_epoch: 25000
+  epochs: 120
+  lr: 4.0e-3               # generator lr; the encoder's is joint.enc_lr
+  weight_decay: 3.17e-7
+  plateau_patience: 5
+  plateau_factor: 0.5
+  early_stop_patience: 15
+  stft_weight: 0.05        # NAM's 5e-4, rescaled to this ESR term
+  preemph: 0.85            # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
+  num_workers: 8           # 4 FLAC seek-reads per item (window A + reference B)
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50
+
+joint:
+  # --- Reference segment (window B) --------------------------------------------
+  ref_seconds: 2.0
+  # THE mechanism: window B comes from a different corpus file than window A, so
+  # the encoder cannot pass content forward — only what is shared across two
+  # different recordings of the same amp survives, and that is the amp. Free here:
+  # data_mixed has 71 train / 10 val files. The dry side is shared across every
+  # device anyway, so a reference is only informative through its wet channel.
+  ref_different_file: true
+  ref_min_gap_seconds: 1.0   # same-file fallback only; unused on this corpus
+  sources: []                # [] = egdb + sweep, both content types
+
+  # --- Encoder backbone (unchanged from proto) ----------------------------------
+  enc_channels: 16         # 30.2 smp/s at 7.0 GB; the head no longer depends on it
+  enc_activation: tanh     # the trunk's activation; the head is GELU throughout
+  enc_attn_hidden: 64
+  enc_proj_hidden: 0       # 0 = derive as pooled_dim // 4 = 256
+  # ON: nothing else bounds ||e||, and the reconstruction gradient will happily
+  # inflate it — growing ||e|| is a cheap way to grow FiLM gain early, and it ends
+  # by saturating the generator's tanh into an amp-independent solution. Measured
+  # on a fixed batch of 8 devices, 900 steps (final ESR / shuffled ratio / ||e||):
+  #     normalize  enc_lr    ESR     shuffled   ||e||   spread
+  #     true       4.0e-3    0.0116     38.1x    1.00   0.054
+  #     false      4.0e-3    0.6964      1.0x  123.01   0.0000  <- collapsed
+  # A shuffled ratio of 1.0 means true and wrong embeddings render identically.
+  enc_normalize: true
+  grad_checkpoint_encoder: false   # true trades ~35% speed for ~2.2 GB
+
+  # --- Pooling head: THE VARIABLE -----------------------------------------------
+  enc_head: multitap       # "stats" = proto's 2*enc_channels readout
+  enc_taps: [6, 13, 22]    # ends of the three A2 dilation runs
+  enc_tap_stride: 8        # 96 000 -> 12 000 frames before the expansion
+  enc_expand_dim: 256      # E
+  enc_n_heads: 2           # K  ->  pooled_dim = 2 * 2 * 256 = 1024
+  # BatchNorm, not GroupNorm, and this is load bearing rather than conventional:
+  # the head's entire output is per-sample statistics of h, so the normalization in
+  # front of it must not itself be per-sample. BatchNorm subtracts a dataset-level
+  # mean, which carries no per-amp information, so every per-amp deviation survives
+  # into the pool — the same reason x-vector and ECAPA-TDNN put BatchNorm exactly
+  # here. GroupNorm subtracts a per-sample mean over time, i.e. it deletes the
+  # statistic the pool is about to measure; it is available ("group") because it is
+  # batch-independent, but it is not the safe default it looks like.
+  enc_expand_norm: batch
+  enc_norm_groups: 32      # "group" only; unused at enc_expand_norm: batch
+
+  # --- Optimization -------------------------------------------------------------
+  # NOT the generator's 4e-3. This is the knob guidelines §9 warns about ("encoder/
+  # generator LR imbalance -> dead encoder"), and it is the difference between a
+  # model and nothing. Measured over 32 devices on real (varying) references, 600
+  # steps at gen_lr 4e-3 — train ESR / embedding spread / shuffled ratio:
+  #     enc_lr 4.0e-3   0.976   0.0000    1.00x   <- collapsed to silence
+  #     enc_lr 5.0e-4   0.285   0.0396    7.11x   <- this config
+  # Carried over from proto unchanged so the head is the only variable. It was
+  # tuned against the 32-d head, so if the encoder now collapses or stalls this is
+  # the first knob to re-measure — a 1024-d pool is a differently-shaped optimand.
+  enc_lr: 5.0e-4
