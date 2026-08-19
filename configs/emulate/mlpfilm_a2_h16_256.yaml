@@ -1,21 +1,15 @@
-# mlpfilm_a2_256 at cond_hidden 16 — the PARAMETER-MATCHED control.
-# Run name is the file stem ("mlpfilm_a2_h16_256") -> results/emulate/mlpfilm_a2_h16_256/.
+# mlpfilm_a2_256 at cond_hidden 16 -- the parameter-matched control (4,384
+# params/layer vs film_wavenet's 4,112). Run name = file stem.
 #
 #   openamp emulate --config configs/emulate/mlpfilm_a2_h16_256.yaml --overfit           # sanity #1
 #   openamp emulate --config configs/emulate/mlpfilm_a2_h16_256.yaml --limit-devices 10  # mini-run
 #   openamp emulate --config configs/emulate/mlpfilm_a2_h16_256.yaml                     # full run
 #
-# Why this run exists: at embedding_dim 256 / wn_channels 8, a Linear(256, 16)
-# FiLM generator is 4,112 params per layer and Linear(256,16)->act->Linear(16,16)
-# is 4,384 — a 1.07x difference. So mlpfilm_a2_h16_256 vs nam_a2_256 isolates
-# *nonlinearity* from *capacity*, which mlpfilm_a2_256 (cond_hidden 32, ~2x) does
-# not. Run this one first; it is the honest read on whether the idea works.
+# Caveat: with leakyrelu, ~half of a 16-unit hidden layer sits on the 0.01
+# slope, so effective width is ~8. A null result here is evidence against
+# nonlinearity at this width, not in general.
 #
-# Caveat when reading the result: with leakyrelu, ~half of a 16-unit hidden layer
-# sits on the 0.01 slope, so effective width is ~8 = 2 * wn_channels. A null
-# result here is evidence against nonlinearity *at this width*, not in general.
-#
-# FULL copy of nam_a2.yaml semantics, not a delta — see mlpfilm_a2_256.yaml.
+# Full copy of nam_a2.yaml's numbers -- see mlpfilm_a2_256.yaml.
 
 emulate:
   # --- Model -------------------------------------------------------------------
@@ -32,16 +26,12 @@ emulate:
   batch_size: 32
   pairs_per_epoch: 50000
   epochs: 100              # NAM trainer.max_epochs; early-stop still ends it sooner
-  # NAM optimizer block, verbatim. Keep the decimal point: PyYAML resolves bare
-  # `4e-3` as a *string*, which reaches Adam untyped and dies at construction.
-  lr: 4.0e-3
+  lr: 4.0e-3                # keep the decimal point -- PyYAML reads bare 4e-3 as a string
   weight_decay: 3.17e-7
   plateau_patience: 3
   plateau_factor: 0.5
   early_stop_patience: 8
-  # NAM's 5e-4 MRSTFT weight rescaled from its MSE term to this trainer's ESR term
-  # (ESR = MSE / mean(t^2); corpus renders sit at median mean(t^2) 0.0096).
-  stft_weight: 0.05
+  stft_weight: 0.05         # NAM's MRSTFT weight, rescaled from MSE to this trainer's ESR term
   preemph: 0.85            # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
   num_workers: 6
   amp: true

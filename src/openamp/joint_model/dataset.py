@@ -11,11 +11,10 @@ One item carries both halves of the joint model's input:
 
 **The disjointness is the whole mechanism, not a detail.** If B overlapped A the
 encoder could pass the answer forward and the embedding would carry content
-instead of tone. Drawing B from a different ``file_id`` is a much harder barrier
-than a gap within one file — different music, different notes, minutes apart in
-the source material — and on ``data_mixed`` (71 train files) it is free. The
-same-file path with an enforced gap exists only for single-file corpora
-(``sources: [sweep]``), and it is strictly the weaker guarantee.
+instead of tone. Drawing B from a different ``file_id`` is a much harder
+barrier than a gap within one file. The same-file path with an enforced gap
+exists only for single-file corpora (``sources: [sweep]``) and is strictly
+the weaker guarantee.
 
 Note that the dry side is shared across every device in the corpus, so a
 reference is only informative through its wet channel — the encoder cannot

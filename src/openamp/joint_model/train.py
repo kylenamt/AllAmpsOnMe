@@ -1,26 +1,21 @@
 """Joint training: encoder and FiLM generator, end to end, from scratch.
 
-Forked from :mod:`openamp.emulate.train` and keeps its contracts — same
-:class:`~openamp.emulate.train.EmulationLoss` (pre-emphasized ESR + MRSTFT), same
-Adam + reduce-on-plateau, same NaN guard, same run-directory layout — so a joint
-run's ``val_esr`` is the same number the table-conditioned runs report and the two
-are directly comparable.
+Forked from openamp.emulate.train and keeps its contracts (same
+EmulationLoss, Adam + reduce-on-plateau, NaN guard, run-directory layout) so a
+joint run's val_esr is directly comparable to the table-conditioned runs.
 
-What is different, and why:
+What's different:
 
-- **The embedding comes from the encoder**, so the generator is driven through
-  ``forward_emb``. Its own ``nn.Embedding`` table is frozen and unused; nothing
-  should train a lookup table alongside the thing meant to replace it.
-- **Two parameter groups.** The encoder gets its own learning rate
-  (``joint.enc_lr``). Guidelines §9 lists LR imbalance as a failure mode, and a
-  dead encoder is invisible in ESR alone.
-- **A collapse tripwire runs every epoch.** ``val_esr_shuffled`` (embeddings
-  permuted within the batch) and ``emb_spread`` (how much ``e`` actually varies
-  across amps) are logged per epoch, not just at the end. With no contrastive
-  term the only pressure on ``e`` is reconstruction, so the cheap failure is an
-  encoder that emits a near-constant vector while ESR still looks respectable —
-  the model having quietly learned one average amp. **A good val_esr means
-  nothing unless the shuffled number is much worse and emb_spread is not ~0.**
+- The embedding comes from the encoder (forward_emb); the generator's own
+  nn.Embedding table is frozen and unused.
+- Two parameter groups: the encoder gets its own learning rate (joint.enc_lr)
+  since LR imbalance is a known failure mode and a dead encoder is invisible
+  in ESR alone.
+- A collapse tripwire runs every epoch: val_esr_shuffled (embeddings permuted
+  within the batch) and emb_spread (how much e varies across amps). With no
+  contrastive term, the cheap failure is an encoder emitting a near-constant
+  vector while ESR still looks respectable. A good val_esr means nothing
+  unless shuffled is much worse and emb_spread is not ~0.
 """
 
 from __future__ import annotations
@@ -265,9 +260,9 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
     if leaked:
         raise RuntimeError(f"holdout devices {leaked} are in the training set")
 
-    # Zero-shot probe. The number this experiment exists to produce, measured every
-    # epoch instead of once at the end: proto's seen 0.439 vs holdout 0.805 gap was
-    # invisible until the run finished.
+    # Zero-shot probe: the number this experiment exists to produce, measured
+    # every epoch instead of only at the end (a seen-vs-holdout gap can stay
+    # invisible until the run finishes otherwise).
     holdout_loader = None
     if holdout_ids:
         h_idx = {int(d): i for i, d in enumerate(sorted(holdout_ids))}
@@ -312,9 +307,14 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         best_val = float(ck.get("best_val_esr", float("inf")))
         # Config is authoritative on resume (same rule as emulate/train.py): the
         # Adam moment buffers are what resuming preserves, not the lr value.
+        enc_wd = getattr(jcfg, "enc_weight_decay", -1.0)
+        enc_wd = ecfg.weight_decay if enc_wd < 0 else float(enc_wd)
         for g in opt.param_groups:
-            g["lr"] = jcfg.enc_lr if g.get("name") == "encoder" else ecfg.lr
-            g["weight_decay"] = ecfg.weight_decay
+            is_enc = g.get("name") == "encoder"
+            g["lr"] = jcfg.enc_lr if is_enc else ecfg.lr
+            # Per-group, not one value for both: joint.enc_weight_decay would
+            # otherwise be silently reset to the generator's on every resume.
+            g["weight_decay"] = enc_wd if is_enc else ecfg.weight_decay
         print(f"[resume] from epoch {start_epoch}, best_val_esr={best_val:.5f}; "
               f"lr_gen={ecfg.lr:.2e} lr_enc={jcfg.enc_lr:.2e} (from config)")
     else:
@@ -499,24 +499,19 @@ def _save_config_copy(run_dir: Path, ecfg, jcfg) -> None:
         encoding="utf-8")
 
 
-# Shape-defining knobs, frozen for the life of a run. Beyond emulate's list,
-# every encoder-shape knob, plus enc_normalize: it changes no shape, so a swap
-# would load cleanly and quietly feed the generator a differently-scaled vector.
+# Shape-defining knobs, frozen for the life of a run. Beyond emulate's list:
+# every encoder-shape knob, plus enc_normalize/fp_path/fp_preprocess -- these
+# change no shape, but a swap would quietly feed the generator a different vector.
 _STRUCTURAL_EMULATE = ("arch", "wn_channels", "wn_activation", "cond_hidden",
                        "cond_activation", "delta_rank", "embedding_dim", "single_device")
 _STRUCTURAL_JOINT = ("enc_channels", "enc_activation", "enc_attn_hidden",
                      "enc_proj_hidden", "enc_normalize", "enc_head", "enc_taps",
                      "enc_tap_stride", "enc_expand_dim", "enc_n_heads",
                      "enc_expand_norm", "enc_norm_groups",
-                     # fp_path and fp_preprocess change no shape, which is exactly the
-                     # enc_normalize argument: a swap would load cleanly and quietly
-                     # feed the generator a different vector for the same amp.
                      "enc_kind", "fp_path", "fp_preprocess", "fp_layernorm")
 
-# A checkpoint written before a knob existed still ran *some* behaviour. Record it,
-# or the `k in saved` test below silently waves the change through — and for
-# enc_head that is precisely the accident this guard exists to stop, since the two
-# heads have disjoint parameters and the load would fail far from the cause.
+# A checkpoint from before a knob existed still ran some default behaviour --
+# record it here so the resume check below doesn't silently wave the change through.
 _LEGACY_JOINT_DEFAULTS = {"enc_head": "stats", "enc_taps": [6, 13, 22],
                           "enc_tap_stride": 8, "enc_expand_dim": 256,
                           "enc_n_heads": 2, "enc_expand_norm": "batch",

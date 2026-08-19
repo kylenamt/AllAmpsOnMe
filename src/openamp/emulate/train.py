@@ -1,18 +1,14 @@
-"""One training script for the amp foundation models (spec §4.2).
+"""One training script for the amp foundation models.
 
-- Trains the configured architecture (``emulate.arch``: FiLM-TCN or the A2
-  FiLM-WaveNet, built by :func:`openamp.emulate.models.build_model`) on
-  :class:`openamp.emulate.dataset.EmulationDataset`: pre-emphasized ESR +
-  multi-resolution STFT (auraloss), 1:1; Adam lr 5e-4, reduce-on-plateau, early
-  stopped at the val-ESR plateau. Plain single-GPU PyTorch — no Lightning.
-- Every run writes to ``results/emulate/<name>/``: best/last checkpoints, a
-  copy of the config, ``metrics.json`` (param count, receptive field, train
-  hours), ``train_log.csv`` (per-epoch train/val curves).
-- Sanity ladder (cheap, run before any long job):
-  1. ``overfit_one_batch`` — a single batch should drive ESR to ~0.
-  2. mini-run (``--limit-devices 10``) — devices sound distinct, and shuffling
-     the embeddings across devices should *hurt* val ESR (proves conditioning
-     works; reported as ``val_esr_shuffled`` at the end of every run).
+- Trains the configured architecture (emulate.arch, built by
+  openamp.emulate.models.build_model) on EmulationDataset: pre-emphasized ESR
+  + multi-resolution STFT (auraloss), 1:1; Adam, reduce-on-plateau, early
+  stopped at the val-ESR plateau. Plain single-GPU PyTorch.
+- Every run writes to results/emulate/<name>/: best/last checkpoints, a copy
+  of the config, metrics.json, train_log.csv (per-epoch train/val curves).
+- Sanity ladder before any long job: overfit_one_batch (one batch -> ESR ~0),
+  then a mini-run (--limit-devices) checking val_esr_shuffled is worse than
+  val_esr (proves the conditioning is doing real work).
 """
 
 from __future__ import annotations
@@ -256,11 +252,8 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         resumed_from = int(ck["epoch"])
         start_epoch = resumed_from + 1
         best_val = float(ck.get("best_val_esr", float("inf")))
-        # Config is authoritative on resume: opt.load_state_dict just restored the
-        # checkpoint's own lr/weight_decay, but config-file edits must win so a
-        # resumed run can be hand-annealed (read the last lr from train_log.csv,
-        # set the config to that or lower, then resume). The Adam moment buffers
-        # are preserved -- that, not the lr value, is the point of resuming.
+        # Config wins over the checkpoint's own lr/weight_decay, so a resumed
+        # run can be hand-annealed; Adam's moment buffers are still preserved.
         for g in opt.param_groups:
             g["lr"], g["weight_decay"] = ecfg.lr, ecfg.weight_decay
         print(f"[resume] from epoch {start_epoch}, best_val_esr={best_val:.5f}; "
@@ -326,8 +319,7 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         tr_stft = ep_stft / max(n_steps, 1)
         val_esr = evaluate_esr(model, val_loader, dev, ecfg.preemph)
 
-        # NaN guard: fp16 forward overflow (activations > 65504) once NaN-killed a
-        # 52-epoch run -- recover instead of dying.
+        # NaN guard: recover from an fp16 forward overflow instead of dying.
         # - Non-finite val ESR: weights are poisoned. Reload best, drop to fp32
         #   (or halve lr if already fp32).
         # - Non-finite train loss with finite val: GradScaler absorbed the

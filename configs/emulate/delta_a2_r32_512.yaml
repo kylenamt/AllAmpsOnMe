@@ -1,50 +1,17 @@
-# delta_wavenet at rank 32 with the embedding widened to 512 — the top of the
-# capacity ladder, and the first point where the embedding is NOT the bottleneck.
-# Run name is the file stem ("delta_a2_r32_512") -> results/emulate/delta_a2_r32_512/.
+# delta_wavenet at rank 32 with embedding widened to 512 -- the top of the
+# capacity ladder, where the embedding (not the rank) stops being the limit
+# (min(23*32, 512) = 512, double every other run in the family). Run name =
+# file stem.
 #
 #   openamp emulate --config configs/emulate/delta_a2_r32_512.yaml --overfit           # sanity #1
 #   openamp emulate --config configs/emulate/delta_a2_r32_512.yaml --limit-devices 10  # mini-run
 #   openamp emulate --config configs/emulate/delta_a2_r32_512.yaml                     # full run
 #
-# Why rank 32 comes with embedding_dim 512 rather than 256. Each layer's `coeff`
-# reads the embedding down to `delta_rank` numbers before anything touches the
-# kernel, so the conditioning path carries min(23 * delta_rank, embedding_dim)
-# effective degrees of freedom. At E=256 the ladder already saturates at r16
-# (23*16 = 368 > 256): rank 32 there would buy 2x the generator parameters and
-# exactly zero extra conditioning bandwidth, testing nothing. Widening E to 512
-# alongside r32 gives min(736, 512) = 512 — double every other run in the family:
+# Moves two knobs at once (rank and embedding_dim), so a result here is about
+# the pair, not either alone; delta_a2_r16_512 (E moved, rank held) is the
+# control. See delta_a2_256.yaml for the rest of the ladder.
 #
-#   run                gen params   DOF   best_val_esr
-#   nam_a2_256          94,576      256   0.0876   (FiLM hook, E-bottlenecked)
-#   nam_a2_512         188,784      368   0.0923   (FiLM hook, generator-bottlenecked)
-#   delta_a2_r6_256     97,601      138   in flight
-#   delta_a2_256       130,127      184   0.0639 @ e87, in flight
-#   delta_a2_r16_256   260,231      256   0.0487 @ e84, in flight
-#   this run           708,855      512   ?
-#
-# The delta hook is already worth ~1.8x over FiLM at matched embedding, and r8 ->
-# r16 bought another 24% — i.e. the ladder had not flattened where it ran out of
-# embedding. This run asks whether that was the rank or the 256-wide read that was
-# binding, by lifting both at once.
-#
-# LIMITATION, read before comparing rows: this moves two knobs, so a win is
-# "rank 32 through a 512 embedding beats rank 16 through a 256 one" and nothing
-# finer. The E axis is not free either — nam_a2_512 is *worse* than nam_a2_256
-# (0.0923 vs 0.0876), so on the FiLM hook the wider embedding cost accuracy, and a
-# null result here could be the wider embedding cancelling a real rank gain. The
-# control that separates them is delta_a2_r16_512 (E moved, rank held), which is
-# the run to launch next if this one lands anywhere interesting.
-#
-# Cost. Real-time CPU is unchanged, as with every delta run: for a fixed embedding
-# the residual is a constant, so export folds it into conv.weight/conv.bias/mixin
-# and ships a bit-for-bit stock A2 capture. What grows is training params and the
-# bundle's generator blob (~0.57 MB base + 708,855 * 4 B ~= 3.4 MB), re-run once
-# per morph point. Training memory tracks the [C,C,K] weight tensors, not batch —
-# r8 measured 3.75 GiB at batch 32 on this 12 GB card, and the extra rank adds
-# parameters, not per-sample activations.
-#
-# FULL copy of nam_a2.yaml semantics, not a delta — see delta_a2_256.yaml for why
-# every value is repeated here.
+# Full copy of nam_a2.yaml's numbers -- see delta_a2_256.yaml.
 
 emulate:
   # --- Model -------------------------------------------------------------------
@@ -60,16 +27,12 @@ emulate:
   batch_size: 32
   pairs_per_epoch: 50000
   epochs: 100              # NAM trainer.max_epochs; early-stop still ends it sooner
-  # NAM optimizer block, verbatim. Keep the decimal point: PyYAML resolves bare
-  # `4e-3` as a *string*, which reaches Adam untyped and dies at construction.
-  lr: 4.0e-3
+  lr: 4.0e-3                # keep the decimal point -- PyYAML reads bare 4e-3 as a string
   weight_decay: 3.17e-7
   plateau_patience: 3
   plateau_factor: 0.5
-  early_stop_patience: 15   # 8 burned delta_a2_256 attempt 1 mid-recovery from a loss spike
-  # NAM's 5e-4 MRSTFT weight rescaled from its MSE term to this trainer's ESR term
-  # (ESR = MSE / mean(t^2); corpus renders sit at median mean(t^2) 0.0096).
-  stft_weight: 0.05
+  early_stop_patience: 15
+  stft_weight: 0.05         # NAM's MRSTFT weight, rescaled from MSE to this trainer's ESR term
   preemph: 0.85            # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
   num_workers: 6
   amp: true

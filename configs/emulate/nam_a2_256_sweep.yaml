@@ -1,38 +1,23 @@
-# nam_a2_256 trained on the SWEEP-ONLY corpus — TONE3000's own recipe, but one
-# network conditioned on 405 amps at once instead of one network per amp.
-# Run name is the file stem ("nam_a2_256_sweep") -> results/emulate/nam_a2_256_sweep/.
+# nam_a2_256 trained on the SWEEP-ONLY corpus -- TONE3000's own recipe, but
+# one network conditioned on 405 amps at once instead of one network per amp.
+# Run name = file stem.
 #
 #   python scripts/build_sweep_corpus.py                                  # once
 #   OPENAMP_DATA_DIR=data_sweep openamp render --devices @data_sweep/manifests/render_subset.txt
 #   OPENAMP_DATA_DIR=data_sweep openamp emulate --config configs/emulate/nam_a2_256_sweep.yaml
 #
-# THE ENV VAR IS PART OF THE RECIPE. Without OPENAMP_DATA_DIR=data_sweep this trains
-# on the EGDB corpus and silently reproduces nam_a2_256 under a different run name.
+# THE ENV VAR IS PART OF THE RECIPE. Without OPENAMP_DATA_DIR=data_sweep this
+# trains on the EGDB corpus and silently reproduces nam_a2_256 under a
+# different run name.
 #
-# Every knob below is byte-identical to nam_a2_256.yaml on purpose: the corpus is the
-# only variable, so the two runs are a controlled A/B on "what should the one-to-many
-# net be trained on". Do not tune anything here without changing nam_a2_256.yaml too.
-#
-# What differs is upstream, in data_sweep/:
-#   - corpus  = the TONE3000 v3 capture signal in NAM's own regions, unmodified:
-#               train 10.0-181.0 s, val 181.0-190.0 s. NAM defines no test split, so
-#               `test` is the SAME 9 s block as val (test_ESR re-measures val audio
-#               under the test metric; it is not held out). Held-out evidence comes
-#               from evaluating the checkpoint against the EGDB data dir afterwards.
-#   - level   = native. `openamp corpus` would cut 0.9 dB to satisfy its -1 dBFS peak
-#               cap; TONE3000 and `enroll_pair` both use the signal as-is, and matching
-#               them is the point of this run.
-#   - volume  = 171 s/device vs 1913 s/device, i.e. 19 h of unique paired audio vs
-#               215 h. pairs_per_epoch is left at 50000 anyway so the OPTIMIZATION
-#               budget matches nam_a2_256 exactly; epochs are simply more redundant.
-#   - devices = the same 450 rendered / 45 held out (render_subset.txt and
-#               emulate_holdout.txt are copied into data_sweep/manifests/), so the
-#               405-row embedding table indexes the same amps in the same order.
-#
-# Read val_esr against two references it is now directly comparable to: the .nam
-# captures' own NAM-reported validation_esr (median 0.0033 over the same 9 s block)
-# and the enrollment floor measured in notebooks/sweep_domain_gap.ipynb (median 0.0163
-# for nam_a2_256's EGDB-trained sibling delta_a2_tanh_r32_512).
+# Every knob below is byte-identical to nam_a2_256.yaml on purpose -- the
+# corpus is the only variable, so do not tune anything here without changing
+# nam_a2_256.yaml too. What differs is upstream, in data_sweep/: the TONE3000
+# v3 capture signal in NAM's own regions (train 10.0-181.0s, val/test both
+# 181.0-190.0s -- NAM defines no test split, so val is not truly held out),
+# native level (no -1 dBFS peak cap, matching what enroll_pair feeds), and
+# 171s/device of unique audio vs 1913s/device on EGDB (pairs_per_epoch left
+# at 50000 anyway, so the optimization budget matches).
 
 emulate:
   # --- Model -------------------------------------------------------------------
@@ -47,22 +32,14 @@ emulate:
   batch_size: 32
   pairs_per_epoch: 50000
   epochs: 100
-  # Keep the decimal point: PyYAML resolves bare `4e-3` as a *string*, which reaches
-  # Adam untyped and dies at construction.
-  lr: 4.0e-3
+  lr: 4.0e-3                # keep the decimal point -- PyYAML reads bare 4e-3 as a string
   weight_decay: 3.17e-7
   plateau_patience: 3
   plateau_factor: 0.5
   early_stop_patience: 8
-  # NAM's 5e-4 MRSTFT weight rescaled from its MSE term to this trainer's ESR term
-  # as w = 5e-4 / median mean(t^2). nam_a2.yaml derived 0.05 from the EGDB renders
-  # (median mean(t^2) 0.0096); these sweep renders measure 0.00481, so the same rule
-  # would give 0.104 here and this run's STFT term is ~2x weaker than NAM's recipe
-  # implies. Held at 0.05 deliberately, for two reasons: it keeps the corpus as the
-  # ONLY variable against nam_a2_256, and the STFT term is known to misbehave on this
-  # exact signal (pair enrollment on the sweep needs stft_weight=0 to descend at all —
-  # see notebooks/enroll_from_nam.ipynb), so erring low is the safer direction.
-  stft_weight: 0.05
+  stft_weight: 0.05         # held at the EGDB-derived value deliberately, to keep the corpus
+                            # as the only variable vs nam_a2_256 (this corpus's own NAM-scaled
+                            # weight would be ~0.104; the STFT term misbehaves on this signal)
   preemph: 0.85
   num_workers: 6
   amp: true

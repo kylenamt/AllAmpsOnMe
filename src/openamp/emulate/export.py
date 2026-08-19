@@ -1,50 +1,25 @@
 """Morph-plugin exports: weight bundle + pasteable embedding profiles.
 
-- The real-time plugin (AllAmpsOnMePlugin) runs the trained FiLM-WaveNet by
-  *weight folding*: for any fixed embedding ``e``, the per-layer FiLM
-  ``z = gamma * (conv(x) + mixin(clean)) + beta`` (gamma, beta = film(e)) is
-  absorbed into the layer's own weights::
-
-      conv.weight  *= gamma[:, None, None]
-      conv.bias     = gamma * conv.bias + beta
-      mixin.weight *= gamma[:, None, None]
-
-  leaving a bit-for-bit standard NAM A2 WaveNet — the architecture
-  NeuralAmpModelerCore already runs in real time. The plugin never evaluates
-  FiLM in its DSP loop; it re-folds (a few kFLOPs) whenever the morph dot
-  moves. :func:`folded_model` is the Python reference for that operation and
-  :func:`forward_with_embedding` the reference for the unfolded path;
-  ``tests/test_export.py`` pins the two equal to the trained model.
-- ``delta_wavenet`` folds the same way, one step upstream: its generator emits
-  the layer's own weight residual, so folding is literally::
-
-      conv.weight  += dW(e)
-      conv.bias    += db(e)
-      mixin.weight += dm(e)
-
-  Same guarantee, same stock-A2 result — no per-channel structure to preserve,
-  since the residual is already in weight space.
-- Two artifacts leave this module:
-  - **Bundle** (:func:`export_bundle`) — one JSON file with everything the
-    plugin needs: base weights of every static part, per-layer FiLM matrices,
-    the A2 schedule, built-in profiles (always the table mean). Tensors are
-    base64 float32 little-endian, C-order; structure stays human-readable.
-    Meant to be embedded in the plugin binary via ``juce_add_binary_data``.
-  - **Profile** (:func:`export_profile`) — the small pasteable JSON users
-    exchange: ``{"aaom_profile": 1, "name", "run", "dim", "embedding"}``.
-    ``run`` is the first 8 hex chars of the checkpoint's sha256, so the plugin
-    can reject profiles enrolled against a different network.
-- All three A2 archs export: ``film_wavenet``, ``mlpfilm_wavenet``,
-  ``delta_wavenet``. Only *how* the conditioning is computed from ``e``
-  differs, discriminated by ``arch.type`` (``film_wavenet_a2`` /
-  ``mlpfilm_wavenet_a2`` / ``delta_wavenet_a2``). ``aaom_bundle`` stays 1: the
-  envelope is unchanged, and the per-arch layer payload is what ``arch.type``
-  exists to select. An mlpfilm bundle carries ``film_layers``, a delta bundle
-  ``delta_coeff_w``/``delta_coeff_b``/``delta_basis``, and both deliberately
-  **omit** ``film_w``/``film_b``, so a reader that predates the arch fails on
-  a missing key rather than folding garbage.
-- WaveNet-only: folding into the TCN would work the same way, but the plugin
-  ships the A2 topology; exporting a ``film_tcn`` run is a hard error.
+- The plugin runs the trained FiLM-WaveNet by weight folding: for a fixed
+  embedding e, film_wavenet/mlpfilm_wavenet's per-layer FiLM
+  (z = gamma*(conv(x)+mixin(clean))+beta) is absorbed into the layer's own
+  weights (conv.weight *= gamma, conv.bias = gamma*bias+beta, mixin *= gamma),
+  leaving a bit-for-bit stock NAM A2 WaveNet. delta_wavenet folds the same way
+  one step upstream (conv.weight += dW(e), etc.) since its generator already
+  emits a weight residual. folded_model() is the Python reference for this;
+  forward_with_embedding() is the unfolded reference; test_export.py pins the
+  two equal to the trained model.
+- Two artifacts:
+  - Bundle (export_bundle) -- one JSON file with every static weight, per-layer
+    FiLM/delta matrices, the A2 schedule, and built-in profiles (tensors as
+    base64 float32). Meant to be embedded in the plugin binary.
+  - Profile (export_profile) -- the small pasteable JSON users exchange:
+    {"aaom_profile", "name", "run", "dim", "embedding"}. run is the checkpoint's
+    sha256 prefix, so the plugin can reject profiles from a different network.
+- All three A2 archs export (film_wavenet, mlpfilm_wavenet, delta_wavenet),
+  discriminated by arch.type. Each non-legacy arch omits film_w/film_b, so a
+  reader that predates the arch fails on a missing key instead of folding garbage.
+- WaveNet-only: the plugin ships the A2 topology, so exporting film_tcn is a hard error.
 """
 
 from __future__ import annotations
@@ -100,23 +75,15 @@ def _require_wavenet(model) -> FiLMWaveNet:
 def _fold_layer(layer, emb: torch.Tensor, channels: int) -> None:
     """Fold one layer's conditioning at ``emb`` into its own weights, in place.
 
-    Then neutralize the generator, so the layer's forward ignores its embedding
-    argument entirely -- that's what makes the copy a plain A2 layer for *any*
-    device_idx. Two shapes of conditioning, one contract:
+    The model neutralizes the generator afterwards (``neutralize_conditioning``),
+    so the copy's forward ignores device_idx entirely for *any* value.
 
-    - FiLM (``film_wavenet`` / ``mlpfilm_wavenet``): per-channel affine on the
-      conv output, absorbed by scaling the rows of conv/mixin and shifting the
-      bias. Both generators fold identically; only ``film(emb)`` differs.
+    - FiLM (``film_wavenet`` / ``mlpfilm_wavenet``): per-channel affine,
+      absorbed by scaling conv/mixin rows and shifting the bias.
     - Delta (``delta_wavenet``): the generator already speaks in weight space,
       so the fold is the addition the layer would have done.
-    - Table (``tabledelta_wavenet``): the same addition, with the residual read
-      straight out of the device's row rather than generated -- ``emb`` is that
-      row's slice for this layer. The layer's part mask is honoured, so a masked
-      capture plays exactly what the masked model plays.
-
-    Neutralizing the conditioning afterwards is the model's job
-    (``neutralize_conditioning``), since for the table arch the state to clear
-    lives in one table rather than per layer.
+    - Table (``tabledelta_wavenet``): same addition, residual read straight
+      from the device's row. The layer's part mask is honoured.
     """
     if isinstance(layer, TableDeltaWaveNetLayer):
         dw, db, dm = layer.split_delta(emb.reshape(1, -1))
@@ -183,31 +150,21 @@ def forward_with_embedding(model: FiLMWaveNet, x: torch.Tensor,
 def _cond_blobs(layer) -> dict:
     """One layer's conditioning weights, in the shape the plugin's re-fold expects.
 
-    - film_wavenet's single Linear ships as ``film_w``/``film_b`` -- the keys
-      that shipped from day one, byte-identical.
-    - mlpfilm_wavenet ships ``film_layers`` (its Linears in input->output
-      order; apply ``arch.cond_activation`` *between* them, not after the last).
-    - delta_wavenet ships its generator instead:
-      ``delta = (coeff_w @ e + coeff_b) @ delta_basis``, split into the kernel
-      residual (first ``C*C*K`` entries, C-order like ``conv_w``), the bias
-      residual (next ``C``), the mixin-gain residual (last ``C``).
-    - tabledelta_wavenet ships **no generator at all**: a profile row *is* the
-      delta, so only ``delta_split`` (the kernel/bias/mixin widths) is needed and
-      the plugin's re-fold is a slice-and-add with no matmul. Its profiles are
-      correspondingly large — ~10k floats rather than 256, so ~40 KB of JSON each.
-    - Each non-legacy arch deliberately **omits** ``film_w``/``film_b``:
-      ``arch.type`` is the intended discriminator, but a reader that predates
-      the arch and ignores it then dies on a missing key instead of silently
-      folding garbage and playing the wrong amp at full volume.
+    - film_wavenet: ``film_w``/``film_b`` (day-one keys, byte-identical).
+    - mlpfilm_wavenet: ``film_layers`` (Linears in input->output order; apply
+      ``cond_activation`` *between* them, not after the last).
+    - delta_wavenet: ``delta = (coeff_w @ e + coeff_b) @ delta_basis``, split
+      into kernel/bias/mixin residuals (``C*C*K``/``C``/``C`` entries).
+    - tabledelta_wavenet: no generator at all -- a profile row *is* the delta,
+      so only ``delta_split`` (the slice widths) is needed; profiles are
+      correspondingly large (~10k floats vs 256).
+    - Every non-legacy arch omits ``film_w``/``film_b``: ``arch.type`` is the
+      intended discriminator, and a reader that ignores it dies on a missing
+      key instead of silently folding garbage.
     """
     if isinstance(layer, TableDeltaWaveNetLayer):
-        # No generator at all: a profile row *is* the delta, so the plugin's
-        # re-fold is a slice-and-add. Only the slice widths are needed to do it.
         return {"delta_split": [layer.n_weight, layer.channels, layer.channels]}
     if hasattr(layer, "delta"):
-        # effective_basis() folds the training-time direction/magnitude split back
-        # into one matrix, so the plugin's re-fold is a plain matmul and the bundle
-        # format is unchanged by that reparameterization.
         return {"delta_coeff_w": _blob(layer.delta.coeff.weight),
                 "delta_coeff_b": _blob(layer.delta.coeff.bias),
                 "delta_basis": _blob(layer.delta.effective_basis())}

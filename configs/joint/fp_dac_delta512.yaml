@@ -54,16 +54,29 @@ emulate:
   clip_seconds: 2.0
   batch_size: 32
   pairs_per_epoch: 50000
-  epochs: 150
-  # NOT the 1.25e-4 in configs/emulate/delta_a2_tanh_r32_512.yaml: that value was
-  # hand-annealed to resume a run mid-schedule. This is a fresh run, so it starts
-  # where that one started. Keep the decimal point -- PyYAML resolves bare `4e-3`
-  # as a *string*, which reaches Adam untyped and dies at construction.
-  lr: 4.0e-3
+  # Extended from 150 at the epoch-127 resume, to give the adapter a real window
+  # at its raised learning rate.
+  epochs: 300
+  # Hand-annealed to train_log.csv's last value at the epoch-126 resume: --resume
+  # applies the config lr verbatim (the Adam moment buffers are what resuming
+  # preserves, not the lr), so leaving 4.0e-3 here would undo 126 epochs of
+  # ReduceLROnPlateau annealing. Original fresh-run value was 4.0e-3.
+  lr: 3.13e-5
   weight_decay: 3.17e-7
-  plateau_patience: 3
+  # Frozen schedule: a patience larger than any remaining epoch count means
+  # ReduceLROnPlateau can never fire, so lr stays exactly where the resume put it.
+  # (plateau_factor: 1.0 is NOT the way to do this -- torch rejects factor >= 1.0
+  # with "Factor should be < 1.0.") plateau_factor is left at its usual value and
+  # is simply unreachable. One ReduceLROnPlateau scales *both* param groups, so
+  # without freezing, the adapter's lr is driven by the generator's plateau rather
+  # than by its own progress.
+  plateau_patience: 100000
   plateau_factor: 0.5
-  early_stop_patience: 15
+  # Effectively disabled. Early stopping watches seen-amp val_esr, which has
+  # already plateaued at ~0.127 with the lr frozen -- it would fire around epoch
+  # 142 and make the extension to 300 a no-op. The number this run exists to move
+  # is val_esr_holdout, which early stopping does not look at.
+  early_stop_patience: 100000
   stft_weight: 0.05
   preemph: 0.85
   num_workers: 6
@@ -100,7 +113,12 @@ joint:
   # ON. Nothing else bounds |e| and the reconstruction gradient inflates it: proto
   # measured |e| -> 123 and total collapse (shuffled ratio exactly 1.00) with it off.
   enc_normalize: true
-  enc_lr: 5.0e-4
+  # Raised to parity with the generator at the epoch-126 resume. It had annealed to
+  # 3.91e-6 -- 8x below the generator and effectively frozen since ~epoch 105 --
+  # because the shared scheduler tied it to the generator's plateau. The adapter is
+  # the component under test and the one that still has to find a generalizable
+  # map, so it should not stop learning just because the generator has converged.
+  enc_lr: 3.13e-5
   # The adapter's own decay. Its deepest failure mode is memorization -- it sees the
   # identical vector for a given amp on all 50,000 draws per epoch, where an encoder
   # would see a fresh window each time -- and emulate.weight_decay is 3.17e-7, i.e.

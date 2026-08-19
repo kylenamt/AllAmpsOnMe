@@ -1,65 +1,17 @@
-# nam_a2_256 with the conditioning moved from FiLM into the conv weights —
-# the headline delta_wavenet run.
-# Run name is the file stem ("delta_a2_256") -> results/emulate/delta_a2_256/.
+# delta_wavenet: conditioning moved from FiLM into the conv weights -- the
+# embedding writes a low-rank residual onto each layer's kernel/bias/mixin
+# instead of a per-channel affine on the output. Run name = file stem.
 #
 #   openamp emulate --config configs/emulate/delta_a2_256.yaml --overfit           # sanity #1
 #   openamp emulate --config configs/emulate/delta_a2_256.yaml --limit-devices 10  # mini-run
 #   openamp emulate --config configs/emulate/delta_a2_256.yaml                     # full run
 #
-# Why this run exists: every arch so far conditions the *output* of a shared conv,
-# per channel (gamma * z + beta). That can only re-gain each channel — it cannot
-# change what the filter listens for. mlpfilm_a2_256 spent 2x the generator
-# parameters on a nonlinear map into that same per-channel affine and landed within
-# noise of the linear one (best_val_esr 0.0872 vs 0.0876), which reads as the
-# *hook*, not the generator, being the limit. delta_wavenet tests exactly that: the
-# embedding writes a low-rank residual onto each layer's kernel, bias and mixin
-# gain, so a device can retime a filter rather than only re-level it. FiLM is inside
-# this family (dW = (gamma - 1) * W, db = (gamma - 1) * b + beta, dm = (gamma - 1) *
-# mixin_w), so a null result here is a real answer about the hook rather than an
-# artifact of what the arch cannot express.
+# Not parameter-matched to film_wavenet (rank 8 = 130,127 params vs 94,576);
+# see delta_a2_r6_256 for the matched pair (97,601).
 #
-# Not parameter-matched: rank 8 costs 130,127 generator params against
-# film_wavenet's 94,576 (1.36x). Pair it with delta_a2_r6_256, which is matched
-# (97,601), to separate the mechanism from the capacity — same split as
-# mlpfilm_a2_256 / mlpfilm_a2_h16_256.
-#
-# Exports like the FiLM archs: for a fixed embedding the delta is a constant, so
-# adding it into conv.weight/conv.bias/mixin leaves a bit-for-bit stock A2 capture. The
-# folded network is unchanged in size — this arch adds nothing to the plugin's DSP
-# loop, only to the bundle (the generator, re-run per morph point).
-#
-# Training cost is *lower* than film_wavenet's, despite the extra parameters:
-# measured 241 vs 394 ms/step at batch 32 and 3.75 vs 4.88 GiB peak (RTX 5070,
-# bf16, 2 s clips + warmup). The delta only touches [C,C,K] weight tensors, where
-# FiLM materializes a [B,C,T] scale+shift per layer and keeps it for backward.
-#
-# ---------------------------------------------------------------------------------
-# ATTEMPT 1 (2026-08-04) — DISCARDED, do not compare its row against anything.
-# best_val_esr 0.31787, stopped at epoch 13 of 100. Two separate faults:
-#
-#   1. The generator had no `scale`, so magnitude lived diffusely in `basis` where
-#      `coeff` and `basis` trade it for free. By epoch 12 the delta was 5.1x the base
-#      kernel (max |delta| 27.9 vs |W| std 0.38): the shared filter had been shrunk
-#      toward irrelevance and each device's conv rebuilt from its own residual — the
-#      per-device weight table this arch exists to avoid. Fixed in wavenet.py by
-#      normalizing the basis rows and putting magnitude in one scalar per layer.
-#   2. It early-stopped mid-recovery. val tracked nam_a2_256 exactly through epoch 4
-#      (0.3179 vs 0.3102), took a loss spike at epoch 5, and burned all 8 patience
-#      epochs climbing back — still descending (0.3657) when the counter expired.
-#      The spikes are NOT delta-specific: nam_a2_256 hit train_esr 3.7e10 at epoch 2
-#      and 1933 at epoch 12 on this same recipe and still finished at 0.0876. Its
-#      recoveries were just shallow enough never to burn 8 in a row.
-#
-# Hence early_stop_patience 15 below rather than nam_a2's 8. That is a stopping rule,
-# not a model property, so it does not compromise comparability with nam_a2_256 —
-# and nam_a2_256 never triggered the rule at 8 anyway.
-# ---------------------------------------------------------------------------------
-#
-# This is a FULL copy of nam_a2.yaml with those changes, not a delta: a per-run
-# file is read *instead of* configs/openamp.yaml, not merged over another emulate
-# config, so anything omitted here falls back to the EmulateConfig dataclass
-# defaults (stft_weight 1.0, weight_decay 0.0, lr 5e-4 — the paper's TCN numbers),
-# silently undoing the NAM recipe. See nam_a2.yaml for the derivation of each value.
+# Full copy of nam_a2.yaml's numbers -- a per-run file replaces
+# configs/openamp.yaml entirely, so omitted keys fall back to EmulateConfig
+# defaults, not NAM's.
 
 emulate:
   # --- Model -------------------------------------------------------------------
@@ -67,12 +19,7 @@ emulate:
   wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
   embedding_dim: 256
   single_device: -1        # -1 = one-to-many over all render-ok devices
-  # Rank of the per-layer residual: 8 shared kernel-shaped directions per layer,
-  # mixed per device by a linear read of the embedding. The only capacity knob of
-  # this arch (there is no FiLM generator to shape, so cond_hidden/cond_activation
-  # are ignored here). Costs training params and bundle bytes (~0.57 -> ~1.1 MB),
-  # never real-time CPU.
-  delta_rank: 8
+  delta_rank: 8            # rank of the per-layer residual; the arch's only capacity knob
 
   # --- Training (NAM's A2 numbers where the knob exists) -----------------------
   holdout_frac: 0.1
@@ -80,17 +27,13 @@ emulate:
   batch_size: 32
   pairs_per_epoch: 50000
   epochs: 100              # NAM trainer.max_epochs; early-stop still ends it sooner
-  # NAM optimizer block, verbatim. Keep the decimal point: PyYAML resolves bare
-  # `4e-3` as a *string*, which reaches Adam untyped and dies at construction.
-  lr: 4.0e-3
+  lr: 4.0e-3                # keep the decimal point -- PyYAML reads bare 4e-3 as a string
   weight_decay: 3.17e-7
   plateau_patience: 3
   plateau_factor: 0.5
-  early_stop_patience: 15   # 8 burned attempt 1 while it was still recovering from a loss spike
-  # NAM's 5e-4 MRSTFT weight rescaled from its MSE term to this trainer's ESR term
-  # (ESR = MSE / mean(t^2); corpus renders sit at median mean(t^2) 0.0096).
-  stft_weight: 0.05
-  preemph: 0.85            # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
+  early_stop_patience: 15
+  stft_weight: 0.05         # NAM's MRSTFT weight, rescaled from MSE to this trainer's ESR term
+  preemph: 0.85             # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
   num_workers: 6
   amp: true
   amp_dtype: bf16

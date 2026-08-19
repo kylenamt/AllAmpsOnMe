@@ -401,28 +401,50 @@ def emulate_demo(run, n_devices, seconds, device) -> None:
 
 @cli.command("emulate-enroll")
 @click.argument("run", type=Path)
+@click.option("--config", "config_path", type=Path, default=None,
+              help="configs/emulate/<name>.yaml, read for its enroll: section "
+                   "(training hyperparameters).")
 @click.option("--devices", default=None,
               help="Comma-separated device ids (default: the run's holdout set).")
-@click.option("--pairs", default=1000, show_default=True,
-              help="Training pairs per device per epoch (optimization budget).")
-@click.option("--epochs", default=30, show_default=True, help="Max epochs (early-stopped).")
-@click.option("--lr", default=1e-2, show_default=True)
+@click.option("--pairs", type=int, default=None,
+              help="Training pairs per device per epoch (optimization budget). "
+                   "Overrides --config.")
+@click.option("--epochs", type=int, default=None,
+              help="Max epochs (early-stopped). Overrides --config.")
+@click.option("--lr", type=float, default=None, help="Overrides --config.")
 @click.option("--device", default=None, help="cuda/cpu (default: auto).")
-@click.option("--seed", type=int, default=None, help="Override the config seed.")
-@click.option("--init", type=click.Choice(["uniform", "table_mean"]),
-              default="uniform", show_default=True,
+@click.option("--seed", type=int, default=None, help="Overrides --config / the config seed.")
+@click.option("--batch-size", type=int, default=None,
+              help="Overrides the run's own training batch size for this fit (fp32, so "
+                   "~2x the activation memory at the same batch size -- drop to 8-16 "
+                   "against a batch-32 run on a 12 GB card). Overrides --config.")
+@click.option("--init", type=click.Choice(["uniform", "table_mean"]), default=None,
               help="Where new rows start: the trainer's own init scale, or the "
-                   "trained table's mean.")
-def emulate_enroll(run, devices, pairs, epochs, lr, device, seed, init) -> None:
+                   "trained table's mean. Overrides --config.")
+def emulate_enroll(run, config_path, devices, pairs, epochs, lr, device, seed,
+                   batch_size, init) -> None:
     """Enroll unseen devices: freeze a trained run, fit new embeddings only."""
     from openamp.emulate import enroll as emu_enroll
 
-    cfg = _config()
+    cfg = _config(config_path)
     if not (run / "checkpoint.pt").is_file():
         raise click.ClickException(f"No checkpoint.pt under {run}.")
+    ecfg = cfg.enroll
     ids = [int(x) for x in devices.split(",") if x.strip()] if devices else None
-    m = emu_enroll.enroll(cfg, run, device_ids=ids, pairs=pairs, epochs=epochs, lr=lr,
-                          device=device or _default_device(), seed=seed, init=init)
+    m = emu_enroll.enroll(
+        cfg, run, device_ids=ids,
+        pairs=pairs if pairs is not None else ecfg.pairs,
+        epochs=epochs if epochs is not None else ecfg.epochs,
+        lr=lr if lr is not None else ecfg.lr,
+        device=device or _default_device(),
+        seed=seed if seed is not None else ecfg.seed,
+        init=init if init is not None else ecfg.init,
+        test_pairs=ecfg.test_pairs,
+        early_stop_patience=ecfg.early_stop_patience,
+        stft_weight=ecfg.stft_weight,
+        batch_size=batch_size if batch_size is not None else ecfg.batch_size,
+        plateau_patience=ecfg.plateau_patience,
+        plateau_factor=ecfg.plateau_factor)
     click.echo(f"  enrolled {m['n_enrolled']} devices: test_ESR={m['test_esr_mean']} "
                f"(baseline {m['baseline_test_esr_mean']}, "
                f"trained {m['trained_test_esr_mean']})")

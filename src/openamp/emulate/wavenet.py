@@ -1,48 +1,17 @@
 """FiLM-conditioned NAM A2 WaveNet for one-to-many amp emulation.
 
-- Exact architecture of the corpus's own captures: every A2 (Slimmable NAM)
-  export on TONE3000 shares one full-width WaveNet — 23 dilated conv layers
-  (channels 8, schedule below), LeakyReLU(0.01), a per-layer input mixin of the
-  raw signal, a residual 1x1 per layer, summed skip outputs through a kernel-16
-  head conv, scaled by ``head_scale``. Verified identical across all 774 A2
-  captures in the corpus; the schedule constants here are read straight from
-  those exports.
-- Per-layer nonlinearity is a knob (``wn_activation``): ``leakyrelu`` is what the
-  captures use, ``tanh`` is the other activation NAM's A2 schema implements, so a
-  tanh run still folds into a plugin-playable A2 WaveNet (see
-  :mod:`openamp.emulate.export`).
-- Two deliberate departures from a capture make it one-to-many and trainable:
-  - **FiLM conditioning**: NAM's A2 layer schema defines optional FiLM hooks
-    (all inactive in single-device captures). This model activates the
-    pre-activation position, driven by a learnable
-    ``[N_devices x embedding_dim]`` table — same mechanism/placement
-    (post-conv, pre-nonlinearity) as :class:`~openamp.emulate.tcn.FiLMTCN`.
-    FiLM starts near identity (scale 1, shift 0), so an untrained net is a pure
-    A2 WaveNet.
-  - **Causal same-length padding**: NAM uses valid convs and trims; here every
-    conv is left-padded so output length equals input length, matching the
-    training loop's contract (loss on ``out[..., R:]``). Sample-identical once
-    the receptive field is warmed up.
-- Three architectures live here:
-  - :class:`FiLMWaveNet` (``film_wavenet``) and :class:`MLPFiLMWaveNet`
-    (``mlpfilm_wavenet``) differ *only* in the map from embedding to
-    ``(gamma, beta)``: one ``Linear(E, 2C)`` per layer vs. an independent
-    ``Linear(E, H) -> act -> Linear(H, 2C)``. Conditioning itself is per-channel
-    affine in both.
-  - :class:`DeltaWaveNet` (``delta_wavenet``) moves conditioning one step
-    upstream: instead of rescaling the layer's *output* per channel, the
-    embedding generates a low-rank **residual on the layer's own weights**,
-    ``z = conv_{W + dW(e), b + db(e)}(x) + (mixin_w + dm(e)) * clean``. FiLM is
-    the special case ``dW = (gamma - 1) * W`` row-wise,
-    ``db = (gamma - 1) * b + beta``, ``dm = (gamma - 1) * mixin_w`` — a strict
-    superset of what the FiLM hook can express at the same position, at
-    comparable parameter cost (:class:`DeltaWeightGen`).
-- All three fold into a plugin-playable A2 capture — the generator never runs in
-  the real-time DSP loop, and for ``delta_wavenet`` the fold *is* the addition
-  the layer would have done anyway (see :mod:`openamp.emulate.export`). All
-  three share one ``[N_devices x embedding_dim]`` table, so enrollment,
-  morphing and profile export are architecture-independent.
-- Import is torch-only, like :mod:`~openamp.emulate.tcn`.
+- Same architecture as the corpus's A2 (Slimmable NAM) captures: 23 dilated
+  conv layers (channels 8), LeakyReLU, per-layer input mixin, residual 1x1,
+  skip sum through a kernel-16 head conv. wn_activation also allows tanh.
+- FiLM conditioning (pre-activation, near-identity init) and same-length causal
+  padding are the only departures from a stock capture -- both fold away for
+  export (see openamp.emulate.export).
+- Three archs, differing only in how the embedding conditions a layer:
+  FiLMWaveNet / MLPFiLMWaveNet (linear vs MLP gamma/beta generator),
+  DeltaWaveNet (low-rank residual on the conv weights instead of FiLM),
+  TableDeltaWaveNet (same residual, free per-device instead of low-rank --
+  cannot be enrolled, no shared embedding space).
+- All share one [N_devices x embedding_dim] table.
 """
 
 from __future__ import annotations
@@ -60,84 +29,52 @@ __all__ = ["FiLMWaveNet", "MLPFiLMWaveNet", "DeltaWaveNet", "TableDeltaWaveNet",
            "A2_DELTA_RANK", "A2_DELTA_SCALE_INIT", "DELTA_PARTS_ALL",
            "DELTA_PART_NAMES"]
 
-# The one architecture shared by every A2 capture in the corpus (full-width
-# submodel of the SlimmableContainer export): three 7-layer dilation runs at
-# kernel 6 with two kernel-15 layers between runs 2 and 3.
+# The one architecture shared by every A2 capture: three 7-layer dilation runs
+# at kernel 6, two kernel-15 layers between runs 2 and 3.
 A2_KERNEL_SIZES = (6,) * 14 + (15, 15) + (6,) * 7
 A2_DILATIONS = (1, 3, 7, 17, 41, 101, 239) * 2 + (1, 13) + (1, 3, 7, 17, 41, 101, 239)
 A2_HEAD_KERNEL = 16
 A2_CHANNELS = 8
 A2_HEAD_SCALE = 0.02
 A2_EMBEDDING_STD = 0.1               # init std of the [N_devices x E] table
-A2_FILM_INIT_STD = 0.01              # near-identity FiLM start; see FiLMWaveNetLayer
+A2_FILM_INIT_STD = 0.01              # near-identity FiLM start
 
-# --- Activation (``wn_activation``) ---------------------------------------------
-# Both options are parameter-free, so a checkpoint's state_dict is identical
-# either way: switching this on an existing run loads silently and plays the
-# wrong network. Hence "wn_activation" sits in train.py's _STRUCTURAL_KEYS.
+# --- Activation (wn_activation) --------------------------------------------------
+# Parameter-free, so a checkpoint's state_dict is identical either way -- in
+# train.py's _STRUCTURAL_KEYS to stop a silent architecture swap on resume.
 ACTIVATIONS = ("leakyrelu", "tanh")
 A2_ACTIVATION = "leakyrelu"          # what every A2 capture uses
 A2_LEAKY_SLOPE = 0.01
-# NAM's own schema spelling for each option, for the plugin bundle's arch block.
-NAM_ACTIVATION_NAMES = {"leakyrelu": "LeakyReLU", "tanh": "Tanh"}
+NAM_ACTIVATION_NAMES = {"leakyrelu": "LeakyReLU", "tanh": "Tanh"}   # plugin bundle spelling
 
-# --- Nonlinear FiLM generator (``cond_hidden`` / ``cond_activation``) -------------
-# mlpfilm_wavenet replaces each layer's single Linear(E, 2C) FiLM generator with
-# an independent Linear(E, H) -> act -> Linear(H, 2C). At embedding_dim 256 /
-# channels 8: linear generator = 4,112 params/layer; H=16 is parameter-matched
-# (4,384), H=32 is ~2x (8,752), H=64 quadruples the plugin bundle (17,488).
-# Never runs in the plugin's DSP loop (folded away per morph point), so H costs
-# training parameters and bundle bytes, not real-time CPU.
+# --- Nonlinear FiLM generator (cond_hidden / cond_activation) -------------------
+# mlpfilm_wavenet: Linear(E,H) -> act -> Linear(H,2C) per layer instead of one
+# Linear(E,2C). Never runs in the plugin DSP loop (folded per morph point), so
+# H only costs training params / bundle bytes, not real-time CPU.
 A2_COND_HIDDEN = 32
-# LeakyReLU is positively homogeneous (equally curved at any input scale). Tanh
-# is ~linear until embedding/first-layer weights grow (measured 0.35% nonlinear
-# at init, E=256/H=64) -- a slower departure from film_wavenet.
 A2_COND_ACTIVATION = "leakyrelu"
 
-# --- Weight-delta generator (``delta_rank``) --------------------------------------
-# delta_wavenet drops FiLM entirely; the embedding writes a residual straight
-# onto each layer's conv kernel, bias and mixin gain. A full per-device kernel
-# would be C*C*K numbers per layer per device (9,984/device over the A2
-# schedule at C=8) -- a private weight blob per amp, exactly what the shared
-# embedding space exists to avoid. So the residual is low-rank: ``rank``
-# kernel-shaped directions (``basis``, shared by all devices) mixed per device
-# (``coeff``). Per layer: E*R + R + R*(C*C*K + 2C) + 1 = 16,263*R + 23 at
-# E=256/C=8 -- rank 6 is parameter-matched to film_wavenet's 23 Linears (97,601
-# vs 94,576), the rank-8 default is 1.36x (130,127).
+# --- Weight-delta generator (delta_rank) -----------------------------------------
+# delta_wavenet: embedding writes a residual onto each layer's conv kernel/bias/
+# mixin instead of FiLM-scaling the output. Low-rank (kernel-shaped basis
+# directions shared across devices, per-device coeff) so it stays a shared
+# embedding space rather than a per-device weight table.
 A2_DELTA_RANK = 8
-# Initial delta size, as a fraction of the base kernel's own weight std. Must
-# *stay* a residual: at 0.03 the untrained net is a plain A2 WaveNet to within a
-# fraction of a dB, and the shared kernel keeps doing the work while the device
-# only nudges it.
-#
-# Hard-won constant: the first delta_a2_256 run had no ``scale`` at all --
-# magnitude lived diffusely in ``basis``, which ``coeff`` could trade against for
-# free. By epoch 12 the delta was 5.1x the base weight (max |delta| 27.9 vs |W|
-# std 0.38) -- the shared kernel had shrunk toward irrelevance and each device
-# rebuilt its filter from its own residual, the per-device weight table this arch
-# exists to avoid, reached the long way round. Pinning ``basis`` to unit-norm
-# directions and putting magnitude in one scalar per layer removes the free
-# trade: growing the delta now costs one visible, decayable parameter instead of
-# drifting through 3,200 diffuse ones.
+# Delta size at init, as a fraction of the base kernel's weight std -- must stay
+# a residual (untrained net ~= stock A2). basis is unit-norm and scale is one
+# learned magnitude scalar per layer, so growth is visible/decayable instead of
+# a free trade between the two (see DeltaWeightGen).
 A2_DELTA_SCALE_INIT = 0.03
 
-# Which slices of a weight residual are applied, for tabledelta_wavenet's runtime
-# mask: (kernel, bias, mixin). All on is the trained network; subsets exist to ask
-# which part of the conditioning actually carries the amp (see set_delta_parts).
+# tabledelta_wavenet runtime mask: which slices of a weight residual apply.
 DELTA_PARTS_ALL = (True, True, True)
 DELTA_PART_NAMES = ("kernel", "bias", "mixin")
 
 
-# --- General-purpose helpers ------------------------------------------------------
-# Shared by every architecture below; nothing here is tied to FiLM or delta
-# conditioning specifically.
+# --- General-purpose helpers, shared by every arch below -----------------------
 
 def normalize_activation(name: str, field: str = "wn_activation") -> str:
-    """Validate an activation value and return its canonical key.
-
-    ``field`` names the config knob being validated, so ``cond_activation`` errors
-    do not blame ``wn_activation``.
-    """
+    """Validate + canonicalize an activation name; `field` names the config knob for errors."""
     key = str(name).strip().lower()
     if key not in ACTIVATIONS:
         raise ValueError(f"{field} must be one of {ACTIVATIONS}, got {name!r}")
@@ -145,23 +82,18 @@ def normalize_activation(name: str, field: str = "wn_activation") -> str:
 
 
 def make_activation(name: str, field: str = "wn_activation") -> nn.Module:
-    """The activation module for an activation value (case-insensitive)."""
+    """The activation module for a name (case-insensitive)."""
     key = normalize_activation(name, field)
     return nn.LeakyReLU(A2_LEAKY_SLOPE) if key == "leakyrelu" else nn.Tanh()
 
 
 def per_sample_conv1d(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor,
                       pad: int, dilation: int) -> torch.Tensor:
-    """Causal conv1d where **every batch item has its own weights**.
+    """Causal conv1d where every batch item has its own weights.
 
-    ``x`` [B,C,T], ``w`` [B,C,C,K], ``b`` [B,C] -> [B,C,T]. A training batch mixes
-    devices, so there is no single weight tensor to convolve with. Disguising the
-    batch as channels turns it into one grouped conv: ``groups=B`` convolves chunk
-    *i* of the input only with filter chunk *i*, which is exactly B independent
-    convolutions, in one kernel launch.
-
-    Shared by every weight-conditioned arch here (:class:`DeltaWaveNetLayer`,
-    :class:`TableDeltaWaveNetLayer`) so the trick lives in one place.
+    x [B,C,T], w [B,C,C,K], b [B,C] -> [B,C,T]. Disguises the batch as extra
+    channels (groups=B) so B independent per-sample convolutions run as one
+    grouped conv in a single kernel launch.
     """
     B, C, T = x.shape
     K = w.shape[-1]
@@ -170,19 +102,15 @@ def per_sample_conv1d(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor,
                     dilation=dilation, groups=B).reshape(B, C, T)
 
 
-# --- FiLM family: film_wavenet / mlpfilm_wavenet -----------------------------------
-# Conditioning scales the layer's output per channel (``gamma``/``beta``); the
-# generator maps embedding -> (gamma, beta) linearly (FiLMWaveNet) or through an
-# MLP (MLPFiLMWaveNet).
+# --- FiLM family: film_wavenet / mlpfilm_wavenet --------------------------------
+# Conditioning scales the layer's output per channel (gamma/beta); the generator
+# maps embedding -> (gamma, beta) linearly (FiLMWaveNet) or via an MLP (MLPFiLMWaveNet).
 
 def film_output_linear(film: nn.Module) -> nn.Linear:
-    """The FiLM generator's final ``nn.Linear`` -- the one whose rows are (gamma, beta).
+    """The FiLM generator's final nn.Linear (the one producing gamma, beta).
 
-    Both generators end in a Linear (``nn.Linear`` itself for film_wavenet, ``fc2``
-    for :class:`MLPFiLM`), and zeroing *that* weight makes the whole generator emit
-    its bias verbatim for any finite input. That single fact is what keeps both the
-    near-identity training init and export's fold neutralization exact for either
-    generator (see :func:`openamp.emulate.export.folded_model`).
+    Zeroing its weight makes the generator emit its bias verbatim for any
+    input -- what keeps the near-identity init and export's fold-neutralization exact.
     """
     linears = [m for m in film.modules() if isinstance(m, nn.Linear)]
     if not linears:
@@ -194,10 +122,8 @@ def film_output_linear(film: nn.Module) -> nn.Linear:
 def init_film_identity(film: nn.Module, channels: int, std: float = 0.0) -> None:
     """Set a FiLM generator to (near-)identity: gamma ~ 1, beta ~ 0.
 
-    ``std=0`` is *exact* identity -- the generator returns (1, 0) bit for bit, since
-    ``x @ 0^T`` is a sum of exact zeros. That is what export's neutralized fold copy
-    needs. ``std>0`` is the training init: identity plus a small random tilt, so the
-    untrained net is a plain A2 WaveNet while conditioning gradients stay alive.
+    std=0: exact identity (export's neutralized fold). std>0: training init --
+    identity plus a small random tilt so conditioning gradients stay alive.
     """
     out = film_output_linear(film)
     if std > 0:
@@ -209,14 +135,10 @@ def init_film_identity(film: nn.Module, channels: int, std: float = 0.0) -> None
 
 
 class MLPFiLM(nn.Module):
-    """Nonlinear embedding -> (gamma, beta) generator: ``Linear -> act -> Linear``.
+    """Nonlinear embedding -> (gamma, beta) generator: Linear -> act -> Linear.
 
-    - One independent generator per WaveNet layer (no shared trunk), so every
-      layer bends the embedding space its own way.
-    - Never runs in the plugin's DSP loop: evaluated once per morph point and
-      folded into the conv weights, like the single Linear it replaces.
-    - Named submodules rather than :class:`~torch.nn.Sequential` so the
-      state_dict reads ``fc1.weight`` and stays stable if a layer is inserted.
+    One independent generator per layer. Folded into the conv weights at
+    export, like the single Linear it replaces -- never runs in the plugin DSP loop.
     """
 
     def __init__(self, embedding_dim: int, channels: int, hidden: int,
@@ -235,11 +157,8 @@ class MLPFiLM(nn.Module):
 class FiLMWaveNetLayer(nn.Module):
     """One A2 WaveNet layer, causal, with device FiLM at the pre-activation hook.
 
-    ``z = conv(x) + mixin(clean)`` is FiLM-modulated by the device embedding,
-    then passed through ``activation`` (LeakyReLU(0.01) as in the captures, or
-    Tanh). The activation feeds two paths: ``layer1x1`` back onto the residual
-    trunk, and (head1x1 is inactive in A2) directly out as this layer's skip
-    contribution to the head sum.
+    z = conv(x) + mixin(clean), FiLM-modulated by the device embedding, then
+    activation. Feeds layer1x1 back onto the trunk and out as the skip term.
     """
 
     def __init__(self, channels: int, kernel_size: int, dilation: int,
@@ -250,21 +169,17 @@ class FiLMWaveNetLayer(nn.Module):
         self.pad = (kernel_size - 1) * dilation          # causal left pad
         self.conv = nn.Conv1d(channels, channels, kernel_size, dilation=dilation)
         self.input_mixer = nn.Conv1d(1, channels, 1, bias=False)
-        # cond_hidden 0 = the linear generator (film_wavenet); > 0 swaps in the
-        # per-layer MLP (mlpfilm_wavenet). Only the emb -> (gamma, beta) map
-        # changes: the conditioning itself stays per-channel affine either way, so
-        # both fold into a stock A2 capture identically.
+        # cond_hidden 0 -> linear generator (film_wavenet); >0 -> per-layer MLP
+        # (mlpfilm_wavenet). Conditioning stays per-channel affine either way.
         self.film = (nn.Linear(embedding_dim, 2 * channels) if cond_hidden <= 0 else
                      MLPFiLM(embedding_dim, channels, cond_hidden, cond_activation))
-        # Near-identity start (scale ~1, shift ~0): the untrained net is a plain
-        # A2 WaveNet, but the small weight keeps conditioning gradients alive.
-        init_film_identity(self.film, channels, std=A2_FILM_INIT_STD)
+        init_film_identity(self.film, channels, std=A2_FILM_INIT_STD)   # near-identity start
         self.act = make_activation(activation)
         self.layer1x1 = nn.Conv1d(channels, channels, 1)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor,
                 emb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """``x`` trunk [B,C,T], ``cond`` clean signal [B,1,T], ``emb`` [B,E]."""
+        """x trunk [B,C,T], cond clean signal [B,1,T], emb [B,E]."""
         z = self.conv(F.pad(x, (self.pad, 0))) + self.input_mixer(cond)
         gamma, beta = self.film(emb).chunk(2, dim=-1)    # [B, C], [B, C]
         z = gamma.unsqueeze(-1) * z + beta.unsqueeze(-1)
@@ -273,19 +188,10 @@ class FiLMWaveNetLayer(nn.Module):
 
 
 class FiLMWaveNet(nn.Module):
-    """Conditioned A2-WaveNet emulator: ``(audio, device_idx) -> emulated audio``.
+    """Conditioned A2-WaveNet emulator: (audio, device_idx) -> emulated audio.
 
-    - Same contract as :class:`~openamp.emulate.tcn.FiLMTCN`: input ``[B, T]``
-      or ``[B, 1, T]`` mono at 48 kHz, ``device_idx`` a ``[B]`` long tensor of
-      embedding rows, output ``[B, 1, T]`` causal.
-    - ``head_scale`` is a **fixed** buffer, as in NAM's own trainer: made
-      learnable, Adam moves this single global-gain scalar ~lr per step (the
-      fastest parameter in the model) and drives it to the silence solution
-      (output 0, ESR 1.0) in the first epochs before anything else can fit
-      (observed 0.02 -> -2e-4 by epoch 7).
-    - Kernel/dilation schedule defaults to the A2 constants; ``channels``
-      (``wn_channels``) is the width sweep knob, ``activation``
-      (``wn_activation``) picks the per-layer nonlinearity.
+    Same contract as FiLMTCN: input [B,T] or [B,1,T] mono @ 48kHz, device_idx a
+    [B] long tensor of embedding rows, output [B,1,T] causal.
     """
 
     def __init__(self, *, n_devices: int, channels: int = A2_CHANNELS,
@@ -320,35 +226,28 @@ class FiLMWaveNet(nn.Module):
         self.layers = nn.ModuleList(self._make_layer(k, d)
                                     for k, d in zip(self.kernel_sizes, self.dilations))
         self.head_rechannel = nn.Conv1d(self.channels, 1, self.head_kernel)
+        # Fixed buffer, not learnable: as a free param this single global gain
+        # races to the silence solution (output 0) before anything else can fit.
         self.register_buffer("head_scale", torch.tensor(float(head_scale)))
 
     def _make_layer(self, kernel_size: int, dilation: int) -> nn.Module:
-        """The per-layer module — the one thing a WaveNet arch here overrides.
-
-        Everything else (schedule, embedding table, rechannel/head, forward) is
-        shared, so an arch is defined by how its layer takes the embedding.
-        """
+        """The per-layer module -- the one thing a WaveNet arch here overrides."""
         return FiLMWaveNetLayer(self.channels, kernel_size, dilation,
                                 self.embedding_dim, self.activation,
                                 self.cond_hidden, self.cond_activation)
 
     def layer_conditioning(self, emb: torch.Tensor):
-        """Yield ``(layer, conditioning)`` for one embedding vector.
+        """Yield (layer, conditioning) for one embedding vector.
 
-        Every generator arch hands the same ``emb`` to every layer; only
-        :class:`TableDeltaWaveNet` slices it. Exists so :mod:`openamp.emulate.export`
-        can fold and reference-forward without knowing which arch it holds.
+        Every arch hands the same emb to every layer except TableDeltaWaveNet,
+        which slices it -- lets export fold/reference-forward arch-agnostically.
         """
         for layer in self.layers:
             yield layer, emb
 
     @torch.no_grad()
     def neutralize_conditioning(self) -> None:
-        """Make the conditioning a no-op for *any* device_idx (export's fold copy).
-
-        Per-layer for the generator archs (identity FiLM / zero delta); overridden
-        where the state lives elsewhere.
-        """
+        """Make the conditioning a no-op for any device_idx (export's fold copy)."""
         for layer in self.layers:
             if hasattr(layer, "delta"):
                 init_delta_zero(layer.delta)
@@ -357,7 +256,7 @@ class FiLMWaveNet(nn.Module):
 
     @classmethod
     def from_config(cls, ecfg, n_devices: int) -> "FiLMWaveNet":
-        """Construct from an :class:`~openamp.core.config.EmulateConfig`."""
+        """Construct from an EmulateConfig."""
         return cls(n_devices=n_devices, channels=ecfg.wn_channels,
                    embedding_dim=ecfg.embedding_dim,
                    activation=ecfg.wn_activation)
@@ -377,17 +276,10 @@ class FiLMWaveNet(nn.Module):
                                             self.head_kernel)
 
     def forward_emb(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
-        """Conditioned forward on an embedding **vector**, not a table row.
+        """Conditioned forward on an embedding vector [B, embedding_dim], not a table row.
 
-        The whole audio path lives here; :meth:`forward` is the table lookup in
-        front of it. Split out so the embedding can come from somewhere other
-        than ``self.embedding`` -- an encoder trained jointly with this network
-        (:mod:`openamp.joint_model`), or a morph point between two rows -- with
-        gradients flowing back into ``emb``. Routing through
-        :meth:`layer_conditioning` keeps it arch-agnostic: every subclass that
-        already customizes how a layer reads the embedding gets this for free.
-
-        ``emb`` is ``[B, embedding_dim]``.
+        Split from forward() so emb can come from elsewhere -- a jointly-trained
+        encoder (openamp.joint_model), or a morph point between two rows.
         """
         if x.dim() == 2:
             x = x.unsqueeze(1)                           # [B, T] -> [B, 1, T]
@@ -404,18 +296,10 @@ class FiLMWaveNet(nn.Module):
 
 
 class MLPFiLMWaveNet(FiLMWaveNet):
-    """A2 FiLM-WaveNet whose per-layer FiLM generator is a small MLP.
+    """FiLMWaveNet whose per-layer FiLM generator is a small MLP instead of one Linear.
 
-    - Identical to :class:`FiLMWaveNet` everywhere audio flows -- same A2
-      schedule, same per-channel affine ``z = gamma * z + beta`` at the same
-      pre-activation hook, same fold-into-a-stock-A2-capture export path. Only
-      change: the map from embedding to ``(gamma, beta)`` is an independent
-      ``Linear(E, H) -> act -> Linear(H, 2C)`` per layer instead of one
-      ``Linear(E, 2C)``, so a device's position in embedding space can steer the
-      network nonlinearly rather than only through a single linear read.
-    - A separate arch rather than a knob on ``film_wavenet``: the two have
-      incompatible state_dicts, so keeping the names apart means every existing
-      film_wavenet run, checkpoint and plugin bundle stays exactly what it is.
+    Separate arch (not a knob on film_wavenet) since the two have incompatible
+    state_dicts -- keeps every existing film_wavenet checkpoint/bundle exact.
     """
 
     def __init__(self, *, cond_hidden: int = A2_COND_HIDDEN,
@@ -428,7 +312,7 @@ class MLPFiLMWaveNet(FiLMWaveNet):
 
     @classmethod
     def from_config(cls, ecfg, n_devices: int) -> "MLPFiLMWaveNet":
-        """Construct from an :class:`~openamp.core.config.EmulateConfig`."""
+        """Construct from an EmulateConfig."""
         return cls(n_devices=n_devices, channels=ecfg.wn_channels,
                    embedding_dim=ecfg.embedding_dim,
                    activation=ecfg.wn_activation,
@@ -436,25 +320,17 @@ class MLPFiLMWaveNet(FiLMWaveNet):
                    cond_activation=ecfg.cond_activation)
 
 
-# --- Delta family: delta_wavenet ----------------------------------------------------
-# Conditioning writes a low-rank residual straight onto each layer's conv weights
-# instead of scaling the layer's output.
+# --- Delta family: delta_wavenet -------------------------------------------------
+# Conditioning writes a low-rank residual onto each layer's conv weights instead
+# of scaling the layer's output.
 
 @torch.no_grad()
 def init_delta_zero(gen: "DeltaWeightGen", scale: float = 0.0) -> None:
-    """Set a weight-delta generator to (near-)zero: ``dW ~ 0``, ``db ~ 0``, ``dm ~ 0``.
+    """Set a weight-delta generator to (near-)zero: dW ~ 0, db ~ 0, dm ~ 0.
 
-    ``scale=0`` is *exact* zero -- the generator multiplies by a zero scalar, so the
-    layer is a plain A2 conv again for any finite embedding. That is what export's
-    neutralized fold copy needs, the delta counterpart of
-    :func:`init_film_identity`. ``scale>0`` is the training init: random basis
-    directions at that magnitude.
-
-    Note what is *not* done: zeroing ``basis``. It would be the tidier start, but it
-    also zeroes ``coeff``'s gradient (``dL/dcoeff = dL/ddelta @ basis^T``), leaving
-    the embedding read untrained until the basis drifts off zero on its own. Random
-    directions with a small ``scale`` give the same near-identity net with both
-    generator paths live from step 1.
+    scale=0: exact zero (export's neutralized fold). scale>0: training init --
+    random unit-norm basis directions at that magnitude, so coeff's gradient
+    stays live from step 1 (zeroing basis instead would also zero coeff's gradient).
     """
     if scale > 0:
         gen.basis.normal_(0.0, 1.0)      # directions only; forward() normalizes them
@@ -464,32 +340,16 @@ def init_delta_zero(gen: "DeltaWeightGen", scale: float = 0.0) -> None:
 class DeltaWeightGen(nn.Module):
     """Embedding -> low-rank residual on one layer's conv kernel, bias and mixin.
 
-    - ``delta(e) = scale * (coeff(e) @ normalize(basis))``, split into ``dW``
-      [C, C, K], ``db`` [C] and ``dm`` [C]: ``rank`` kernel-shaped **unit-norm
-      directions** shared by every device, mixed by a per-device coefficient
-      vector read linearly off the embedding, sized by one learned scalar for
-      the whole layer. Rank is the capacity knob -- ``rank >= C*C*K + 2C`` would
-      be an unconstrained per-device layer: huge and pointless (no shared
-      structure left to generalize with).
-    - Splitting direction (``basis``) from magnitude (``scale``) is the whole
-      point of the parameterization: without it ``coeff``/``basis`` can trade
-      scale for free and the delta grows without ever paying for it (see
-      :data:`A2_DELTA_SCALE_INIT`). Normalizing pins each direction's length, so
-      the layer's total deviation from the shared kernel is one number that can
-      be watched, weight-decayed, or clamped.
-    - ``dm`` (raw-signal mixin gain) exists only so the family strictly
-      contains FiLM's: FiLM's gamma scales ``conv(x) + mixin(clean)`` as a sum,
-      so without a mixin term the delta would be missing something the arch
-      it's measured against can do. C numbers per rank direction.
-    - Training-time only: export ships ``scale * normalize(basis)``
-      pre-multiplied as one matrix, so the plugin's re-fold stays the plain
-      ``coeff(e) @ basis`` matmul it always was.
-    - Deliberately linear in ``e``: enrollment optimizes an embedding by
-      gradient, morph points are mixes of table rows, so a linear read keeps
-      the delta a well-behaved (affine) function of embedding position. The
-      *network* is nonlinear in the delta regardless.
-    - Never runs in the plugin's DSP loop -- evaluated once per morph point and
-      added into the conv weights, like the FiLM generators it replaces.
+    - delta(e) = scale * (coeff(e) @ normalize(basis)): rank unit-norm kernel-
+      shaped directions shared by every device, mixed by a per-device coeff
+      vector, sized by one learned scalar. rank is the capacity knob.
+    - basis (direction) is split from scale (magnitude) so growth costs one
+      visible, decayable parameter instead of drifting for free through coeff/basis.
+    - dm (mixin gain) exists so the family strictly contains FiLM's.
+    - Training-time only: export ships scale*normalize(basis) pre-multiplied as
+      one matrix, so the plugin's re-fold is a plain coeff(e) @ basis matmul.
+    - Linear in e (not just the network) so enrollment/morph points stay
+      well-behaved functions of embedding position.
     """
 
     def __init__(self, embedding_dim: int, channels: int, kernel_size: int, rank: int,
@@ -510,16 +370,11 @@ class DeltaWeightGen(nn.Module):
 
     @torch.no_grad()
     def _calibrate(self, scale: float, weight_std: float) -> None:
-        """Solve for ``scale`` so the initial delta is ``scale * weight_std`` wide.
+        """Solve for `scale` so the initial delta is `scale * weight_std` wide.
 
-        - ``scale`` reads as "the delta starts at 3% of this layer's kernel", but
-          the raw ``coeff(e) @ normalize(basis)`` magnitude depends on rank,
-          ``n_out``, and how ``nn.Linear`` happened to initialize ``coeff`` -- so
-          it's measured against a probe batch rather than derived (deriving it by
-          hand put the first attempt three orders of magnitude off).
-        - The probe draws from a private generator: calibration must not consume
-          the global RNG stream, or adding a layer would shift every later
-          layer's init.
+        Measured against a probe batch, not derived by hand (raw magnitude
+        depends on rank/n_out/nn.Linear's own init). Probe uses a private RNG
+        so calibration doesn't shift later layers' init.
         """
         if scale <= 0:
             self.scale.zero_()
@@ -530,16 +385,11 @@ class DeltaWeightGen(nn.Module):
         self.scale.mul_(scale * weight_std / max(float(raw.std()), 1e-12))
 
     def effective_basis(self) -> torch.Tensor:
-        """``scale * normalize(basis)`` -- the matrix the delta is actually read from.
-
-        The single definition of the reparameterization, shared by :meth:`forward` and
-        the bundle export, so the two can never drift apart.
-        """
+        """scale * normalize(basis) -- shared by forward() and the bundle export."""
         return self.scale * F.normalize(self.basis, dim=1)
 
     def forward(self, emb: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """``emb`` [B,E] (or a bare [E] morph point) -> ``dW`` [B,C,C,K], ``db``,
-        ``dm`` [B,C]."""
+        """emb [B,E] (or a bare [E] morph point) -> dW [B,C,C,K], db, dm [B,C]."""
         flat = (self.coeff(emb) @ self.effective_basis()).reshape(-1, self.n_out)
         dw, db, dm = flat.split((self.n_weight, self.channels, self.channels), dim=-1)
         return dw.view(-1, self.channels, self.channels, self.kernel_size), db, dm
@@ -548,24 +398,12 @@ class DeltaWeightGen(nn.Module):
 class DeltaWaveNetLayer(nn.Module):
     """One A2 WaveNet layer, causal, conditioned by a per-device delta on its conv.
 
-    - Same signature and audio path as :class:`FiLMWaveNetLayer` -- the device
-      enters one step earlier. Instead of scaling a shared conv's output per
-      channel, the embedding writes a residual onto the layer's own weights::
+    Same signature/audio path as FiLMWaveNetLayer, one step earlier:
 
-          z = conv_{W + dW(e), b + db(e)}(x) + (mixin_w + dm(e)) * clean
+        z = conv_{W + dW(e), b + db(e)}(x) + (mixin_w + dm(e)) * clean
 
-      then ``activation`` and the same two outputs (residual trunk, head term).
-    - Strictly contains the FiLM hook: ``gamma * (conv_{W,b}(x) + mixin(clean))
-      + beta`` is the delta ``dW = (gamma - 1) * W`` row-wise,
-      ``db = (gamma - 1) * b + beta``, ``dm = (gamma - 1) * mixin_w`` -- one
-      point in this family, which is why a null result against film_wavenet is
-      informative rather than a capacity artifact. A delta can also *rotate* a
-      kernel, retiming the filter rather than only re-gaining it -- the reason
-      to try it. ``layer1x1`` stays shared and unconditioned (FiLM doesn't
-      reach it either).
-    - The delta is a shared low-rank basis mixed per device
-      (:class:`DeltaWeightGen`), not a per-device kernel table, so the arch
-      keeps the one ``[N, E]`` embedding space everything else is built on.
+    Strictly contains the FiLM hook (dW = (gamma-1)*W row-wise, etc.), but can
+    also rotate a kernel, not just re-gain it. layer1x1 stays shared/unconditioned.
     """
 
     def __init__(self, channels: int, kernel_size: int, dilation: int,
@@ -578,9 +416,8 @@ class DeltaWaveNetLayer(nn.Module):
         self.pad = (kernel_size - 1) * dilation          # causal left pad
         self.conv = nn.Conv1d(channels, channels, kernel_size, dilation=dilation)
         self.input_mixer = nn.Conv1d(1, channels, 1, bias=False)
-        # The generator sizes its init off this layer's own kernel, so the delta
-        # starts at the same *fraction* of W in every layer of the schedule (the
-        # kernel-15 layers have a smaller fan-in std than the kernel-6 ones).
+        # Sized off this layer's own kernel std, so the delta starts at the
+        # same fraction of W in every layer despite the schedule's varying fan-in.
         self.delta = DeltaWeightGen(embedding_dim, channels, kernel_size, rank,
                                     scale=A2_DELTA_SCALE_INIT,
                                     weight_std=float(self.conv.weight.detach().std()))
@@ -589,18 +426,15 @@ class DeltaWaveNetLayer(nn.Module):
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor,
                 emb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """``x`` trunk [B,C,T], ``cond`` clean signal [B,1,T], ``emb`` [B,E]."""
+        """x trunk [B,C,T], cond clean signal [B,1,T], emb [B,E]."""
         C = self.channels
         dw, db, dm = self.delta(emb)                     # [B,C,C,K], [B,C], [B,C]
         z = per_sample_conv1d(x, self.conv.weight.unsqueeze(0) + dw,
                               self.conv.bias.unsqueeze(0) + db,
                               self.pad, self.dilation)
-        # input_mixer is a 1x1 no-bias conv (a per-channel gain on the raw
-        # signal), written as a broadcast multiply so the delta can ride on it;
-        # module still holds the shared weight (state_dict/bundle key). Cast to
-        # the conv's dtype first -- autocast only rewrites conv/matmul, so a bare
-        # fp32 multiply here would promote this layer back to fp32 (~25% extra
-        # peak memory under amp for nothing).
+        # Per-channel gain on the raw signal as a broadcast multiply so the
+        # delta can ride on it; cast to z's dtype first since autocast only
+        # rewrites conv/matmul (a bare fp32 multiply would promote the layer back).
         mix = (self.input_mixer.weight.reshape(1, C, 1) + dm.unsqueeze(-1)).to(z.dtype)
         z = self.act(z + mix * cond.to(z.dtype))
         return x + self.layer1x1(z), z                   # (residual, head term)
@@ -609,26 +443,17 @@ class DeltaWaveNetLayer(nn.Module):
 class DeltaWaveNet(FiLMWaveNet):
     """A2 WaveNet conditioned by a per-device residual on each layer's conv weights.
 
-    - Identical to :class:`FiLMWaveNet` in topology, receptive field, embedding
-      table and forward -- layers are :class:`DeltaWaveNetLayer` instead of
-      :class:`FiLMWaveNetLayer`, so the device steers ``W`` itself rather than
-      the conv's per-channel output gain. ``delta_rank`` is the capacity knob;
-      ``cond_*`` knobs don't apply (no FiLM generator to shape).
-    - A separate arch rather than a knob: its state_dict has no ``film`` and the
-      FiLM archs have no ``delta``, so every existing film_wavenet /
-      mlpfilm_wavenet run, checkpoint and plugin bundle stays exactly what it
-      is, and a cross-arch load fails loudly instead of reinterpreting weights.
-    - Still exports: for a fixed embedding the delta is a constant, so folding
-      is the addition the layer would have performed, leaving a bit-for-bit
-      stock A2 capture (see :func:`openamp.emulate.export.folded_model`).
+    Same topology/receptive field/embedding table/forward as FiLMWaveNet;
+    layers are DeltaWaveNetLayer instead of FiLMWaveNetLayer. delta_rank is the
+    capacity knob; cond_* doesn't apply (no FiLM generator). Separate arch
+    (not a knob) since its state_dict has no `film` and vice versa.
     """
 
     def __init__(self, *, delta_rank: int = A2_DELTA_RANK, **kwargs):
         if int(delta_rank) < 1:
             raise ValueError(f"delta_rank must be >= 1, got {delta_rank}")
-        # Set before nn.Module.__init__ runs — legal for a plain int (only Parameter
-        # / Module assignment needs the module dicts) and necessary, because the
-        # base constructor calls _make_layer, which reads it.
+        # Set before nn.Module.__init__: legal for a plain int, and necessary
+        # since the base constructor calls _make_layer, which reads it.
         self.delta_rank = int(delta_rank)
         super().__init__(**kwargs)
 
@@ -638,31 +463,26 @@ class DeltaWaveNet(FiLMWaveNet):
 
     @classmethod
     def from_config(cls, ecfg, n_devices: int) -> "DeltaWaveNet":
-        """Construct from an :class:`~openamp.core.config.EmulateConfig`."""
+        """Construct from an EmulateConfig."""
         return cls(n_devices=n_devices, channels=ecfg.wn_channels,
                    embedding_dim=ecfg.embedding_dim,
                    activation=ecfg.wn_activation,
                    delta_rank=ecfg.delta_rank)
 
 
-# --- TableDelta family: tabledelta_wavenet ------------------------------------------
-# The full-rank limit of the delta family: each device's residual is a free row in a
-# table instead of a low-rank read of a shared embedding.
+# --- TableDelta family: tabledelta_wavenet ---------------------------------------
+# Full-rank limit of the delta family: each device's residual is a free table row
+# instead of a low-rank read of a shared embedding.
 
 class TableDeltaWaveNetLayer(nn.Module):
     """One A2 layer whose weight residual is handed in, not generated.
 
-    Same audio path as :class:`DeltaWaveNetLayer`; the difference is upstream.
-    This layer owns no generator: :class:`TableDeltaWaveNet` slices the device's
-    row out of one big table and passes the raw numbers in, so ``dW``/``db``/``dm``
-    are free parameters rather than a low-rank read of an embedding.
+    Same audio path as DeltaWaveNetLayer; TableDeltaWaveNet slices the device's
+    row out of one big table and passes dW/db/dm in directly.
 
-    ``delta_parts`` gates the three slices at *inference* -- a plain attribute, not
-    a buffer, so it never enters the state_dict and one checkpoint can be evaluated
-    every way. Only the kernel residual needs per-sample weights, so ``kernel=False``
-    takes the shared conv and adds ``db`` as a broadcast instead. That branch is
-    there for correctness, not speed: measured 1.3-1.5x cheaper at batch 2-8 on CPU
-    but a wash by batch 32, so don't count on it.
+    delta_parts gates the three slices at inference (plain attribute, not in
+    the state_dict, so one checkpoint can be heard every way). kernel=False
+    skips the per-sample conv for a shared one plus a broadcast bias.
     """
 
     def __init__(self, channels: int, kernel_size: int, dilation: int,
@@ -682,72 +502,56 @@ class TableDeltaWaveNetLayer(nn.Module):
         self.delta_parts = DELTA_PARTS_ALL
 
     def split_delta(self, delta: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """``delta`` [B, n_delta] -> ``dW`` [B,C,C,K], ``db`` [B,C], ``dm`` [B,C].
+        """delta [B, n_delta] -> dW [B,C,C,K], db [B,C], dm [B,C].
 
-        Same layout as :meth:`DeltaWeightGen.forward` -- kernel (C-order), bias,
-        mixin gain -- so a rank-R generator's output and a table row are the same
-        vector, which is what makes the two archs comparable at all.
+        Same layout as DeltaWeightGen.forward, so a generator's output and a
+        table row are interchangeable.
         """
         dw, db, dm = delta.split((self.n_weight, self.channels, self.channels), dim=-1)
         return dw.view(-1, self.channels, self.channels, self.kernel_size), db, dm
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor,
                 delta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """``x`` trunk [B,C,T], ``cond`` clean [B,1,T], ``delta`` [B, n_delta]."""
+        """x trunk [B,C,T], cond clean [B,1,T], delta [B, n_delta]."""
         C = self.channels
         use_kernel, use_bias, use_mixin = self.delta_parts
         dw, db, dm = self.split_delta(delta)
         if use_kernel:
-            # zeros_like(db), not a bare 0: per_sample_conv1d reshapes the bias by
-            # B, so masking the bias off must still hand it a [B,C] tensor. A scalar
-            # 0 leaves conv.bias at [1,C] and only works at batch 1.
+            # zeros_like(db), not a bare 0: per_sample_conv1d reshapes the bias
+            # by B, so it still needs a [B,C] tensor even when masked off.
             z = per_sample_conv1d(x, self.conv.weight.unsqueeze(0) + dw,
                                   self.conv.bias.unsqueeze(0)
                                   + (db if use_bias else torch.zeros_like(db)),
                                   self.pad, self.dilation)
         else:
-            # No per-device kernel: the shared conv serves the whole batch, and a
-            # bias residual is a [B,C,1] broadcast rather than B separate filters.
-            z = self.conv(F.pad(x, (self.pad, 0)))
+            z = self.conv(F.pad(x, (self.pad, 0)))       # shared conv, no per-device kernel
             if use_bias:
                 z = z + db.unsqueeze(-1)
         mix = self.input_mixer.weight.reshape(1, C, 1)
         if use_mixin:
             mix = mix + dm.unsqueeze(-1)
-        # See DeltaWaveNetLayer.forward for why this is cast before the multiply.
-        z = self.act(z + mix.to(z.dtype) * cond.to(z.dtype))
+        z = self.act(z + mix.to(z.dtype) * cond.to(z.dtype))   # see DeltaWaveNetLayer for the cast
         return x + self.layer1x1(z), z                   # (residual, head term)
 
 
 class TableDeltaWaveNet(FiLMWaveNet):
     """A2 WaveNet where every device owns a free, unconstrained weight residual.
 
-    The full-rank limit of :class:`DeltaWaveNet`: same hook, same audio path, same
-    ``dW``/``db``/``dm`` layout -- but instead of ``scale * coeff(e) @
-    normalize(basis)``, the residual is looked up whole from a ``[N_devices, D]``
-    table. Nothing is shared between devices except the base kernels, which is
-    exactly the constraint being measured; a comparison against ``delta_wavenet``
-    isolates the low-rank basis and nothing else.
+    Full-rank limit of DeltaWaveNet: same hook/audio path/dW-db-dm layout, but
+    the residual is a whole-row lookup from a [N_devices, D] table rather than
+    scale * coeff(e) @ normalize(basis). Nothing is shared between devices but
+    the base kernels, isolating the low-rank basis as the only difference from
+    delta_wavenet.
 
-    Consequences that follow from having no shared conditioning space, and are
-    deliberate rather than incidental:
+    - embedding_dim is derived from the schedule (D=10,352 at C=8), not
+      configured; there is no capacity knob.
+    - Parameters scale with n_devices (4.2M at 405).
+    - Cannot be enrolled: held-out devices have no row and there's no shared
+      structure to place one in. openamp.emulate.enroll refuses this arch.
+    - Still folds/exports: a device's row is its delta, a slice-and-add.
 
-    - ``embedding_dim`` is **derived** (``D`` = 10,352 at the A2 schedule / C=8),
-      not configured; ``ecfg.embedding_dim`` is ignored. There is no capacity knob:
-      full rank is the definition.
-    - Parameters scale with ``n_devices`` (4.2M at 405), dwarfing the 12,145-weight
-      A2 core they steer.
-    - Held-out devices have no row, so this arch **cannot be enrolled** -- there is
-      no structure an unseen amp could be positioned within.
-      :mod:`openamp.emulate.enroll` refuses it rather than fitting a table nothing
-      reads.
-    - It still folds and exports: a device's row *is* its delta, so the plugin's
-      re-fold is a slice-and-add with no generator to evaluate.
-
-    The table is zero-initialized, so an untrained net is a plain A2 WaveNet and
-    every device starts identical. Unlike the low-rank generator there's no
-    vanishing-gradient trap in that: the table *is* the delta, so its gradient is
-    nonzero at zero.
+    Table is zero-initialized (untrained net = stock A2, every device starts
+    identical); its gradient is nonzero at zero, so no vanishing-gradient trap.
     """
 
     def __init__(self, **kwargs):
@@ -769,14 +573,7 @@ class TableDeltaWaveNet(FiLMWaveNet):
 
     def set_delta_parts(self, *, kernel: bool = True, bias: bool = True,
                         mixin: bool = True) -> "TableDeltaWaveNet":
-        """Choose which slices of the per-device delta are applied. Returns self.
-
-        Inference-time only and not part of the state_dict, so one trained
-        checkpoint can be heard every way: ``kernel`` alone answers "is the amp in
-        the filter shape?", ``bias``/``mixin`` alone "or just in the levels?".
-        Export's fold reads the same flags, so a masked capture matches what the
-        masked model plays.
-        """
+        """Choose which slices of the per-device delta are applied at inference. Returns self."""
         parts = (bool(kernel), bool(bias), bool(mixin))
         for layer in self.layers:
             layer.delta_parts = parts
@@ -794,15 +591,12 @@ class TableDeltaWaveNet(FiLMWaveNet):
 
     @torch.no_grad()
     def neutralize_conditioning(self) -> None:
-        # No per-layer generator to neutralize: the deltas live in the table, so
-        # zeroing it is what makes a folded copy ignore its device_idx.
-        self.embedding.weight.zero_()
+        self.embedding.weight.zero_()   # deltas live in the table; zeroing it is the no-op
 
     @classmethod
     def from_config(cls, ecfg, n_devices: int) -> "TableDeltaWaveNet":
-        """Construct from an :class:`~openamp.core.config.EmulateConfig`."""
+        """Construct from an EmulateConfig."""
         return cls(n_devices=n_devices, channels=ecfg.wn_channels,
                    activation=ecfg.wn_activation)
 
-    # No ``forward`` override: the base class routes through layer_conditioning,
-    # which is where this arch's per-layer slicing already lives.
+    # No forward() override: layer_conditioning already does this arch's per-layer slicing.

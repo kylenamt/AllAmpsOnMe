@@ -74,9 +74,7 @@ def conditioning_check(model, loader, device, coeff: float, seed: int) -> dict:
     """ESR with the true, permuted and zeroed embedding.
 
     ``shuffled_ratio`` / ``zero_ratio`` are the numbers that matter: how many
-    times worse a wrong or absent embedding makes the output. The table-conditioned
-    baseline sits near x36 (0.052 -> 1.88), which is what "the model plainly uses
-    its conditioning" looks like.
+    times worse a wrong or absent embedding makes the output.
     """
     out = {m: evaluate_esr(model, loader, device, coeff, mode=m, seed=seed)
            for m in EVAL_MODES}

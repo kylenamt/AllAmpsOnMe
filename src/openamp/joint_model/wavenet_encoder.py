@@ -1,49 +1,30 @@
-"""WaveNet reference encoder: ``(dry, wet) -> one embedding vector``.
+"""WaveNet reference encoder: (dry, wet) -> one embedding vector.
 
-The new half of the joint model. It reads a short reference recording of an amp
-and emits the vector that :class:`~openamp.emulate.wavenet.FiLMWaveNet` consumes,
-replacing the per-device row that model looks up today. Trained jointly with the
-generator, from scratch; see ``guidelines.md`` §3 for the spec this implements.
+Reads a short reference recording of an amp and emits the vector that
+FiLMWaveNet consumes, replacing the per-device row it looks up today. Trained
+jointly with the generator, from scratch (see guidelines.md §3).
 
-Three things distinguish it from the generator it feeds:
+Differs from the generator it feeds:
 
-- **Two input channels.** The reference is the ``(dry, wet)`` pair, so the encoder
-  observes the transfer function directly rather than inferring it from the wet
-  side alone. Input is deliberately **unnormalized** — amplitude is gain and
-  compression information, so scaling it away would delete part of the answer.
-- **Non-causal.** The reference is offline, so every conv is centered rather than
-  left-padded. Same schedule, but a layer sees ~66 ms either side instead of
-  132 ms behind.
-- **No head, no conditioning.** The A2 head collapses ``C`` channels to one audio
-  sample; here the point is the opposite, so the layer array runs and the
-  residual stream ``(B, C_enc, L)`` is pooled instead. There is no FiLM hook and
-  no embedding table — nothing conditions this network, it *is* the condition.
+- Two input channels (dry, wet) -- observes the transfer function directly.
+  Input is unnormalized: amplitude is gain/compression information.
+- Non-causal: every conv is centered (offline reference), not left-padded.
+- No head, no conditioning: the residual stream (B, C_enc, L) is pooled
+  instead of collapsed to one audio sample. It IS the condition.
 
-Deliberately **not** a :class:`~openamp.emulate.wavenet.FiLMWaveNet` subclass: it
-would inherit the embedding table and the causal padding, which are the two things
-it exists not to have. It does share that module's schedule constants and
-activation factory, so "the same WaveNet" stays literally true.
+Not a FiLMWaveNet subclass (would inherit the embedding table and causal
+padding, the two things it exists not to have); shares its schedule constants
+and activation factory.
 
-**Two pooling heads.**
+Two pooling heads:
+- head="stats": AttentiveStatsPool over the final trunk -> MLP to
+  embedding_dim. Pooled width is 2*C_enc, tying readout width to backbone width.
+- head="multitap" (MultiTapStatsHead): taps from several depths + a 1x1
+  channel expansion + K attention heads, decoupling pooled width
+  (K*2*expand_dim) from the backbone entirely.
 
-``head="stats"`` is the original: :class:`AttentiveStatsPool` over the final trunk,
-then an MLP to ``embedding_dim``. Its pooled vector is ``2 * C_enc`` numbers, which
-ties readout width to backbone width — at ``C_enc=16`` the embedding lives on a
-32-dimensional manifold however wide the projection's output is. Measured on the
-``proto`` run, the held-out capture embeddings spanned 8.55 effective dimensions
-against the 51.8 of the lookup table that reaches val ESR 0.052 on the same corpus,
-so 32 is a real ceiling *and* it was not being filled.
-
-``head="multitap"`` (:class:`MultiTapStatsHead`) breaks that tie with three
-independent levers: taps from several depths, a 1x1 channel expansion, and ``K``
-attention heads. Pooled width becomes ``K * 2 * expand_dim``, set without touching
-the backbone. Because every layer here same-pads and keeps ``channels`` constant,
-the taps all come out at one length and one width — no trimming or alignment is
-needed, and the concatenated width is just ``len(taps) * C_enc``.
-
-**On normalization.** The layer array has none: the A2 schedule has none and this
-follows it. The multitap head is the one exception, and the choice there is load
-bearing — see :class:`MultiTapStatsHead`.
+No normalization in the layer array (the A2 schedule has none); the multitap
+head's expansion norm is the one exception -- see MultiTapStatsHead.
 """
 
 from __future__ import annotations
@@ -62,21 +43,20 @@ __all__ = ["WaveNetEncoder", "WaveNetEncoderLayer", "AttentiveStatsPool",
            "ENC_TAPS", "ENC_TAP_STRIDE", "ENC_EXPAND_DIM", "ENC_N_HEADS",
            "ENC_EXPAND_NORM", "ENC_EXPAND_NORMS", "ENC_NORM_GROUPS"]
 
-ENC_CHANNELS = 32          # guidelines §7 puts C_enc at 16-32; see the width note above
+ENC_CHANNELS = 32          # guidelines §7 puts C_enc at 16-32
 ENC_ATTN_HIDDEN = 64       # attention bottleneck, independent of C_enc
 ENC_PROJ_HIDDEN = 128      # hidden width of the pooled -> De projection
 
 # --- multitap head ---------------------------------------------------------------
 ENC_HEADS = ("stats", "multitap")
-# End of each of the A2 schedule's three dilation runs (7 + 7 + 2 + 7 layers). Early
-# taps see ~ms structure, the last sees the full 132 ms where sag and compression
-# time constants live; pooling only the deepest view discards the short-scale one.
+# End of each of the A2 schedule's three dilation runs (7+7+2+7 layers) -- early
+# taps see ~ms structure, the last sees the full 132 ms (sag/compression time
+# constants), so pooling only the deepest view discards the short-scale one.
 ENC_TAPS = (6, 13, 22)
-# A WaveNet never downsamples, so a 2 s reference is still 96 000 frames at the tap.
-# The attention tensor is (B, K*E, T), which is what makes that unaffordable: at
-# batch 16 / E 512 / K 4 the head alone wants ~45 GB. Tone does not need
-# sample-rate time resolution, so decimate first. Average-pool, not striding —
-# plain striding aliases.
+# Average-pools the concatenated taps before the attention head -- a WaveNet
+# never downsamples, so the tap is still full sample-rate width, and the
+# attention tensor (B, K*E, T) is a memory knob, not a modelling one.
+# Average-pool, not striding, to avoid aliasing.
 ENC_TAP_STRIDE = 8
 ENC_EXPAND_DIM = 256       # E: pooled width is K * 2 * E, set independently of C_enc
 ENC_N_HEADS = 2            # K: each head may weight the reference differently
@@ -86,14 +66,13 @@ ENC_NORM_GROUPS = 32       # "group" only; clamped to divide expand_dim
 
 
 class WaveNetEncoderLayer(nn.Module):
-    """One non-causal A2-schedule layer: ``(trunk, reference) -> (trunk, skip)``.
+    """One non-causal A2-schedule layer: (trunk, reference) -> (trunk, skip).
 
-    Mirrors :class:`~openamp.emulate.wavenet.FiLMWaveNetLayer` minus the FiLM hook
-    — ``z = conv(x) + mixer(reference)``, activation, residual back onto the trunk
-    — with the causal left pad replaced by a centered one. Extra padding on an
-    even kernel goes on the right, which only fixes an arbitrary half-sample
-    convention; nothing downstream depends on the choice because the output is
-    pooled over time.
+    Mirrors FiLMWaveNetLayer minus the FiLM hook (conv + mixer(reference),
+    activation, residual), with the causal left pad replaced by a centered
+    one. Extra padding on an even kernel goes on the right -- an arbitrary
+    half-sample convention; nothing downstream depends on it since the output
+    is pooled over time.
     """
 
     def __init__(self, channels: int, kernel_size: int, dilation: int,
@@ -142,16 +121,11 @@ def _weighted_moments(alpha: torch.Tensor, h: torch.Tensor, eps: float):
 
 
 class AttentiveStatsPool(nn.Module):
-    """``(B, C, L) -> (B, 2C)``: attention-weighted mean and standard deviation.
+    """(B, C, L) -> (B, 2C): attention-weighted mean and standard deviation.
 
-    Per-channel attention (Okabe et al.), so different feature channels may read
-    different parts of the reference — the channel tracking sag wants the loud
-    passages, the one tracking hiss wants the quiet ones.
-
-    Masking is handled once, in the attention logits: an invalid frame is set to
-    ``-inf`` before the softmax, so its weight is exactly zero and **both**
-    statistics are masked by construction. Weighting the moments after the fact
-    is the version that silently leaves the standard deviation unmasked.
+    Per-channel attention (Okabe et al.), so different channels can read
+    different parts of the reference. Masking is applied to the logits before
+    softmax, so an invalid frame gets exactly zero weight in both statistics.
     """
 
     def __init__(self, channels: int, hidden: int = ENC_ATTN_HIDDEN,
@@ -174,20 +148,12 @@ class AttentiveStatsPool(nn.Module):
 
 
 class MultiHeadAttentiveStatsPool(nn.Module):
-    """``(B, E, T) -> (B, K * 2E)``: ``K`` independent attention-weighted (mean, std).
+    """(B, E, T) -> (B, K * 2E): K independent attention-weighted (mean, std).
 
-    Two changes from :class:`AttentiveStatsPool`:
-
-    - **K heads.** One head gives each channel a single weighting over time. With
-      ``K`` heads the *same* channel can be read under several — the loud passages
-      and the quiet ones — instead of having to choose.
-    - **Context-aware scoring.** Each frame is scored from ``[h ; global_mean ;
-      global_std]`` (``3E`` channels) rather than from ``h`` alone, so "is this
-      frame loud" is judged against the reference it sits in rather than an
-      absolute threshold the network had to bake into its weights.
-
-    Masking is again applied to the logits, so a padded frame gets weight exactly
-    zero in both moments.
+    K heads let the same channel be read under several different weightings
+    (e.g. loud vs quiet passages) instead of one. Each frame is scored from
+    [h; global_mean; global_std] rather than h alone, so "is this frame loud"
+    is judged against its own reference. Masking is again applied to the logits.
     """
 
     def __init__(self, channels: int, n_heads: int, hidden: int = ENC_ATTN_HIDDEN,
@@ -219,40 +185,27 @@ class MultiHeadAttentiveStatsPool(nn.Module):
 
 
 class MultiTapStatsHead(nn.Module):
-    """``list[(B, C, L)] -> (B, De)``: taps -> decimate -> expand -> K-head pooling.
+    """list[(B, C, L)] -> (B, De): taps -> decimate -> expand -> K-head pooling.
 
-    The three capacity levers, in order. Taps widen *what* is summarized; the 1x1
-    expansion widens *how many* statistics are taken, decoupled from ``C_enc``; the
-    ``K`` heads multiply that again. Pooled width is ``K * 2 * expand_dim``, and the
-    projection down to ``De`` is then the one deliberate bottleneck — keep
-    ``pooled_dim`` comfortably above ``De`` or pooling is silently throttling it
-    again, which is the failure this head exists to remove.
+    Three independent capacity levers: taps widen *what* is summarized, the 1x1
+    expansion widens *how many* statistics are taken (decoupled from C_enc),
+    the K heads multiply that again. Pooled width is K*2*expand_dim; keep it
+    well above De or the projection becomes a decorative bottleneck.
 
-    **Why the expansion is BatchNorm by default.** A pooling head's whole output is
-    per-sample statistics of ``h``, so the normalization in front of it must not be
-    per-sample. BatchNorm subtracts a *dataset*-level mean, which carries no
-    per-amp information, and every per-amp deviation survives into the pool — this
-    is why the speaker-verification stacks this head follows (x-vector, ECAPA-TDNN)
-    all put BatchNorm here. GroupNorm and LayerNorm subtract a *per-sample* mean
-    over time, deleting exactly the statistic the pool is about to measure;
-    ``"group"`` is offered because it is batch-independent, but it hands the pool a
-    signal whose group-level mean is zero by construction. ``"none"`` matches the
-    A2 schedule's no-normalization rule and leaves the expansion's scale unbounded.
+    Expansion norm defaults to BatchNorm: it subtracts a dataset-level mean, so
+    per-amp deviation survives into the pool, unlike GroupNorm/LayerNorm which
+    subtract a per-sample mean and delete exactly the statistic being pooled.
+    "group" is offered for batch-independence; "none" matches the A2 schedule's
+    no-normalization rule.
 
-    ``tap_stride`` average-pools the concatenated taps before the expansion. This
-    is a memory knob, not a modelling one — the attention tensor is ``(B, K*E, T)``
-    and ``T`` is the raw sample count — but average-pooling rather than striding
-    matters, since decimating a 48 kHz trunk by 8 without a filter aliases.
+    tap_stride average-pools the concatenated taps before the expansion (a
+    memory knob, not a modelling one -- decimating without a filter would alias).
 
-    **Masking is exact through the pool, not through the normalization.** Padded
-    frames get attention weight zero, so they cannot reach either moment. But
-    BatchNorm's batch statistics and GroupNorm's per-sample statistics are both
-    taken over *every* frame, invalid ones included, so in ``train()`` mode junk
-    beyond the mask still shifts the normalization. In ``eval()`` mode BatchNorm
-    uses fixed running stats and each frame is normalized independently, so masking
-    is exact again; ``norm="none"`` is exact in both. This costs nothing today —
-    ``JointDataset`` only ever emits fixed-length references and no caller passes a
-    mask — but a ragged-batch path would have to face it.
+    Masking is exact through the pool (padded frames get zero attention
+    weight), but only exact through BatchNorm/GroupNorm in eval() mode, where
+    each frame normalizes independently; in train() mode invalid frames still
+    shift the batch statistics. Moot today since no caller passes a mask, but
+    relevant to a future ragged-batch path.
     """
 
     def __init__(self, *, in_channels: int, embedding_dim: int,
@@ -311,29 +264,23 @@ def _make_expand_norm(norm: str, channels: int, groups: int) -> nn.Module:
 
 
 class WaveNetEncoder(nn.Module):
-    """``(B, 2, L_ref) -> (B, embedding_dim)``.
+    """(B, 2, L_ref) -> (B, embedding_dim).
 
-    ``normalize`` L2-projects the embedding onto the unit sphere (the interface
-    contract's toggle, §2). Off by default so the module stays neutral, but the
-    joint configs turn it **on**, and that is not a stylistic choice: nothing else
-    bounds ``|e|``, and inflating it is a cheap early way for the reconstruction
-    gradient to grow the generator's FiLM gain. Left free at lr 4e-3 this diverged
-    on a fixed batch at ~step 500 — ``|e|`` reached 123, the generator's tanh
-    saturated, and true vs. shuffled embeddings rendered *identically* (ESR ratio
-    1.0, i.e. total collapse). Init is not the problem (``|e|`` starts near 3.7,
-    comparable to the 1.6 of the table this replaces); the runaway is learned.
-    Normalizing removes the direction rather than merely avoiding it.
+    normalize L2-projects e onto the unit sphere. Off by default so the module
+    stays neutral, but joint configs turn it on: nothing else bounds |e|, and
+    an unbounded |e| is a cheap way for the reconstruction gradient to grow
+    the generator's FiLM gain until it saturates and conditioning collapses.
+    Normalizing removes the direction rather than merely discouraging it.
 
-    ``grad_checkpoint`` recomputes each layer's activations during backward
-    instead of storing them. A WaveNet never downsamples, so a 2 s reference stays
-    96 000 frames wide through all 23 layers; this is the escape hatch when that
-    does not fit alongside the generator. It wraps the layer array only — the
-    multitap head decimates by ``tap_stride`` before it does anything expensive.
+    grad_checkpoint recomputes each layer's activations in backward instead of
+    storing them -- a WaveNet never downsamples, so a reference stays full
+    width through all 23 layers; this is the escape hatch when that doesn't
+    fit alongside the generator. Wraps the layer array only (multitap's
+    tap_stride already handles the expensive part).
 
-    ``head`` picks the pooling head; see :class:`MultiTapStatsHead` for why
-    ``"multitap"`` exists. The heads have disjoint parameters, so a checkpoint
-    written under one cannot be loaded under the other — ``enc_head`` is
-    structural, and ``train.py`` treats it that way.
+    head picks the pooling head (see MultiTapStatsHead). The two heads have
+    disjoint parameters, so a checkpoint from one cannot load under the other
+    -- enc_head is structural, and train.py treats it that way.
     """
 
     def __init__(self, *, embedding_dim: int, in_channels: int = 2,

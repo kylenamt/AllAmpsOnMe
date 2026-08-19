@@ -1,37 +1,25 @@
 """Conditioning from a frozen audio codec's fingerprint, looked up by device id.
 
-Same interface contract as :class:`~openamp.joint_model.wavenet_encoder.WaveNetEncoder`
-— ``.embedding_dim``, ``__call__(ref, mask)``, ``.pooled_dim``, ``.capacity_report()``
-— so :class:`~openamp.joint_model.model.JointModel` drives it unchanged. Only where
-the pooled vector comes from changes: a frozen codec's pooled latent over the whole
-171 s capture signal, instead of a trained WaveNet backbone's pool over a 2 s window.
+Same interface contract as WaveNetEncoder (.embedding_dim, __call__(ref, mask),
+.pooled_dim, .capacity_report()), so JointModel drives it unchanged. Only the
+pooled vector's source differs: a frozen codec's pooled latent over the whole
+capture signal, instead of a trained WaveNet backbone's pool over a short window.
 
-**Why a lookup and not an on-the-fly encode.** A codec fingerprint is a statistic over
-frames, and short audio makes it a noisy one. Measured on 450 amps with DAC, matching
-an amp to itself against 449 competitors (sibling captures excluded):
+Lookup, not on-the-fly encoding: a codec fingerprint needs long audio to be a
+reliable statistic (DAC own-nearest accuracy drops from 99.8% at 85s to 17.8%
+at 12s), well above a joint reference window's 2-6s. The fingerprint is
+precomputed once per amp by scripts/encode_fingerprints.py and looked up here;
+joint.ref_seconds and the reference-disjointness machinery are inert under
+this encoder -- there is no reference window to draw.
 
-    audio per side   85 s   43 s   22 s   12 s
-    own-nearest      99.8%  88.7%  61.1%  17.8%
+The fingerprint is a buffer, not a parameter: nn.Module.parameters() returns
+only the adapter, so the codec is frozen by construction and the joint
+trainer's "encoder" optimizer group means exactly "the adapter".
 
-A joint reference window is 2-6 s, an order of magnitude below where this becomes
-reliable, so encoding one on the fly would condition the generator on noise. The
-fingerprint is therefore precomputed once per amp from the full capture render by
-``scripts/encode_fingerprints.py`` and looked up here. ``joint.ref_seconds`` and the
-reference-disjointness machinery are inert under this encoder — there is no reference
-window to draw.
-
-**The fingerprint is a buffer, not a parameter.** ``nn.Module.parameters()`` therefore
-returns only the adapter, which is what makes the codec frozen by construction rather
-than by a ``requires_grad_(False)`` somebody can forget, and what makes the joint
-trainer's ``"encoder"`` optimizer group mean exactly "the adapter".
-
-**Rows are keyed by device id, over every amp in the npz — including held-out ones.**
-That is deliberate and it is not leakage: the training dataset only ever draws training
-ids, and a buffer cannot receive gradient in any case. Keying by id rather than by the
-run's ``id_to_idx`` row is what lets a held-out amp be conditioned at evaluation with no
-table swap (contrast ``emulate.enroll._swap_embedding``, which must install a new table
-because trained rows exist only for seen devices — here nothing is per-device trained,
-so there is nothing to swap).
+Rows are keyed by device id over every amp in the npz, including held-out
+ones -- not leakage, since the training dataset only ever draws training ids
+and a buffer can't receive gradient. Keying by id (not the run's id_to_idx)
+is what lets a held-out amp be conditioned at evaluation with no table swap.
 """
 
 from __future__ import annotations

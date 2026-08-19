@@ -1,0 +1,13 @@
+enroll:
+  pairs: 1000              # training pairs per device per epoch (optimization budget)
+  epochs: 30                # max epochs; early-stopped on val ESR
+  lr: 0.01
+  early_stop_patience: 5
+  plateau_patience: 2       # ReduceLROnPlateau patience (epochs)
+  plateau_factor: 0.5
+  test_pairs: 200            # test pairs per device, for the final test ESR
+  stft_weight: null          # null = keep the run's own trained value
+  batch_size: 16              # fp32 fit needs ~2x the run's own training memory; 12 GB
+                              # card OOMs at the run's batch 32 -- see enroll.enroll
+  init: uniform              # "uniform" | "table_mean"
+  seed: null                 # null = use the top-level seed

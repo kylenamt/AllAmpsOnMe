@@ -1,9 +1,5 @@
-"""One configuration object for the whole pipeline.
-
-- **API access** (key, base URL, token path, rate limit): environment / git-ignored ``.env`` (``OPENAMP_*``).
-- **Pipeline knobs** (corpus, render, model, train, eval): ``configs/openamp.yaml``; ``model``/``train``/``eval`` are nested sub-sections.
-- **Every path** derives from one ``data_dir`` (inputs/manifests/renders) + one ``results_dir`` (reports/checkpoints); a run is fully reproducible from the single ``seed``.
-- ``load_config()`` merges ``.env`` + yaml into a :class:`Config`.
+"""One configuration object for the whole pipeline: env/.env for API access,
+configs/openamp.yaml for pipeline knobs, one data_dir/results_dir for all paths.
 """
 
 from __future__ import annotations
@@ -20,7 +16,7 @@ log = logging.getLogger("openamp.config")
 # --- Fixed API facts -----------------------------------------------------------
 DEFAULT_BASE_URL = "https://www.tone3000.com/api/v1"
 DEFAULT_REDIRECT_URI = "http://localhost:3001"
-DEFAULT_RATE_LIMIT_RPM = 80          # sit under the server's 100 req/min
+DEFAULT_RATE_LIMIT_RPM = 80          # stay under the server's 100 req/min
 DEFAULT_SEED = 1234
 SELECT_TARGET = 430                  # headroom over 400 for validation/dedup losses
 FINAL_TARGET = 400
@@ -34,74 +30,41 @@ class ConfigError(RuntimeError):
 # --- Nested pipeline sections (yaml) -------------------------------------------
 @dataclass
 class EmulateConfig:
-    """One-to-many amp emulation: FiLM-conditioned model + its training (spec §4).
+    """One-to-many amp emulation: model architecture + its training.
 
-    - Self-contained sub-pipeline: every architecture size is a plain knob here, so
-      exploring sizes is copy-a-config-and-change-numbers.
-    - Read from the ``emulate:`` yaml section; a per-run file under
-      ``configs/emulate/<name>.yaml`` overrides just this section, run named after
-      the file stem.
+    Read from the ``emulate:`` yaml section; ``configs/emulate/<name>.yaml``
+    overrides just this section, run named after the file stem.
     """
 
-    # --- Architecture ------------------------------------------------------------
-    # "film_tcn" paper FiLM-TCN | "film_wavenet" corpus's own NAM A2 WaveNet
-    # topology, FiLM-conditioned | "mlpfilm_wavenet" same A2 topology, small-MLP
-    # FiLM generator | "delta_wavenet" same A2 topology, no FiLM: embedding writes
-    # a low-rank residual onto each layer's conv weights | "tabledelta_wavenet"
-    # that residual free and per-device rather than low-rank (the full-rank
-    # control; derives its own embedding_dim, has no capacity knob, and cannot be
-    # enrolled). See emulate/wavenet.py.
+    # Model architecture, see emulate/wavenet.py:
+    # film_tcn | film_wavenet | mlpfilm_wavenet | delta_wavenet | tabledelta_wavenet
+    # (tabledelta_wavenet has no shared embedding space -> cannot be enrolled)
     arch: str = "film_tcn"
 
-    # --- FiLM-TCN model (fully parametric; paper default = values below) --------
+    # --- FiLM-TCN model ------------------------------------------------------------
     blocks: int = 2                  # dilation resets per block
     layers_per_block: int = 8
     channels: int = 16
     kernel_size: int = 3
     dilation_growth: int = 2
 
-    # --- FiLM-WaveNet model (kernel/dilation schedule is the fixed A2 one) ------
+    # --- FiLM-WaveNet model (NAM A2 kernel/dilation schedule) ----------------------
     wn_channels: int = 8             # A2 full-width value; the width sweep knob
-    # Per-layer nonlinearity: "leakyrelu" (slope 0.01, what every A2 capture uses)
-    # | "tanh" (NAM's other A2-schema activation, still plugin-playable). Validated
-    # in openamp/emulate/wavenet.py.
-    wn_activation: str = "leakyrelu"
+    wn_activation: str = "leakyrelu"   # "leakyrelu" | "tanh", both A2-schema
 
-    # --- MLP-FiLM WaveNet ("mlpfilm_wavenet"): the FiLM generator only -----------
-    # Hidden width of the per-layer embedding -> (gamma, beta) MLP (Linear(E,H) ->
-    # cond_activation -> Linear(H,2C), independent per layer). Ignored by film_tcn
-    # and film_wavenet. At embedding_dim 256 / wn_channels 8: 16 params-matches
-    # film_wavenet's single Linear (4,384 vs 4,112/layer), 32 is ~2x, 64 quadruples
-    # the plugin bundle.
-    cond_hidden: int = 32
-    # Nonlinearity inside that MLP: same two options as wn_activation. Parameter-
-    # free, so it's resume-structural (see train.py's _STRUCTURAL_KEYS).
+    # --- MLP-FiLM WaveNet: per-layer FiLM generator ---------------------------------
+    cond_hidden: int = 32            # generator MLP hidden width; ignored by film_tcn/film_wavenet
     cond_activation: str = "leakyrelu"
 
-    # --- Delta WaveNet ("delta_wavenet"): the weight-residual generator ----------
-    # Rank of the per-layer map from the device embedding to a residual on that
-    # layer's conv kernel, bias and mixin gain (delta = scale * coeff(e) @
-    # normalize(basis), one shared basis of `delta_rank` unit-norm directions).
-    # Arch's only capacity knob; ignored by the other archs. At embedding_dim 256 /
-    # wn_channels 8: 16,263 * delta_rank + 23 params — rank 6 params-matches
-    # film_wavenet's 23 Linears (97,601 vs 94,576), 8 is ~1.36x.
-    delta_rank: int = 8
+    # --- Delta WaveNet: embedding -> low-rank residual on each layer's kernel ------
+    delta_rank: int = 8              # capacity knob; ignored by the other archs
 
-    # --- Shared model knobs ------------------------------------------------------
-    # Per-device embedding, consumed at every layer. Ignored by tabledelta_wavenet,
-    # which derives its width from the schedule (a device's row is its whole
-    # weight residual).
-    embedding_dim: int = 64
-    # One-to-one baseline: >=0 trains a single-device model on that device_id
-    # (same class, n_devices=1), for the one-to-many gap reference.
-    single_device: int = -1
+    # --- Shared model knobs ----------------------------------------------------------
+    embedding_dim: int = 64          # per-device embedding, fed to every layer
+    single_device: int = -1          # >=0: one-to-one baseline trained on that device_id
 
-    # --- Training (one script; Adam + reduce-on-plateau to val plateau) ---------
-    # Fraction of render-ok devices held out of training entirely, so Phase 5 can
-    # enroll them as truly unseen (reference: 90/10 device split). Drawn once,
-    # persisted to `emulate_holdout.txt`; <= 0 disables. Not applied to
-    # `single_device`.
-    holdout_frac: float = 0.1
+    # --- Training (Adam + reduce-on-plateau) ------------------------------------------
+    holdout_frac: float = 0.1        # fraction of devices excluded from training (enrolled later, Phase 5)
     clip_seconds: float = 2.0        # training clip length (must match corpus grid)
     batch_size: int = 16
     pairs_per_epoch: int = 50_000    # dataset length: random (device, file, window) draws
@@ -115,114 +78,51 @@ class EmulateConfig:
     preemph: float = 0.85            # 1st-order pre-emphasis coefficient for ESR
     num_workers: int = 6
     amp: bool = True                 # CUDA mixed precision (STFT loss forced fp32)
-    amp_dtype: str = "fp16"          # "fp16" | "bf16"; bf16 has fp32's range (no overflow) at fp16's memory cost
+    amp_dtype: str = "fp16"          # "fp16" | "bf16"
     val_pairs: int = 2000            # #pairs used for each val-ESR estimate
     log_every: int = 50
 
 
-
-
 @dataclass
 class JointConfig:
-    """Encoder trained jointly with a FiLM generator (see joint_model/guidelines.md).
+    """Encoder trained jointly with a FiLM generator.
 
-    - Read from the ``joint:`` yaml section. A joint run reads **two** sections:
-      ``emulate:`` is the generator and every shared training knob (batch size,
-      epochs, learning rate, loss weights), and this holds only what is new. Same
-      "full copy, never a delta" rule as the other one.
-    - Two knobs deliberately do **not** live here, because duplicating them would
-      create a second source of truth for one number:
-      ``emulate.embedding_dim`` is the width of ``e`` (it is the generator's FiLM
-      input — the interface contract), and ``emulate.lr`` is the generator's
-      learning rate. Only the *encoder's* learning rate is new.
+    Read from the ``joint:`` yaml section. A joint run also reads ``emulate:``
+    for the generator + every shared training knob.
     """
 
-    # --- Conditioning source ------------------------------------------------------
-    # "wavenet" trains an encoder on a short (dry, wet) reference clip. "fingerprint"
-    # looks up a precomputed frozen-codec vector by device id, training only a small
-    # adapter onto it. The lookup exists because a codec fingerprint is a statistic
-    # over frames and needs ~85 s of audio to be reliable (measured own-nearest over
-    # 450 amps: 99.8% at 85 s, 61.1% at 22 s, 17.8% at 12 s) -- an order of magnitude
-    # more than a reference window holds. Under "fingerprint" the whole reference
-    # block below (ref_seconds, ref_different_file, ref_min_gap_seconds) is inert.
-    enc_kind: str = "wavenet"
-    # Fingerprint run directory holding pooled.npz + meta.json, as written by
-    # scripts/encode_fingerprints.py. Required under enc_kind "fingerprint".
-    fp_path: str = ""
-    # What happens to the pooled vector before the adapter. NO corpus statistics are
-    # permitted: every option uses either the single fixed dry vector (device -1, the
-    # same signal with no amp) or per-sample arithmetic.
-    #   "dry_l2"  subtract the dry null, then L2. Measured on the 450 DAC vectors,
-    #             dry subtraction drops mean pairwise cosine 0.886 -> 0.576: most of a
-    #             raw fingerprint is "what the codec does to this audio", not "what
-    #             this amp does". L2 then does for the fingerprint what enc_normalize
-    #             does for e. It discards ||fp - dry||, which is real amp information
-    #             (range 1.25-95.9) -- "dry" is the arm that keeps it.
-    #   "dry" | "l2" | "raw"
-    # Note a linear adapter's bias absorbs a pure shift, so "dry" alone differs from
-    # "raw" only when composed with fp_layernorm.
-    fp_preprocess: str = "dry_l2"
-    # LayerNorm(D_fp) as the adapter's first layer: per-sample, learned affine, no
-    # corpus statistics. Off by default because DAC's vector is mean + std
-    # concatenated, two halves on different scales that one LayerNorm would mix.
-    fp_layernorm: bool = False
+    # --- Conditioning source ---------------------------------------------------------
+    enc_kind: str = "wavenet"        # "wavenet": encode a (dry, wet) clip | "fingerprint": lookup by device id
+    fp_path: str = ""                # fingerprint run dir (pooled.npz); required if enc_kind="fingerprint"
+    fp_preprocess: str = "dry_l2"    # "dry_l2" (subtract dry null, L2) | "dry" | "l2" | "raw"
+    fp_layernorm: bool = False       # LayerNorm as the adapter's first layer
 
-    # --- Reference segment (window B) --------------------------------------------
-    # Length of the clip the encoder reads. Long enough that pooling averages
-    # content away, short enough to fit beside the generator on one card: a
-    # WaveNet never downsamples, so this length survives all 23 layers.
+    # --- Reference segment (window B) --------------------------------------------------
     ref_seconds: float = 2.0
-    # Draw window B from a different corpus file than window A. This is what stops
-    # the embedding carrying content instead of tone, and on a multi-file corpus it
-    # is free. Falls back to a gapped same-file draw when a split has one file.
-    ref_different_file: bool = True
+    ref_different_file: bool = True  # draw window B from a different file than window A (content vs tone)
     ref_min_gap_seconds: float = 1.0   # same-file fallback only
     sources: list = field(default_factory=list)   # [] = every source
 
-    # --- Encoder (see joint_model/wavenet_encoder.py) ----------------------------
-    # Pooling emits 2 * enc_channels numbers, so this — not embedding_dim — is the
-    # real bottleneck on what can be said about an amp. Guidelines §7 puts it at
-    # 16-32; 16 gives a 32-d pooled vector, still twice the spec's default width.
-    enc_channels: int = 16
-    enc_activation: str = "tanh"       # "leakyrelu" | "tanh", as wn_activation
+    # --- Encoder ---------------------------------------------------------------------
+    enc_channels: int = 16           # pooled width = 2 * enc_channels; the real embedding bottleneck
+    enc_activation: str = "tanh"       # "leakyrelu" | "tanh"
     enc_attn_hidden: int = 64          # attentive-pooling bottleneck
-    # Hidden width of the pooled -> embedding_dim projection. 0 = derive it as
-    # pooled_dim // 4, which is the only sane default once pooled_dim stops being
-    # a fixed 2*enc_channels.
-    enc_proj_hidden: int = 128
+    enc_proj_hidden: int = 128         # pooled -> embedding_dim projection width; 0 = derive as pooled_dim // 4
     enc_normalize: bool = False        # L2-project e onto the unit sphere
 
-    # --- Pooling head (see joint_model/wavenet_encoder.py) ------------------------
-    # "stats" is the original 2*enc_channels readout; "multitap" decouples pooled
-    # width from backbone width via taps + expansion + K attention heads. The two
-    # have disjoint parameters, so this is structural — a checkpoint written under
-    # one cannot load under the other.
-    enc_head: str = "stats"
+    # --- Pooling head ------------------------------------------------------------------
+    enc_head: str = "stats"            # "stats" | "multitap" -- structural, not checkpoint-compatible
     enc_taps: list = field(default_factory=lambda: [6, 13, 22])   # A2 dilation-run ends
-    enc_tap_stride: int = 8            # avg-pool before the head; memory, not modelling
+    enc_tap_stride: int = 8            # avg-pool before the head
     enc_expand_dim: int = 256          # E: pooled width is enc_n_heads * 2 * E
     enc_n_heads: int = 2               # K
-    # BatchNorm subtracts a dataset-level mean, so every per-amp deviation survives
-    # into the pool; "group" is batch-independent but subtracts a *per-sample* mean
-    # over time, which deletes the statistic the pool then measures.
-    enc_expand_norm: str = "batch"     # "batch" | "group" | "none"
+    enc_expand_norm: str = "batch"     # "batch": pools a per-amp deviation | "group": per-sample, destroys it
     enc_norm_groups: int = 32          # "group" only; clamped to divide enc_expand_dim
-    # Recompute encoder activations in backward instead of storing them: ~35%
-    # slower, ~2.2 GB cheaper at batch 16 / enc_channels 32.
-    grad_checkpoint_encoder: bool = False
+    grad_checkpoint_encoder: bool = False   # recompute activations in backward: slower, less memory
 
-    # --- Optimization -------------------------------------------------------------
-    # Separate from the generator's lr because the two halves are differently
-    # shaped and a dead encoder looks exactly like a working one from ESR alone
-    # (guidelines §9). Equal by default; lower this first if the encoder collapses.
-    enc_lr: float = 4.0e-3
-    # Weight decay for the encoder/adapter group only; < 0 inherits emulate.weight_decay.
-    # It exists for the fingerprint arm, whose deepest failure mode is memorization: a
-    # WaveNet encoder sees a *different* reference window on every draw, an implicit
-    # regularizer, whereas the adapter sees the identical vector for a given amp on
-    # every one of pairs_per_epoch draws. Shrinkage is the natural guard, and
-    # emulate.weight_decay is 3.17e-7, i.e. effectively none.
-    enc_weight_decay: float = -1.0
+    # --- Optimization ---------------------------------------------------------------
+    enc_lr: float = 4.0e-3             # separate from emulate.lr -- see joint_model/guidelines.md §9
+    enc_weight_decay: float = -1.0     # < 0 inherits emulate.weight_decay
 
     def __post_init__(self) -> None:
         if self.ref_seconds <= 0:
@@ -273,6 +173,27 @@ class JointConfig:
                               f"{(C.SOURCE_EGDB, C.SOURCE_SWEEP)}, got {bad}")
 
 
+@dataclass
+class EnrollConfig:
+    """Phase 5 enrollment: fit embeddings for unseen devices against a frozen run.
+
+    Read from the ``enroll:`` yaml section; passed to ``emulate-enroll --config``.
+    Run dir / ``--devices`` / ``--device`` stay CLI flags (what/where, not how).
+    """
+
+    pairs: int = 1000                 # training pairs per device per epoch (optimization budget)
+    epochs: int = 30                  # max epochs; early-stopped on val ESR
+    lr: float = 1e-2
+    early_stop_patience: int = 5
+    plateau_patience: int = 2         # ReduceLROnPlateau patience (epochs)
+    plateau_factor: float = 0.5
+    test_pairs: int = 200             # test pairs per device, for the final test ESR
+    stft_weight: float | None = None  # override the run's trained STFT loss weight (None = keep it)
+    batch_size: int | None = None     # override the run's batch size (fp32 fit needs ~2x memory; try 8-16)
+    init: str = "uniform"             # "uniform" | "table_mean" -- see _swap_embedding
+    seed: int | None = None           # override the top-level seed (None = use it)
+
+
 # --- The one config ------------------------------------------------------------
 @dataclass
 class Config:
@@ -283,14 +204,14 @@ class Config:
     seed: int = DEFAULT_SEED
     sample_rate: int = C.SAMPLE_RATE
 
-    # Corpus / render knobs (yaml ``corpus:`` / ``render:`` sections).
+    # Corpus / render knobs (yaml `corpus:` / `render:` sections).
     minutes_total: float = 40.0
     split_ratios: dict = field(default_factory=lambda: {"train": 0.8, "val": 0.1, "test": 0.1})
     clip_seconds: float = C.CLIP_SECONDS
     output_format: str = "flac"
     chunk_seconds: float = C.DEFAULT_CHUNK_SECONDS
 
-    # API access (environment / ``.env``).
+    # API access (environment / `.env`).
     publishable_key: str = ""
     base_url: str = DEFAULT_BASE_URL
     redirect_uri: str = DEFAULT_REDIRECT_URI
@@ -298,16 +219,12 @@ class Config:
     rate_limit_rpm: int = DEFAULT_RATE_LIMIT_RPM
     select_target: int = SELECT_TARGET
     final_target: int = FINAL_TARGET
-    # NAM capture architecture to acquire: 2 (A2, canonical) or 1 (legacy A1).
-    # Must go to BOTH `/tones/search` and `/models` -- `/models` defaults to A1
-    # and silently hands back A1 captures otherwise.
-    architecture: int = DEFAULT_ARCHITECTURE
+    architecture: int = DEFAULT_ARCHITECTURE   # NAM capture arch to acquire: 2 (A2) or 1 (legacy A1)
 
-    # Nested emulation sub-section (yaml).
+    # Nested sub-sections (yaml).
     emulate: EmulateConfig = field(default_factory=EmulateConfig)
-    # Nested tone-encoder sub-section (yaml).
-    # Nested joint encoder+generator sub-section (yaml).
     joint: JointConfig = field(default_factory=JointConfig)
+    enroll: EnrollConfig = field(default_factory=EnrollConfig)
 
     def __post_init__(self) -> None:
         self.data_dir = Path(self.data_dir)
@@ -434,14 +351,8 @@ class Config:
     def emulate_demos_dir(self) -> Path:
         return self.emulate_dir / "demos"
 
-    # --- Tone-encoder runs under results_dir ------------------------------------
-    # A separate tree from `emulate/`: encoder runs log a contrastive loss, not
-    # ESR, and the two must not end up in one comparison table (decisions.md §6 is
-    # the standing warning about cross-comparing metrics that share a name).
-    # --- Joint encoder+generator runs under results_dir -------------------------
-    # Its own tree again: a joint run logs ESR like `emulate/` does, but that ESR
-    # is conditioned on an encoder rather than a table, so the two numbers answer
-    # different questions and must not land in one comparison table.
+    # --- Joint encoder+generator runs under results_dir (own tree: ESR here is ---
+    # --- conditioned on an encoder, not directly comparable to emulate/'s) ------
     @property
     def joint_dir(self) -> Path:
         return self.results_dir / "joint"
@@ -461,11 +372,7 @@ def default_config_path(project_root: Path | None = None) -> Path:
 
 
 def _load_dotenv(path: Path) -> None:
-    """Minimal, dependency-free ``.env`` loader.
-
-    - Only sets keys not already in ``os.environ`` (the real environment wins).
-    - Supports ``KEY=VALUE`` lines, ``#`` comments, optional surrounding quotes.
-    """
+    """Minimal .env loader: KEY=VALUE lines, # comments, real env wins."""
     if not path.is_file():
         return
     try:
@@ -508,11 +415,10 @@ def _read_yaml(path: Path) -> dict:
 
 def load_config(path: Path | None = None, *, data_dir: Path | None = None,
                 require_key: bool = False) -> Config:
-    """Build the one :class:`Config` from ``.env`` + ``configs/openamp.yaml``.
+    """Build the one Config from .env + configs/openamp.yaml.
 
-    - ``data_dir`` overrides the yaml/env data root (used by tests).
-    - ``require_key`` raises if the API key is absent (stages that call the API
-      set it; metadata-only stages can run without it).
+    ``data_dir`` overrides the yaml/env data root (used by tests). ``require_key``
+    raises if the API key is absent (metadata-only stages can run without it).
     """
     _load_dotenv(Path.cwd() / ".env")
 
@@ -537,13 +443,14 @@ def load_config(path: Path | None = None, *, data_dir: Path | None = None,
     if data_dir is None:
         data_dir = Path(os.environ.get("OPENAMP_DATA_DIR", y.get("data_dir") or "./data"))
 
-    # Override only what a source (yaml/env) actually provides; defaults live once
-    # on the dataclass fields above. A key lands in ``kw`` only when present.
+    # A key lands in kw only when a source (yaml/env) actually provides it;
+    # defaults live once on the dataclass fields above.
     kw: dict = {
         "data_dir": Path(data_dir).expanduser(),
         "publishable_key": key,
         "emulate": _coerce(EmulateConfig, y.get("emulate", {})),
         "joint": _coerce(JointConfig, y.get("joint", {})),
+        "enroll": _coerce(EnrollConfig, y.get("enroll", {})),
     }
 
     def _yaml(mapping: dict, name: str, dest: str, cast) -> None:
@@ -556,9 +463,8 @@ def load_config(path: Path | None = None, *, data_dir: Path | None = None,
 
     if y.get("results_dir"):
         kw["results_dir"] = Path(y["results_dir"]).expanduser()
-    # seed: env wins over yaml.
     _yaml(y, "seed", "seed", int)
-    _env("OPENAMP_SEED", "seed", int)
+    _env("OPENAMP_SEED", "seed", int)              # env wins over yaml
     _yaml(y, "sample_rate", "sample_rate", int)
     _yaml(corpus, "minutes_total", "minutes_total", float)
     _yaml(corpus, "split_ratios", "split_ratios", lambda d: {k: float(v) for k, v in d.items()})

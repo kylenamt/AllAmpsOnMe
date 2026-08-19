@@ -1,20 +1,14 @@
-# delta_a2_256 at the parameter-matched rank — the controlled half of the pair.
-# Run name is the file stem ("delta_a2_r6_256") -> results/emulate/delta_a2_r6_256/.
+# delta_a2_256 at the parameter-matched rank (97,601 params vs film_wavenet's
+# 94,576) -- the controlled half of the delta-vs-FiLM comparison. Run name =
+# file stem.
 #
 #   openamp emulate --config configs/emulate/delta_a2_r6_256.yaml --overfit           # sanity #1
 #   openamp emulate --config configs/emulate/delta_a2_r6_256.yaml --limit-devices 10  # mini-run
 #   openamp emulate --config configs/emulate/delta_a2_r6_256.yaml                     # full run
 #
-# Identical to delta_a2_256.yaml except delta_rank. At embedding_dim 256 /
-# wn_channels 8 the generators cost 16,263 * rank + 23 params, so rank 6 lands at 97,601
-# against film_wavenet's 23 Linears at 94,576 — +3.2%, the closest integer match
-# (rank 5 undershoots by 14%).
-# The delta against nam_a2_256 is then the conditioning *hook* (conv weights vs
-# per-channel output affine) at held capacity, with delta_a2_256 (rank 8, 1.36x)
-# on the other side to show what the extra capacity is worth. Same role as
-# mlpfilm_a2_h16_256 plays for mlpfilm_a2_256.
+# Identical to delta_a2_256.yaml except delta_rank.
 #
-# FULL copy of nam_a2.yaml semantics, not a delta — see delta_a2_256.yaml.
+# Full copy of nam_a2.yaml's numbers -- see delta_a2_256.yaml.
 
 emulate:
   # --- Model -------------------------------------------------------------------
@@ -30,16 +24,12 @@ emulate:
   batch_size: 32
   pairs_per_epoch: 50000
   epochs: 100              # NAM trainer.max_epochs; early-stop still ends it sooner
-  # NAM optimizer block, verbatim. Keep the decimal point: PyYAML resolves bare
-  # `4e-3` as a *string*, which reaches Adam untyped and dies at construction.
-  lr: 4.0e-3
+  lr: 4.0e-3                # keep the decimal point -- PyYAML reads bare 4e-3 as a string
   weight_decay: 3.17e-7
   plateau_patience: 3
   plateau_factor: 0.5
-  early_stop_patience: 15   # 8 burned attempt 1 while it was still recovering from a loss spike
-  # NAM's 5e-4 MRSTFT weight rescaled from its MSE term to this trainer's ESR term
-  # (ESR = MSE / mean(t^2); corpus renders sit at median mean(t^2) 0.0096).
-  stft_weight: 0.05
+  early_stop_patience: 15
+  stft_weight: 0.05         # NAM's MRSTFT weight, rescaled from MSE to this trainer's ESR term
   preemph: 0.85            # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
   num_workers: 6
   amp: true

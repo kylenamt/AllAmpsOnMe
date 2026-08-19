@@ -1,49 +1,17 @@
-# delta_a2_r32_512 with the per-layer nonlinearity switched to tanh — one knob
-# moved against the current best run, so the result is attributable.
-# Run name is the file stem ("delta_a2_tanh_r32_512") -> results/emulate/delta_a2_tanh_r32_512/.
+# delta_a2_r32_512 with the per-layer nonlinearity switched to tanh -- one
+# knob moved against delta_a2_r32_512, so the result is attributable. Run
+# name = file stem.
 #
 #   openamp emulate --config configs/emulate/delta_a2_tanh_r32_512.yaml --overfit           # sanity #1
 #   openamp emulate --config configs/emulate/delta_a2_tanh_r32_512.yaml --limit-devices 10  # mini-run
 #   openamp emulate --config configs/emulate/delta_a2_tanh_r32_512.yaml                     # full run
 #
-# The question. On the FiLM hook, tanh is the single cleanest win in the sweep so
-# far — nam_a2_tanh_256 differs from nam_a2_256 in exactly this one line:
+# tanh is NAM's other A2-schema activation (parameter-free, still
+# plugin-playable). wn_activation is resume-structural (train.py's
+# _STRUCTURAL_KEYS), which is why this is its own run dir rather than a flag
+# on delta_a2_r32_512.
 #
-#   run                    activation   best_val_esr
-#   nam_a2_256             leakyrelu    0.0876
-#   nam_a2_tanh_256        tanh         0.0796    (-9.1%, one knob)
-#
-# That gain was measured on the *FiLM* hook at E=256, where conditioning enters as
-# a per-layer (gamma, beta) on the activations. The delta hook conditions the conv
-# weights instead, and it has since moved the numbers far more than tanh did:
-#
-#   run                gen params   DOF   best_val_esr
-#   delta_a2_256       130,127      184   0.0639
-#   delta_a2_r16_256   260,231      256   0.0469
-#   delta_a2_r32_512   708,855      512   0.0374   <- this run's control
-#   this run           708,855      512   ?
-#
-# So the open question is whether the two are additive. tanh's benefit on the FiLM
-# hook plausibly came from bounding a signal path that leakyrelu lets run away;
-# the delta hook already reshapes the kernel per device, which may absorb the same
-# headroom and leave tanh with nothing to add — or tanh may compound, since a
-# bounded per-layer nonlinearity is exactly what a *capture-native* A2 topology is
-# modelling. A null result is informative here: it says the ladder's remaining
-# error is in the conditioning bandwidth, not the nonlinearity.
-#
-# Attribution. This is a genuine one-knob control against delta_a2_r32_512 — same
-# rank, same embedding width, same optimizer block, same seed. Any difference in
-# best_val_esr is the activation. (Contrast delta_a2_r32_512 itself, which moved
-# rank *and* embedding at once and so only supports a joint claim.)
-#
-# Cost. tanh is parameter-free: identical param count, identical bundle size, and
-# still plugin-playable — it is NAM's other A2-schema activation, so export still
-# ships a stock A2 capture. Expect ~10.4 h, the same as the control. Note that
-# wn_activation is resume-structural (train.py's _STRUCTURAL_KEYS): it cannot be
-# flipped on a --resume of an existing run, which is why this is its own run dir.
-#
-# FULL copy of delta_a2_r32_512.yaml, not a delta — see delta_a2_256.yaml for why
-# every value is repeated here.
+# Full copy of delta_a2_r32_512.yaml's numbers -- see delta_a2_256.yaml.
 
 emulate:
   # --- Model -------------------------------------------------------------------
@@ -59,19 +27,14 @@ emulate:
   clip_seconds: 2.0        # must match the corpus clip grid
   batch_size: 32
   pairs_per_epoch: 50000
-  epochs: 150              # was 100; extending +50 from the epoch-99 finish, hand-annealed below
-  # NAM optimizer block, verbatim. Keep the decimal point: PyYAML resolves bare
-  # `4e-3` as a *string*, which reaches Adam untyped and dies at construction.
-  lr: 1.25e-4               # hand-annealed to match train_log.csv's last lr (was 4.0e-3);
-                             # --resume applies config lr verbatim, so leaving 4e-3 here
-                             # would undo 74 epochs of ReduceLROnPlateau annealing
+  epochs: 150              # this run's total budget (started at 100, extended +50)
+  lr: 1.25e-4                # ReduceLROnPlateau's annealed value partway through this
+                              # run's training, not the initial 4.0e-3 -- see train_log.csv
   weight_decay: 3.17e-7
   plateau_patience: 3
   plateau_factor: 0.5
-  early_stop_patience: 15   # 8 burned delta_a2_256 attempt 1 mid-recovery from a loss spike
-  # NAM's 5e-4 MRSTFT weight rescaled from its MSE term to this trainer's ESR term
-  # (ESR = MSE / mean(t^2); corpus renders sit at median mean(t^2) 0.0096).
-  stft_weight: 0.05
+  early_stop_patience: 15
+  stft_weight: 0.05         # NAM's MRSTFT weight, rescaled from MSE to this trainer's ESR term
   preemph: 0.85            # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
   num_workers: 6
   amp: true
