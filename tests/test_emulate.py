@@ -1,4 +1,4 @@
-"""Emulation models (FiLM-TCN + A2 FiLM-WaveNet): receptive field / causality /
+"""Emulation models (the A2 FiLM-WaveNet family): receptive field / causality /
 conditioning, arch dispatch, training-pair construction (alignment + real
 left-context warmup), losses, and the size-comparison CSV.
 
@@ -13,10 +13,10 @@ torch = pytest.importorskip("torch")
 
 from openamp.core.config import EmulateConfig, load_config
 from openamp.emulate.models import build_model
-from openamp.emulate.tcn import FiLMTCN, count_parameters
 from openamp.emulate.wavenet import (A2_DILATIONS, A2_KERNEL_SIZES, DeltaWaveNet,
                                      DeltaWaveNetLayer, FiLMWaveNet, MLPFiLMWaveNet,
-                                     TableDeltaWaveNet, film_output_linear)
+                                     TableDeltaWaveNet, count_parameters,
+                                     film_output_linear)
 
 # A shrunken A2-shaped schedule shared by the weight-conditioned arch tests.
 SMALL_SCHEDULE = dict(kernel_sizes=(3, 3, 3), dilations=(1, 2, 4), head_kernel=4)
@@ -25,52 +25,6 @@ SMALL_SCHEDULE = dict(kernel_sizes=(3, 3, 3), dilations=(1, 2, 4), head_kernel=4
 # case below is parametrized over both: cond_hidden 0 = film_wavenet's single
 # Linear, > 0 = mlpfilm_wavenet's per-layer MLP.
 COND_HIDDEN = [0, 6]
-
-
-# --- Model ---------------------------------------------------------------------
-def test_receptive_field_matches_formula():
-    # paper default: 1 + 2 blocks * (k-1) * sum(1,2,4,...,128) = 1 + 2*2*255 = 1021
-    assert FiLMTCN.compute_receptive_field(2, 8, 3, 2) == 1021
-    m = FiLMTCN.from_config(EmulateConfig(), n_devices=5)
-    assert m.receptive_field == 1021
-
-
-def test_forward_shape_and_from_config():
-    m = FiLMTCN.from_config(EmulateConfig(channels=8, layers_per_block=4, blocks=1),
-                            n_devices=6)
-    x = torch.randn(3, 4000)
-    y = m(x, torch.tensor([0, 1, 2]))
-    assert y.shape == (3, 1, 4000)                    # [B, T] -> [B, 1, T], same length
-    assert y.shape[-1] == x.shape[-1]
-
-
-def test_causal_output_independent_of_future():
-    torch.manual_seed(0)
-    m = FiLMTCN(n_devices=2, blocks=1, layers_per_block=4, channels=8).eval()
-    R = m.receptive_field
-    x = torch.randn(1, 3000)
-    xb = x.clone(); xb[..., 2000:] += 5.0             # perturb only the future
-    ya = m(x, torch.tensor([0]))
-    yb = m(xb, torch.tensor([0]))
-    # samples before the perturbation (minus the receptive field) must be identical
-    assert torch.allclose(ya[..., :2000 - R], yb[..., :2000 - R], atol=1e-5)
-
-
-def test_conditioning_changes_output():
-    torch.manual_seed(0)
-    m = FiLMTCN(n_devices=4, blocks=1, layers_per_block=4, channels=8).eval()
-    x = torch.randn(1, 2000)
-    y0 = m(x, torch.tensor([0]))
-    y1 = m(x, torch.tensor([3]))
-    assert not torch.allclose(y0, y1)                 # the embedding actually steers
-
-
-def test_param_count_scales_with_config():
-    base = count_parameters(FiLMTCN.from_config(EmulateConfig(), n_devices=10))
-    wider = count_parameters(FiLMTCN.from_config(EmulateConfig(channels=32), n_devices=10))
-    bigger_emb = count_parameters(
-        FiLMTCN.from_config(EmulateConfig(embedding_dim=256), n_devices=10))
-    assert wider > base and bigger_emb > base
 
 
 # --- FiLM-WaveNet (the NAM A2 capture topology) ----------------------------------
@@ -575,7 +529,6 @@ def test_wavenet_activation_from_config_and_validation():
 
 
 def test_build_model_dispatches_on_arch():
-    assert isinstance(build_model(EmulateConfig(), 5), FiLMTCN)
     # `type is` not isinstance: MLPFiLMWaveNet subclasses FiLMWaveNet, so isinstance
     # would no longer distinguish the two archs.
     assert type(build_model(EmulateConfig(arch="film_wavenet"), 5)) is FiLMWaveNet
@@ -592,7 +545,7 @@ def test_build_model_dispatches_on_arch():
         build_model(EmulateConfig(arch="nope"), 5)
 
 
-def test_load_model_rebuilds_arch_and_defaults_legacy_to_tcn(tmp_path):
+def test_load_model_rebuilds_arch_from_the_checkpoint(tmp_path):
     from dataclasses import asdict
 
     from openamp.emulate.evaluate import load_model
@@ -607,16 +560,6 @@ def test_load_model_rebuilds_arch_and_defaults_legacy_to_tcn(tmp_path):
     assert isinstance(loaded, FiLMWaveNet)
     x = torch.randn(1, 500)
     assert torch.allclose(loaded(x, torch.tensor([1])), m(x, torch.tensor([1])))
-
-    # pre-arch checkpoint (no arch/wn_channels keys) must come back as a FiLM-TCN
-    legacy = asdict(EmulateConfig(channels=8, blocks=1, layers_per_block=2))
-    legacy.pop("arch"); legacy.pop("wn_channels")
-    t = FiLMTCN(n_devices=2, channels=8, blocks=1, layers_per_block=2)
-    run2 = tmp_path / "legacy"; run2.mkdir()
-    torch.save({"model": t.state_dict(), "emulate_cfg": legacy,
-                "device_ids": [7, 9]}, run2 / "checkpoint.pt")
-    loaded2, _ = load_model(run2)
-    assert isinstance(loaded2, FiLMTCN)
 
     # a pre-mlpfilm film_wavenet checkpoint (no cond_* keys) must still rebuild
     # with the linear generator, whatever EmulateConfig now defaults cond_hidden to
@@ -976,7 +919,7 @@ def _tiny_run(cfg, tmp_path, device_ids, *, clip):
     """A saved checkpoint over ``device_ids`` (tiny net) -> its run dir."""
     from dataclasses import asdict
 
-    ecfg = EmulateConfig(blocks=1, layers_per_block=2, channels=4, embedding_dim=8,
+    ecfg = EmulateConfig(arch="film_wavenet", wn_channels=4, embedding_dim=8,
                          clip_seconds=clip / cfg.sample_rate, batch_size=4,
                          num_workers=0)
     torch.manual_seed(0)
@@ -1052,7 +995,7 @@ def test_enroll_end_to_end(tmp_path):
     _build_corpus(cfg, files, devices=[0, 1, 2, 3])   # identity renders, all splits
 
     torch.manual_seed(0)
-    ecfg = EmulateConfig(blocks=1, layers_per_block=2, channels=4, embedding_dim=8,
+    ecfg = EmulateConfig(arch="film_wavenet", wn_channels=4, embedding_dim=8,
                          clip_seconds=clip / cfg.sample_rate, batch_size=4,
                          num_workers=0, val_pairs=8, log_every=10**9)
     m = build_model(ecfg, 2).eval()                   # trained table = devices [0, 1]
@@ -1100,7 +1043,7 @@ def test_swap_embedding_init_modes():
     """New rows start at the trainer's own init scale by default, not the mean."""
     from openamp.emulate.enroll import ENROLL_INIT_A, _swap_embedding
 
-    ecfg = EmulateConfig(blocks=1, layers_per_block=2, channels=4, embedding_dim=8,
+    ecfg = EmulateConfig(arch="film_wavenet", wn_channels=4, embedding_dim=8,
                          num_workers=0)
     dev = torch.device("cpu")
 
@@ -1243,7 +1186,7 @@ def test_enroll_pair_end_to_end(tmp_path):
     cfg = load_config(data_dir=tmp_path)
     clip = 8192                                        # >= the largest STFT window
     torch.manual_seed(0)
-    ecfg = EmulateConfig(blocks=1, layers_per_block=2, channels=4, embedding_dim=8,
+    ecfg = EmulateConfig(arch="film_wavenet", wn_channels=4, embedding_dim=8,
                          clip_seconds=clip / cfg.sample_rate, batch_size=4,
                          num_workers=0, val_pairs=8, log_every=10**9)
     m = build_model(ecfg, 2).eval()
@@ -1293,7 +1236,7 @@ def test_enroll_pair_batch_size_overrides_the_runs_value(tmp_path):
     cfg = load_config(data_dir=tmp_path)
     clip = 8192
     torch.manual_seed(0)
-    ecfg = EmulateConfig(blocks=1, layers_per_block=2, channels=4, embedding_dim=8,
+    ecfg = EmulateConfig(arch="film_wavenet", wn_channels=4, embedding_dim=8,
                          clip_seconds=clip / cfg.sample_rate, batch_size=4,
                          num_workers=0, val_pairs=8, log_every=10**9)
     m = build_model(ecfg, 2).eval()

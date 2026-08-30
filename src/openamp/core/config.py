@@ -37,23 +37,16 @@ class EmulateConfig:
     """
 
     # Model architecture, see emulate/wavenet.py:
-    # film_tcn | film_wavenet | mlpfilm_wavenet | delta_wavenet | tabledelta_wavenet
+    # film_wavenet | mlpfilm_wavenet | delta_wavenet | tabledelta_wavenet
     # (tabledelta_wavenet has no shared embedding space -> cannot be enrolled)
-    arch: str = "film_tcn"
-
-    # --- FiLM-TCN model ------------------------------------------------------------
-    blocks: int = 2                  # dilation resets per block
-    layers_per_block: int = 8
-    channels: int = 16
-    kernel_size: int = 3
-    dilation_growth: int = 2
+    arch: str = "film_wavenet"
 
     # --- FiLM-WaveNet model (NAM A2 kernel/dilation schedule) ----------------------
     wn_channels: int = 8             # A2 full-width value; the width sweep knob
     wn_activation: str = "leakyrelu"   # "leakyrelu" | "tanh", both A2-schema
 
     # --- MLP-FiLM WaveNet: per-layer FiLM generator ---------------------------------
-    cond_hidden: int = 32            # generator MLP hidden width; ignored by film_tcn/film_wavenet
+    cond_hidden: int = 32            # generator MLP hidden width; ignored by film_wavenet
     cond_activation: str = "leakyrelu"
 
     # --- Delta WaveNet: embedding -> low-rank residual on each layer's kernel ------

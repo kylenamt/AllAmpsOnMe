@@ -42,7 +42,7 @@ import torch.nn.functional as F
 
 from openamp.core.config import Config
 from openamp.emulate.dataset import manifest_signature
-from openamp.emulate.tcn import count_parameters
+from openamp.emulate.wavenet import count_parameters
 from openamp.emulate.train import (GRAD_CLIP_NORM, EmulationLoss, _device_index,
                                    _make_loader, device_loss_weights, pre_emphasis)
 from openamp.joint_model.dataset import JointDataset

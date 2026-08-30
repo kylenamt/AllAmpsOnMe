@@ -34,7 +34,7 @@ from openamp.emulate.dataset import (EmulationDataset, build_device_index,
                                      load_or_create_holdout, manifest_signature,
                                      render_ok_devices)
 from openamp.emulate.models import arch_summary, build_model
-from openamp.emulate.tcn import count_parameters
+from openamp.emulate.wavenet import count_parameters
 
 # Safety net for loss spikes, not a training knob: healthy grad norms on this
 # model sit at p50~4, p90~7, so 20 leaves normal steps untouched.
@@ -554,8 +554,7 @@ def _save_config_copy(run_dir: Path, ecfg) -> None:
 # ``wn_activation``/``cond_activation`` are here despite changing no shape: both
 # are parameter-free, so a swap would load cleanly and quietly play a different
 # network than the weights were trained for.
-_STRUCTURAL_KEYS = ("arch", "blocks", "layers_per_block", "channels", "kernel_size",
-                    "dilation_growth", "wn_channels", "wn_activation",
+_STRUCTURAL_KEYS = ("arch", "wn_channels", "wn_activation",
                     "cond_hidden", "cond_activation", "delta_rank",
                     "embedding_dim", "single_device", "embed_normalize")
 

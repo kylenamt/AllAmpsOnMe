@@ -1,28 +1,26 @@
-# Smoke run: paper model, 10 devices, short epochs. Validates the fixed ESR
-# (energy-weighted pooling) and the val_esr_shuffled conditioning control before
-# committing to a full run. Model block is identical to paper.yaml; only the
-# training schedule is shortened.
+# Smoke run: the A2 FiLM-WaveNet at its default width, 10 devices, short epochs.
+# Validates the loop, the energy-weighted ESR and the val_esr_shuffled
+# conditioning control before committing to a full run.
 #
 #   openamp emulate --config configs/emulate/smoke10.yaml --limit-devices 10
 #
 # Run name is the file stem ("smoke10") -> results/emulate/smoke10/.
+#
+# Was a film_tcn config until that arch was retired; the training schedule is
+# unchanged, so smoke timings before and after are not comparable.
 
 emulate:
-  # --- Model (identical to paper.yaml) ----------------------------------------
-  blocks: 2
-  layers_per_block: 8
-  channels: 16
-  kernel_size: 3
-  dilation_growth: 2
+  # --- Model -------------------------------------------------------------------
+  arch: film_wavenet
+  wn_channels: 8           # A2 full-width submodel
   embedding_dim: 64
-  single_device: -1
 
-  # --- Training (shortened; paper values in comments) --------------------------
+  # --- Training (shortened) ------------------------------------------------------
   holdout_frac: 0.1        # device holdout for Phase 5 enrollment (emulate_holdout.txt)
   clip_seconds: 2.0
   batch_size: 16
-  pairs_per_epoch: 20000   # paper: 50000
-  epochs: 15               # paper: 60
+  pairs_per_epoch: 20000
+  epochs: 15
   lr: 5.0e-4
   weight_decay: 0.0
   plateau_patience: 3

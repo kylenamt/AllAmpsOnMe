@@ -7,11 +7,13 @@ same-length causal, the same forward on a given vector as
 ``forward_emb(x, emb)``, an integer ``receptive_field`` property, an
 ``embedding`` table, and construction from ``(EmulateConfig, n_devices)``.
 Adding an architecture = one class honoring that contract + one branch here.
+
+Every arch shares the NAM A2 topology; they differ only in how the device
+embedding reaches each layer.
 """
 
 from __future__ import annotations
 
-from openamp.emulate.tcn import FiLMTCN
 from openamp.emulate.wavenet import (A2_ACTIVATION, A2_COND_ACTIVATION, A2_DILATIONS,
                                      DELTA_PART_NAMES, DELTA_PARTS_ALL, DeltaWaveNet,
                                      FiLMWaveNet, MLPFiLMWaveNet, TableDeltaWaveNet,
@@ -19,25 +21,17 @@ from openamp.emulate.wavenet import (A2_ACTIVATION, A2_COND_ACTIVATION, A2_DILAT
 
 __all__ = ["build_model", "arch_summary"]
 
-ARCHS = ("film_tcn", "film_wavenet", "mlpfilm_wavenet", "delta_wavenet",
-         "tabledelta_wavenet")
-
-# The A2-topology archs: same shape and same fold contract, differing only in how
-# the device embedding reaches each layer.
-WAVENET_ARCHS = ("film_wavenet", "mlpfilm_wavenet", "delta_wavenet",
-                 "tabledelta_wavenet")
+ARCHS = ("film_wavenet", "mlpfilm_wavenet", "delta_wavenet", "tabledelta_wavenet")
 
 # Archs whose conditioning is a *shared* map from one embedding space, so an unseen
 # device can be enrolled by finding its point in that space. tabledelta_wavenet is
 # excluded on purpose: its "embedding" is a per-device weight blob with no shared
 # structure to position a new amp within (see enroll.require_enrollable).
-ENROLLABLE_ARCHS = ("film_tcn", "film_wavenet", "mlpfilm_wavenet", "delta_wavenet")
+ENROLLABLE_ARCHS = ("film_wavenet", "mlpfilm_wavenet", "delta_wavenet")
 
 
 def build_model(ecfg, n_devices: int):
     """Construct the configured architecture from an ``EmulateConfig``."""
-    if ecfg.arch == "film_tcn":
-        return FiLMTCN.from_config(ecfg, n_devices)
     if ecfg.arch == "film_wavenet":
         return FiLMWaveNet.from_config(ecfg, n_devices)
     if ecfg.arch == "mlpfilm_wavenet":
@@ -79,18 +73,15 @@ def arch_summary(ecfg, model=None) -> dict:
       measures (``a2-23L-table-kernel``) and would otherwise be invisible in the
       CSV — two rows of the same run, evaluated differently, must not look alike.
     """
-    if ecfg.arch in WAVENET_ARCHS:
-        act = normalize_activation(ecfg.wn_activation)
-        suffix = "" if act == A2_ACTIVATION else f"-{act}"
-        if ecfg.arch == "mlpfilm_wavenet":
-            cact = normalize_activation(ecfg.cond_activation, field="cond_activation")
-            csuffix = "" if cact == A2_COND_ACTIVATION else f"-c{cact}"
-            suffix = f"-mlp{int(ecfg.cond_hidden)}{csuffix}{suffix}"
-        elif ecfg.arch == "delta_wavenet":
-            suffix = f"-delta{int(ecfg.delta_rank)}{suffix}"
-        elif ecfg.arch == "tabledelta_wavenet":
-            suffix = f"-table{_parts_tag(model)}{suffix}"
-        return {"arch": ecfg.arch, "channels": ecfg.wn_channels,
-                "blocks_x_layers": f"a2-{len(A2_DILATIONS)}L{suffix}"}
-    return {"arch": ecfg.arch, "channels": ecfg.channels,
-            "blocks_x_layers": f"{ecfg.blocks}x{ecfg.layers_per_block}"}
+    act = normalize_activation(ecfg.wn_activation)
+    suffix = "" if act == A2_ACTIVATION else f"-{act}"
+    if ecfg.arch == "mlpfilm_wavenet":
+        cact = normalize_activation(ecfg.cond_activation, field="cond_activation")
+        csuffix = "" if cact == A2_COND_ACTIVATION else f"-c{cact}"
+        suffix = f"-mlp{int(ecfg.cond_hidden)}{csuffix}{suffix}"
+    elif ecfg.arch == "delta_wavenet":
+        suffix = f"-delta{int(ecfg.delta_rank)}{suffix}"
+    elif ecfg.arch == "tabledelta_wavenet":
+        suffix = f"-table{_parts_tag(model)}{suffix}"
+    return {"arch": ecfg.arch, "channels": ecfg.wn_channels,
+            "blocks_x_layers": f"a2-{len(A2_DILATIONS)}L{suffix}"}

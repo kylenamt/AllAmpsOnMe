@@ -5,7 +5,6 @@ The model learns the forward amp *transfer function*, conditioned on a learnable
 per-device embedding; architecture and sizes are config-driven (``emulate.arch``
 + knobs), so trying variants is a one-line job.
 
-- :mod:`openamp.emulate.tcn`      — the fully-parametric FiLM-TCN model.
 - :mod:`openamp.emulate.wavenet`  — the NAM A2 WaveNet topology, FiLM-conditioned
   (linear FiLM generator), its MLP-generator variant, and the weight-delta variant
   that conditions the conv kernels themselves instead of FiLM.

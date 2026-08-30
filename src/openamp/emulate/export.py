@@ -19,7 +19,7 @@
 - All three A2 archs export (film_wavenet, mlpfilm_wavenet, delta_wavenet),
   discriminated by arch.type. Each non-legacy arch omits film_w/film_b, so a
   reader that predates the arch fails on a missing key instead of folding garbage.
-- WaveNet-only: the plugin ships the A2 topology, so exporting film_tcn is a hard error.
+- WaveNet-only: the plugin ships the A2 topology.
 """
 
 from __future__ import annotations

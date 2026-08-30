@@ -55,16 +55,17 @@ def test_corpus_and_render_from_yaml(tmp_path):
 def test_emulate_defaults_and_overrides(tmp_path):
     cfg = load_config(tmp_path / "missing.yaml", data_dir=tmp_path)
     assert isinstance(cfg.emulate, EmulateConfig)
-    assert cfg.emulate.channels == 16
+    assert cfg.emulate.arch == "film_wavenet"
+    assert cfg.emulate.wn_channels == 8
     assert cfg.emulate.embedding_dim == 64
 
     p = tmp_path / "openamp.yaml"
     p.write_text(
-        "emulate:\n  channels: 32\n  embedding_dim: 256\n  batch_size: 8\n",
+        "emulate:\n  wn_channels: 16\n  embedding_dim: 256\n  batch_size: 8\n",
         encoding="utf-8",
     )
     cfg = load_config(p, data_dir=tmp_path)
-    assert cfg.emulate.channels == 32 and cfg.emulate.embedding_dim == 256
+    assert cfg.emulate.wn_channels == 16 and cfg.emulate.embedding_dim == 256
     assert cfg.emulate.batch_size == 8
 
 

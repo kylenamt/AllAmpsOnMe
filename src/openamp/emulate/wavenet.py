@@ -23,7 +23,7 @@ from torch import nn
 __all__ = ["FiLMWaveNet", "MLPFiLMWaveNet", "DeltaWaveNet", "TableDeltaWaveNet",
            "MLPFiLM", "DeltaWeightGen", "film_output_linear", "init_film_identity",
            "init_delta_zero", "per_sample_conv1d", "make_activation",
-           "normalize_activation", "NormalizedEmbedding",
+           "normalize_activation", "NormalizedEmbedding", "count_parameters",
            "ACTIVATIONS", "NAM_ACTIVATION_NAMES", "A2_KERNEL_SIZES", "A2_DILATIONS",
            "A2_HEAD_KERNEL", "A2_ACTIVATION", "A2_COND_HIDDEN", "A2_COND_ACTIVATION",
            "A2_DELTA_RANK", "A2_DELTA_SCALE_INIT", "DELTA_PARTS_ALL",
@@ -72,6 +72,11 @@ DELTA_PART_NAMES = ("kernel", "bias", "mixin")
 
 
 # --- General-purpose helpers, shared by every arch below -----------------------
+
+def count_parameters(module: nn.Module) -> int:
+    """Trainable parameter count of ``module``."""
+    return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
 
 def normalize_activation(name: str, field: str = "wn_activation") -> str:
     """Validate + canonicalize an activation name; `field` names the config knob for errors."""
@@ -242,8 +247,8 @@ class FiLMWaveNetLayer(nn.Module):
 class FiLMWaveNet(NormalizedEmbedding, nn.Module):
     """Conditioned A2-WaveNet emulator: (audio, device_idx) -> emulated audio.
 
-    Same contract as FiLMTCN: input [B,T] or [B,1,T] mono @ 48kHz, device_idx a
-    [B] long tensor of embedding rows, output [B,1,T] causal.
+    Input is [B,T] or [B,1,T] mono @ 48kHz, device_idx a [B] long tensor of
+    embedding rows, output [B,1,T] causal.
     """
 
     def __init__(self, *, n_devices: int, channels: int = A2_CHANNELS,

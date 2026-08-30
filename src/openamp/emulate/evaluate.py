@@ -55,7 +55,6 @@ def load_model(run_dir: Path, device: str = "cpu"):
     device = _resolve_device(device)
     ck = torch.load(Path(run_dir) / "checkpoint.pt", map_location=device,
                     weights_only=False)
-    # Old checkpoints predate the arch key; EmulateConfig defaults it to film_tcn.
     ecfg = EmulateConfig(**ck["emulate_cfg"])
     model = build_model(ecfg, len(ck["device_ids"]))
     model.load_state_dict(ck["model"])
