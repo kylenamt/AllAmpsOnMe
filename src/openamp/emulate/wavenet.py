@@ -7,10 +7,8 @@
   padding are the only departures from a stock capture -- both fold away for
   export (see openamp.emulate.export).
 - Three archs, differing only in how the embedding conditions a layer:
-  FiLMWaveNet / MLPFiLMWaveNet (linear vs MLP gamma/beta generator),
-  DeltaWaveNet (low-rank residual on the conv weights instead of FiLM),
-  TableDeltaWaveNet (same residual, free per-device instead of low-rank --
-  cannot be enrolled, no shared embedding space).
+  FiLMWaveNet / MLPFiLMWaveNet (linear vs MLP gamma/beta generator) and
+  DeltaWaveNet (low-rank residual on the conv weights instead of FiLM).
 - All share one [N_devices x embedding_dim] table.
 """
 
@@ -20,14 +18,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-__all__ = ["FiLMWaveNet", "MLPFiLMWaveNet", "DeltaWaveNet", "TableDeltaWaveNet",
+__all__ = ["FiLMWaveNet", "MLPFiLMWaveNet", "DeltaWaveNet",
            "MLPFiLM", "DeltaWeightGen", "film_output_linear", "init_film_identity",
            "init_delta_zero", "per_sample_conv1d", "make_activation",
            "normalize_activation", "NormalizedEmbedding", "count_parameters",
            "ACTIVATIONS", "NAM_ACTIVATION_NAMES", "A2_KERNEL_SIZES", "A2_DILATIONS",
            "A2_HEAD_KERNEL", "A2_ACTIVATION", "A2_COND_HIDDEN", "A2_COND_ACTIVATION",
-           "A2_DELTA_RANK", "A2_DELTA_SCALE_INIT", "DELTA_PARTS_ALL",
-           "DELTA_PART_NAMES"]
+           "A2_DELTA_RANK", "A2_DELTA_SCALE_INIT"]
 
 # The one architecture shared by every A2 capture: three 7-layer dilation runs
 # at kernel 6, two kernel-15 layers between runs 2 and 3.
@@ -65,10 +62,6 @@ A2_DELTA_RANK = 8
 # learned magnitude scalar per layer, so growth is visible/decayable instead of
 # a free trade between the two (see DeltaWeightGen).
 A2_DELTA_SCALE_INIT = 0.03
-
-# tabledelta_wavenet runtime mask: which slices of a weight residual apply.
-DELTA_PARTS_ALL = (True, True, True)
-DELTA_PART_NAMES = ("kernel", "bias", "mixin")
 
 
 # --- General-purpose helpers, shared by every arch below -----------------------
@@ -295,15 +288,6 @@ class FiLMWaveNet(NormalizedEmbedding, nn.Module):
                                 self.embedding_dim, self.activation,
                                 self.cond_hidden, self.cond_activation)
 
-    def layer_conditioning(self, emb: torch.Tensor):
-        """Yield (layer, conditioning) for one embedding vector.
-
-        Every arch hands the same emb to every layer except TableDeltaWaveNet,
-        which slices it -- lets export fold/reference-forward arch-agnostically.
-        """
-        for layer in self.layers:
-            yield layer, emb
-
     @torch.no_grad()
     def neutralize_conditioning(self) -> None:
         """Make the conditioning a no-op for any device_idx (export's fold copy)."""
@@ -345,8 +329,8 @@ class FiLMWaveNet(NormalizedEmbedding, nn.Module):
             x = x.unsqueeze(1)                           # [B, T] -> [B, 1, T]
         h = self.rechannel(x)
         head = torch.zeros_like(h)
-        for layer, cond in self.layer_conditioning(emb):
-            h, head_term = layer(h, x, cond)             # x = the raw clean signal
+        for layer in self.layers:
+            h, head_term = layer(h, x, emb)              # x = the raw clean signal
             head = head + head_term
         y = self.head_rechannel(F.pad(head, (self.head_pad, 0)))
         return self.head_scale * y                       # [B, 1, T]
@@ -530,141 +514,3 @@ class DeltaWaveNet(FiLMWaveNet):
                    activation=ecfg.wn_activation,
                    delta_rank=ecfg.delta_rank,
                    embed_normalize=ecfg.embed_normalize)
-
-
-# --- TableDelta family: tabledelta_wavenet ---------------------------------------
-# Full-rank limit of the delta family: each device's residual is a free table row
-# instead of a low-rank read of a shared embedding.
-
-class TableDeltaWaveNetLayer(nn.Module):
-    """One A2 layer whose weight residual is handed in, not generated.
-
-    Same audio path as DeltaWaveNetLayer; TableDeltaWaveNet slices the device's
-    row out of one big table and passes dW/db/dm in directly.
-
-    delta_parts gates the three slices at inference (plain attribute, not in
-    the state_dict, so one checkpoint can be heard every way). kernel=False
-    skips the per-sample conv for a shared one plus a broadcast bias.
-    """
-
-    def __init__(self, channels: int, kernel_size: int, dilation: int,
-                 activation: str = A2_ACTIVATION):
-        super().__init__()
-        self.channels = int(channels)
-        self.kernel_size = int(kernel_size)
-        self.dilation = int(dilation)
-        self.pad = (kernel_size - 1) * dilation          # causal left pad
-        self.n_weight = self.channels * self.channels * self.kernel_size
-        self.n_delta = self.n_weight + 2 * self.channels
-
-        self.conv = nn.Conv1d(channels, channels, kernel_size, dilation=dilation)
-        self.input_mixer = nn.Conv1d(1, channels, 1, bias=False)
-        self.act = make_activation(activation)
-        self.layer1x1 = nn.Conv1d(channels, channels, 1)
-        self.delta_parts = DELTA_PARTS_ALL
-
-    def split_delta(self, delta: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """delta [B, n_delta] -> dW [B,C,C,K], db [B,C], dm [B,C].
-
-        Same layout as DeltaWeightGen.forward, so a generator's output and a
-        table row are interchangeable.
-        """
-        dw, db, dm = delta.split((self.n_weight, self.channels, self.channels), dim=-1)
-        return dw.view(-1, self.channels, self.channels, self.kernel_size), db, dm
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor,
-                delta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """x trunk [B,C,T], cond clean [B,1,T], delta [B, n_delta]."""
-        C = self.channels
-        use_kernel, use_bias, use_mixin = self.delta_parts
-        dw, db, dm = self.split_delta(delta)
-        if use_kernel:
-            # zeros_like(db), not a bare 0: per_sample_conv1d reshapes the bias
-            # by B, so it still needs a [B,C] tensor even when masked off.
-            z = per_sample_conv1d(x, self.conv.weight.unsqueeze(0) + dw,
-                                  self.conv.bias.unsqueeze(0)
-                                  + (db if use_bias else torch.zeros_like(db)),
-                                  self.pad, self.dilation)
-        else:
-            z = self.conv(F.pad(x, (self.pad, 0)))       # shared conv, no per-device kernel
-            if use_bias:
-                z = z + db.unsqueeze(-1)
-        mix = self.input_mixer.weight.reshape(1, C, 1)
-        if use_mixin:
-            mix = mix + dm.unsqueeze(-1)
-        z = self.act(z + mix.to(z.dtype) * cond.to(z.dtype))   # see DeltaWaveNetLayer for the cast
-        return x + self.layer1x1(z), z                   # (residual, head term)
-
-
-class TableDeltaWaveNet(FiLMWaveNet):
-    """A2 WaveNet where every device owns a free, unconstrained weight residual.
-
-    Full-rank limit of DeltaWaveNet: same hook/audio path/dW-db-dm layout, but
-    the residual is a whole-row lookup from a [N_devices, D] table rather than
-    scale * coeff(e) @ normalize(basis). Nothing is shared between devices but
-    the base kernels, isolating the low-rank basis as the only difference from
-    delta_wavenet.
-
-    - embedding_dim is derived from the schedule (D=10,352 at C=8), not
-      configured; there is no capacity knob.
-    - Parameters scale with n_devices (4.2M at 405).
-    - Cannot be enrolled: held-out devices have no row and there's no shared
-      structure to place one in. openamp.emulate.enroll refuses this arch.
-    - Still folds/exports: a device's row is its delta, a slice-and-add.
-
-    Table is zero-initialized (untrained net = stock A2, every device starts
-    identical); its gradient is nonzero at zero, so no vanishing-gradient trap.
-    """
-
-    def __init__(self, **kwargs):
-        kwargs.pop("embedding_dim", None)                 # derived from the schedule
-        super().__init__(embedding_dim=1, **kwargs)       # placeholder; resized below
-        widths = [layer.n_delta for layer in self.layers]
-        self.delta_slices = []
-        lo = 0
-        for w in widths:
-            self.delta_slices.append((lo, lo + w))
-            lo += w
-        self.embedding_dim = lo
-        self.embedding = nn.Embedding(self.n_devices, self.embedding_dim)
-        nn.init.zeros_(self.embedding.weight)             # every device starts at W
-
-    def _make_layer(self, kernel_size: int, dilation: int) -> nn.Module:
-        return TableDeltaWaveNetLayer(self.channels, kernel_size, dilation,
-                                      self.activation)
-
-    def set_delta_parts(self, *, kernel: bool = True, bias: bool = True,
-                        mixin: bool = True) -> "TableDeltaWaveNet":
-        """Choose which slices of the per-device delta are applied at inference. Returns self."""
-        parts = (bool(kernel), bool(bias), bool(mixin))
-        for layer in self.layers:
-            layer.delta_parts = parts
-        return self
-
-    @property
-    def delta_parts(self) -> tuple[bool, bool, bool]:
-        """The current mask (layers are always set together)."""
-        return self.layers[0].delta_parts
-
-    def layer_conditioning(self, emb: torch.Tensor):
-        """Each layer gets its own slice of the device row, not the whole thing."""
-        for layer, (lo, hi) in zip(self.layers, self.delta_slices):
-            yield layer, emb[..., lo:hi]
-
-    @torch.no_grad()
-    def neutralize_conditioning(self) -> None:
-        self.embedding.weight.zero_()   # deltas live in the table; zeroing it is the no-op
-
-    @classmethod
-    def from_config(cls, ecfg, n_devices: int) -> "TableDeltaWaveNet":
-        """Construct from an EmulateConfig."""
-        if ecfg.embed_normalize:
-            raise ValueError(
-                "emulate.embed_normalize is meaningless for tabledelta_wavenet: its "
-                "table holds per-device conv-weight residuals, not points in a shared "
-                "embedding space, so projecting rows onto a sphere would rescale weight "
-                "deltas at an unrelated magnitude. Set embed_normalize: false.")
-        return cls(n_devices=n_devices, channels=ecfg.wn_channels,
-                   activation=ecfg.wn_activation)
-
-    # No forward() override: layer_conditioning already does this arch's per-layer slicing.

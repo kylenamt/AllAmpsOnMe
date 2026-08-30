@@ -270,23 +270,6 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
     return metrics
 
 
-def require_enrollable(ecfg: EmulateConfig) -> None:
-    """Reject archs with no shared embedding space to enroll into (tabledelta_wavenet).
-
-    Explicit check because it would otherwise fail silently: _swap_embedding
-    would install a table nothing reads, and the fit would report a plausible-
-    looking but meaningless ESR.
-    """
-    from openamp.emulate.models import ENROLLABLE_ARCHS
-
-    if ecfg.arch not in ENROLLABLE_ARCHS:
-        raise RuntimeError(
-            f"arch {ecfg.arch!r} cannot be enrolled: its conditioning is a "
-            "per-device weight table, not a shared map from an embedding space, so "
-            "there is nothing an unseen device can be positioned within. Enrollable "
-            f"archs: {', '.join(ENROLLABLE_ARCHS)}.")
-
-
 def _swap_embedding(model, ecfg: EmulateConfig, n: int, dev, *,
                     init: str = ENROLL_INIT) -> torch.Tensor:
     """Freeze the network and swap in a fresh trainable n-row table.
@@ -299,7 +282,6 @@ def _swap_embedding(model, ecfg: EmulateConfig, n: int, dev, *,
     Model stays eval() throughout (no dropout/norm; grads still flow to the
     new rows). Returns the [n, dim] init rows.
     """
-    require_enrollable(ecfg)
     if init not in ENROLL_INITS:
         raise ValueError(f"init must be one of {ENROLL_INITS}, got {init!r}")
     model.requires_grad_(False)

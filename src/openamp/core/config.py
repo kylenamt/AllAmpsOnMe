@@ -37,8 +37,7 @@ class EmulateConfig:
     """
 
     # Model architecture, see emulate/wavenet.py:
-    # film_wavenet | mlpfilm_wavenet | delta_wavenet | tabledelta_wavenet
-    # (tabledelta_wavenet has no shared embedding space -> cannot be enrolled)
+    # film_wavenet | mlpfilm_wavenet | delta_wavenet
     arch: str = "film_wavenet"
 
     # --- FiLM-WaveNet model (NAM A2 kernel/dilation schedule) ----------------------
@@ -57,8 +56,7 @@ class EmulateConfig:
     single_device: int = -1          # >=0: one-to-one baseline trained on that device_id
     # Read the table as e = embed_scale * normalize(row): direction on the unit
     # sphere, magnitude one global learned scalar. Structural (adds embed_scale
-    # to the state_dict), so it cannot change on --resume. Rejected for
-    # tabledelta_wavenet, whose table is weight residuals. See
+    # to the state_dict), so it cannot change on --resume. See
     # wavenet.NormalizedEmbedding.
     embed_normalize: bool = False
 
@@ -86,8 +84,7 @@ class EmulateConfig:
     # val ESR; compare per-device ESR instead. See train.device_loss_weights.
     device_loss_weighting: float = 0.0
     # Train-time Gaussian jitter on the device embedding, as a fraction of the
-    # table's *current* std (0 = off; train steps only, never val/eval). Inert
-    # for tabledelta_wavenet, whose table is weight deltas, not a shared space.
+    # table's *current* std (0 = off; train steps only, never val/eval).
     embed_noise_frac: float = 0.0
     num_workers: int = 6
     amp: bool = True                 # CUDA mixed precision (STFT loss forced fp32)

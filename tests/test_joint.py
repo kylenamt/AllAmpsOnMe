@@ -291,19 +291,6 @@ def test_export_reference_forward_matches_the_model():
     assert torch.equal(forward_with_embedding(m, x, e), want)
 
 
-def test_table_delta_still_forwards_after_losing_its_override():
-    """TableDeltaWaveNet's forward was a copy of the base body; it now inherits.
-    Its per-layer slicing lives in layer_conditioning, which the base uses."""
-    from openamp.emulate.wavenet import TableDeltaWaveNet
-
-    m = TableDeltaWaveNet(n_devices=3, channels=4, kernel_sizes=(3, 3),
-                          dilations=(1, 2), head_kernel=2).eval()
-    with torch.no_grad():
-        y = m(torch.randn(2, 256), torch.tensor([0, 2]))
-    assert y.shape == (2, 1, 256) and torch.isfinite(y).all()
-
-
-# --- JointModel ----------------------------------------------------------------
 def test_joint_model_refuses_a_width_mismatch():
     with pytest.raises(ValueError, match="embedding width mismatch"):
         JointModel(WaveNetEncoder(embedding_dim=7, **SMALL), _small_generator())
@@ -325,7 +312,7 @@ def test_joint_forward_and_gradients_reach_both_halves():
     assert model.generator.embedding.weight.grad is None
 
 
-def test_build_joint_freezes_the_table_and_refuses_tabledelta():
+def test_build_joint_freezes_the_generator_table():
     cfg = load_config(data_dir="/tmp")
     cfg.emulate.arch = "film_wavenet"
     cfg.emulate.wn_channels = 4
@@ -334,10 +321,6 @@ def test_build_joint_freezes_the_table_and_refuses_tabledelta():
     m = build_joint(cfg.emulate, cfg.joint, 5)
     assert not m.generator.embedding.weight.requires_grad
     assert m.encoder.embedding_dim == m.generator.embedding_dim == 16
-
-    cfg.emulate.arch = "tabledelta_wavenet"
-    with pytest.raises(ValueError, match="cannot be driven by an encoder"):
-        build_joint(cfg.emulate, cfg.joint, 5)
 
 
 # --- Config --------------------------------------------------------------------

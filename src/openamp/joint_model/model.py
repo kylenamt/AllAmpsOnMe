@@ -21,7 +21,7 @@ import torch
 from torch import nn
 
 from openamp.core.config import EmulateConfig, JointConfig
-from openamp.emulate.models import ENROLLABLE_ARCHS, build_model
+from openamp.emulate.models import build_model
 from openamp.joint_model.fingerprint_encoder import FingerprintEncoder
 from openamp.joint_model.frame_encoder import FrameAttentionEncoder
 from openamp.joint_model.wavenet_encoder import WaveNetEncoder
@@ -77,14 +77,7 @@ def build_joint(ecfg: EmulateConfig, jcfg: JointConfig, n_devices: int) -> Joint
     frozen here, so a joint checkpoint can never quietly contain a half-trained
     lookup table competing with the encoder.
     """
-    if ecfg.arch not in ENROLLABLE_ARCHS:
-        raise ValueError(
-            f"emulate.arch {ecfg.arch!r} cannot be driven by an encoder — it has no "
-            f"shared embedding space an unseen amp could be positioned within. "
-            f"Choose one of {ENROLLABLE_ARCHS}.")
     generator = build_model(ecfg, n_devices)
-    if not hasattr(generator, "forward_emb"):
-        raise ValueError(f"emulate.arch {ecfg.arch!r} has no forward_emb path")
     generator.embedding.weight.requires_grad_(False)
     if getattr(generator, "embed_normalize", False):
         # The encoder produces the effective embedding itself (jcfg.enc_normalize),

@@ -306,22 +306,16 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
     print(f"[model] name={name} arch={arch['arch']} params={n_params:,} "
           f"devices={len(ids)} holdout={len(holdout_ids)} "
           f"channels={arch['channels']} layers={arch['blocks_x_layers']} "
-          # Model, not config: tabledelta_wavenet derives its width from the
-          # schedule, so ecfg.embedding_dim would print a number nothing uses.
-          f"embed={getattr(model, 'embedding_dim', ecfg.embedding_dim)}")
+          f"embed={model.embedding_dim}")
     print(f"[model] receptive_field={R} samples ({rf_ms:.1f} ms)  clip={clip}")
 
     # Embedding noise: train steps only (val/eval read the table verbatim).
-    # tabledelta_wavenet's table holds per-device weight residuals, not points in
-    # a shared space, so jitter there would be noise on conv weights at an
-    # unrelated scale -- the knob is inert for that arch.
     if ecfg.embed_noise_frac < 0.0:
         raise ValueError("emulate.embed_noise_frac must be >= 0 (fraction of the "
                          f"embedding table's std), got {ecfg.embed_noise_frac}")
-    noise_frac = 0.0 if ecfg.arch == "tabledelta_wavenet" else float(ecfg.embed_noise_frac)
-    if ecfg.embed_noise_frac > 0.0:
-        print(f"[model] embed_noise_frac={ecfg.embed_noise_frac:g}"
-              + ("" if noise_frac > 0.0 else "  (inert for tabledelta_wavenet)"))
+    noise_frac = float(ecfg.embed_noise_frac)
+    if noise_frac > 0.0:
+        print(f"[model] embed_noise_frac={noise_frac:g}")
 
     # --- Data -------------------------------------------------------------------
     train_ds = EmulationDataset(cfg, "train", receptive_field=R, id_to_idx=id_to_idx,
@@ -509,9 +503,7 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
           f"(shuffle should be worse){' OK' if val_shuf > val_true else ' — weak conditioning'}")
 
     _save_config_copy(run_dir, ecfg)
-    # The model is authoritative on width, not the config: tabledelta_wavenet
-    # derives its embedding_dim from the schedule and ignores ecfg.embedding_dim.
-    emb_dim = getattr(model, "embedding_dim", ecfg.embedding_dim)
+    emb_dim = model.embedding_dim
     save_embedding(run_dir / "embedding.pt", model, ids, manifest_sig, emb_dim, name,
                    holdout_ids=holdout_ids)
     metrics = {
