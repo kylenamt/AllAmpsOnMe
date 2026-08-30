@@ -48,8 +48,8 @@ from torch import nn
 from openamp.core.config import Config, EmulateConfig, load_config
 from openamp.data import CorpusPaths, EmulationDataset, make_loader
 from openamp.encoders import CrossAttentionPool, FrameStore
-from openamp.emulate.enroll import _per_device_esr
-from openamp.emulate.evaluate import _SILENCE_DBFS, _resolve_device, load_model
+from openamp.evaluation import (SILENCE_DBFS, load_model, per_device_esr,
+                                resolve_device)
 
 # What mean+std pooling of the same DAC latents achieves, measured over the same
 # 405 devices. The pooler has to beat these or the input was never the problem.
@@ -134,7 +134,7 @@ def holdout_esr(cfg: Config, run_dir: Path, pred: dict[int, np.ndarray], *,
     ``enroll`` reports ``test_esr_mean`` under, so the numbers are directly
     comparable rather than merely similar.
     """
-    dev = torch.device(_resolve_device(device))
+    dev = torch.device(resolve_device(device))
     model, ck = load_model(run_dir, str(dev))
     ecfg = EmulateConfig(**ck["emulate_cfg"])
     ids = sorted(pred)
@@ -154,8 +154,8 @@ def holdout_esr(cfg: Config, run_dir: Path, pred: dict[int, np.ndarray], *,
                           pairs_per_epoch=test_pairs * len(ids), seed=cfg.seed + 7)
     loader = make_loader(ds, ecfg.batch_size, ecfg.num_workers, shuffle=False,
                           seed=cfg.seed + 7, drop_last=False)
-    per_dev = _per_device_esr(model, loader, dev, len(ids),
-                              silence_dbfs=_SILENCE_DBFS, clip=clip)
+    per_dev = per_device_esr(model, loader, dev, len(ids),
+                              silence_dbfs=SILENCE_DBFS, clip=clip)
     return {"per_device": {int(d): float(per_dev[i]) for i, d in enumerate(ids)},
             "mean": float(np.nanmean(per_dev)), "median": float(np.nanmedian(per_dev))}
 
@@ -189,7 +189,7 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    dev = torch.device(_resolve_device(args.device))
+    dev = torch.device(resolve_device(args.device))
     cfg = load_config()
     args.out.mkdir(parents=True, exist_ok=True)
 

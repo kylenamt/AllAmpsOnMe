@@ -6,7 +6,7 @@ Deliberately thin. The generator is
 (a table row), which is the one seam the joint model needs.
 
 Encoder and generator stay separate attributes rather than being fused, because
-every diagnostic in :mod:`~openamp.joint_model.evaluate` works by cutting the
+every diagnostic in :mod:`~openamp.evaluation.joint` works by cutting the
 wire between them: render window A with a *zeroed* embedding, a *shuffled* one, or
 one computed from another amp's reference. :meth:`JointModel.embed` and
 :meth:`JointModel.render` are those two halves exposed separately;

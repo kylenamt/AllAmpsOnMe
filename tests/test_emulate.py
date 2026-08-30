@@ -370,7 +370,7 @@ def test_build_model_dispatches_on_arch():
 def test_load_model_rebuilds_arch_from_the_checkpoint(tmp_path):
     from dataclasses import asdict
 
-    from openamp.emulate.evaluate import load_model
+    from openamp.evaluation import load_model
 
     torch.manual_seed(0)
     ecfg = EmulateConfig(arch="film_wavenet", wn_channels=4)
@@ -398,7 +398,7 @@ def test_load_model_rebuilds_arch_from_the_checkpoint(tmp_path):
 def test_mlpfilm_checkpoint_roundtrip_and_cross_arch_load_is_loud(tmp_path):
     from dataclasses import asdict
 
-    from openamp.emulate.evaluate import load_model
+    from openamp.evaluation import load_model
 
     torch.manual_seed(0)
     ecfg = EmulateConfig(arch="mlpfilm_wavenet", wn_channels=4, embedding_dim=8,
@@ -422,7 +422,7 @@ def test_mlpfilm_checkpoint_roundtrip_and_cross_arch_load_is_loud(tmp_path):
 def test_delta_checkpoint_roundtrip_and_cross_arch_load_is_loud(tmp_path):
     from dataclasses import asdict
 
-    from openamp.emulate.evaluate import load_model
+    from openamp.evaluation import load_model
 
     torch.manual_seed(0)
     ecfg = EmulateConfig(arch="delta_wavenet", wn_channels=4, embedding_dim=8,
@@ -787,7 +787,7 @@ def test_validate_per_device_writes_a_row_per_amp(tmp_path):
     import csv as _csv
     from dataclasses import asdict
 
-    from openamp.emulate.evaluate import (PER_DEVICE_COLUMNS, format_per_device_summary,
+    from openamp.evaluation.emulate import (PER_DEVICE_COLUMNS, format_per_device_summary,
                                           validate_per_device)
 
     cfg = load_config(data_dir=tmp_path)
@@ -831,7 +831,7 @@ def test_enroll_end_to_end(tmp_path):
     from dataclasses import asdict
 
     from openamp.emulate.enroll import enroll
-    from openamp.emulate.evaluate import load_model
+    from openamp.evaluation import load_model
 
     cfg = load_config(data_dir=tmp_path)
     clip = 8192                                       # >= the largest STFT window
@@ -1107,7 +1107,7 @@ def test_enroll_pair_batch_size_overrides_the_runs_value(tmp_path):
 def test_append_rows_dedups_by_run_name(tmp_path):
     import csv
 
-    from openamp.emulate.evaluate import COMPARISON_COLUMNS, _append_rows
+    from openamp.evaluation.emulate import COMPARISON_COLUMNS, _append_rows
 
     def row(name, esr):
         return {c: 0 for c in COMPARISON_COLUMNS} | {"run_name": name, "test_ESR_mean": esr}

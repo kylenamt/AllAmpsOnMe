@@ -40,10 +40,10 @@ import torch.nn.functional as F
 from openamp.core.config import Config
 from openamp.data import CorpusPaths, JointDataset, make_loader, manifest_signature
 from openamp.encoders import encoder_class, ref_mode_for
+from openamp.evaluation.metrics import pooled_esr_terms
 from openamp.models import count_parameters, model_class
 from openamp.emulate.train import _device_index
-from openamp.losses import (DEFAULT_LOSS, build_loss, device_loss_weights,
-                            pre_emphasis)
+from openamp.losses import DEFAULT_LOSS, build_loss, device_loss_weights
 from openamp.joint_model.model import build_joint, load_joint
 from openamp.training import (GRAD_CLIP_NORM, RunDir, amp_setup, build_scheduler,
                               check_resume_compatible, param_group_lrs)
@@ -146,13 +146,9 @@ def evaluate_esr(model, loader, device, coeff: float, *, n_batches: int | None =
         if e.shape[0] > 1:
             spreads.append(float(e.std(dim=0).mean()))
         out = model.render(inp, _intervene(e, mode, gen))[..., R:].squeeze(1)
-        pe_o, pe_t = pre_emphasis(out, coeff), pre_emphasis(target, coeff)
-        n_i = torch.sum((pe_o - pe_t) ** 2, dim=-1)     # [B]
-        d_i = torch.sum(pe_t ** 2, dim=-1)              # [B]
-        if weights is not None:
-            di = batch["device_idx"].to(device, non_blocking=True)
-            w = weights[di]
-            n_i, d_i = n_i * w, d_i * w
+        w = (None if weights is None
+             else weights[batch["device_idx"].to(device, non_blocking=True)])
+        n_i, d_i = pooled_esr_terms(out, target, coeff=coeff, weights=w)
         num += float(n_i.sum().double())
         den += float(d_i.sum().double())
     if was_training:

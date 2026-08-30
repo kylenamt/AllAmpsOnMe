@@ -36,10 +36,11 @@ from openamp.core import manifest as manifests
 from openamp.core.config import Config, EmulateConfig
 from openamp.data import (CorpusPaths, EmulationDataset, WetDryDataset,
                           make_loader, manifest_signature)
-from openamp.emulate.evaluate import _SILENCE_DBFS, _resolve_device, load_model
 from openamp.emulate.train import evaluate_esr
+from openamp.evaluation import (SILENCE_DBFS, load_model, per_device_esr,
+                                resolve_device)
 from openamp.training import GRAD_CLIP_NORM
-from openamp.losses import DEFAULT_LOSS, build_loss, pre_emphasis
+from openamp.losses import DEFAULT_LOSS, build_loss
 from openamp.models import A2_EMBEDDING_STD
 
 ENROLL_LR = 1e-2                 # only embeddings train (the table trained at 5e-4-2e-3 with the network)
@@ -94,42 +95,6 @@ def _resolve_enroll_ids(cfg: Config, ck: dict, requested) -> tuple[list[int], li
     return enroll_ids, skipped
 
 
-@torch.no_grad()
-def _per_device_esr(model, loader, dev, n_rows: int, *, preemph: float | None = None,
-                    silence_dbfs: float | None = None, clip: int | None = None) -> np.ndarray:
-    """Per-embedding-row ESR over a loader, keyed on batch["device_idx"].
-
-    preemph set: pooled pre-emphasized ratio (val semantics, evaluate_esr).
-    Otherwise: mean of per-window raw ratios with the silence_dbfs gate (test
-    semantics, evaluate_run -- comparable to comparison.csv). No-data rows -> NaN.
-    """
-    R = model.receptive_field
-    num = torch.zeros(n_rows, dtype=torch.float64, device=dev)
-    den = torch.zeros(n_rows, dtype=torch.float64, device=dev)
-    floor = None
-    if preemph is None:
-        floor = clip * (10.0 ** (silence_dbfs / 20.0)) ** 2   # min target sum-of-squares
-    for batch in loader:
-        inp = batch["input"].to(dev, non_blocking=True)
-        target = batch["target"].to(dev, non_blocking=True)
-        di = batch["device_idx"].to(dev, non_blocking=True)
-        out = model(inp, di)[..., R:].squeeze(1)              # [B, clip]
-        if preemph is not None:
-            pe_o, pe_t = pre_emphasis(out, preemph), pre_emphasis(target, preemph)
-            num.index_add_(0, di, torch.sum((pe_o - pe_t) ** 2, dim=-1).double())
-            den.index_add_(0, di, torch.sum(pe_t ** 2, dim=-1).double())
-        else:
-            t = torch.sum(target ** 2, dim=-1)
-            keep = t > floor                                  # drop near-silent windows
-            if keep.any():
-                e = torch.sum((out[keep] - target[keep]) ** 2, dim=-1)
-                num.index_add_(0, di[keep], (e / (t[keep] + 1e-8)).double())
-                den.index_add_(0, di[keep], torch.ones_like(t[keep]).double())
-    arr = (num / den).cpu().numpy()                           # 0/0 -> NaN (no data)
-    arr[~np.isfinite(arr)] = np.nan
-    return arr
-
-
 def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
            pairs: int = ENROLL_PAIRS, epochs: int = ENROLL_EPOCHS,
            lr: float = ENROLL_LR, weight_decay: float = 0.0,
@@ -149,7 +114,7 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
     try 8-16 against a batch-32 run on a 12 GB card).
     """
     run_dir = Path(run_dir)
-    dev = torch.device(_resolve_device(device))
+    dev = torch.device(resolve_device(device))
     seed = int(cfg.seed if seed is None else seed)
     torch.manual_seed(seed)
 
@@ -206,8 +171,8 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
 
     # --- Baseline: what the init rows score before any optimization -------------
     t0 = time.time()
-    baseline_test = np.full(n, np.nan) if test_loader is None else _per_device_esr(
-        model, test_loader, dev, n, silence_dbfs=_SILENCE_DBFS, clip=clip)
+    baseline_test = np.full(n, np.nan) if test_loader is None else per_device_esr(
+        model, test_loader, dev, n, silence_dbfs=SILENCE_DBFS, clip=clip)
     init_val = evaluate_esr(model, val_loader, dev, ecfg.preemph)
     print(f"[enroll] baseline val_esr={init_val:.5f}")
     with log_path.open("a", newline="", encoding="utf-8") as fh:
@@ -224,9 +189,9 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
     # --- Final per-device metrics at the best rows --------------------------------
     with torch.no_grad():
         model.embedding.weight.copy_(best_emb)
-    val_per_dev = _per_device_esr(model, val_loader, dev, n, preemph=ecfg.preemph)
-    test_per_dev = np.full(n, np.nan) if test_loader is None else _per_device_esr(
-        model, test_loader, dev, n, silence_dbfs=_SILENCE_DBFS, clip=clip)
+    val_per_dev = per_device_esr(model, val_loader, dev, n, preemph=ecfg.preemph)
+    test_per_dev = np.full(n, np.nan) if test_loader is None else per_device_esr(
+        model, test_loader, dev, n, silence_dbfs=SILENCE_DBFS, clip=clip)
 
     rows = [{"device_id": d, "pairs": int(pairs), "epochs_run": epochs_run,
              "val_esr": _csv_num(val_per_dev[i]),
@@ -497,7 +462,7 @@ def render_dry(model, dry: np.ndarray, *, row: int = 0, device: str = "cpu",
     Chunked so multi-minute captures fit in memory; each chunk re-reads its own
     receptive-field context, so output matches a single full-length forward.
     """
-    dev = torch.device(_resolve_device(device))
+    dev = torch.device(resolve_device(device))
     R = model.receptive_field
     di = torch.tensor([int(row)], dtype=torch.long, device=dev)
     out = np.empty(len(dry), dtype=np.float32)
@@ -542,7 +507,7 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
     needs ~2x memory; try 8-16 against a batch-32 run on a 12 GB card).
     """
     run_dir = Path(run_dir)
-    dev = torch.device(_resolve_device(device))
+    dev = torch.device(resolve_device(device))
     seed = int(cfg.seed if seed is None else seed)
     torch.manual_seed(seed)
     dry = np.ascontiguousarray(dry, dtype=np.float32)
@@ -678,7 +643,7 @@ def load_pair_model(run_dir: Path, name: str, device: str = "cpu"):
     run_dir = Path(run_dir)
     blob = torch.load(run_dir / "enroll" / "pairs" / name / "enrolled_pair.pt",
                       map_location="cpu", weights_only=False)
-    dev = torch.device(_resolve_device(device))
+    dev = torch.device(resolve_device(device))
     model, ck = load_model(run_dir, str(dev))
     ecfg = EmulateConfig(**ck["emulate_cfg"])
     _swap_embedding(model, ecfg, 1, dev)

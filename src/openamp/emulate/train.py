@@ -23,9 +23,9 @@ import torch
 from openamp.core.config import Config
 from openamp.data import (CorpusPaths, EmulationDataset, build_device_index,
                           load_or_create_holdout, make_loader, manifest_signature)
+from openamp.evaluation.metrics import pooled_esr_terms
 from openamp.models import build_model, count_parameters, model_class
-from openamp.losses import (DEFAULT_LOSS, build_loss, device_loss_weights,
-                            pre_emphasis)
+from openamp.losses import DEFAULT_LOSS, build_loss, device_loss_weights
 from openamp.training import (GRAD_CLIP_NORM, RunDir, amp_setup, build_scheduler,
                               check_resume_compatible)
 
@@ -70,9 +70,9 @@ def evaluate_esr(model, loader, device, coeff: float, *, n_batches: int | None =
                  weights: torch.Tensor | None = None) -> float:
     """Energy-weighted pre-emphasized ESR over the loader (warmed region only).
 
-    - Accumulates error and signal energy across every window and divides once,
-      matching :func:`esr` (a mean of per-window ratios would be dominated by
-      quiet windows).
+    - The pooled definition from :mod:`openamp.evaluation.metrics`: error and
+      signal energy accumulated across every window, divided once (a mean of
+      per-window ratios would be dominated by quiet windows).
     - ``shuffle_devices`` permutes the conditioning within each batch — the
       control that should make ESR *worse* if the embeddings actually steer the
       model.
@@ -96,11 +96,7 @@ def evaluate_esr(model, loader, device, coeff: float, *, n_batches: int | None =
         if shuffle_devices and di.shape[0] > 1:
             di = di[torch.randperm(di.shape[0], device=device)]
         out = model(inp, di)[..., R:].squeeze(1)      # [B, clip]
-        pe_o, pe_t = pre_emphasis(out, coeff), pre_emphasis(target, coeff)
-        n_i = torch.sum((pe_o - pe_t) ** 2, dim=-1)   # [B]
-        d_i = torch.sum(pe_t ** 2, dim=-1)            # [B]
-        if w is not None:
-            n_i, d_i = n_i * w, d_i * w
+        n_i, d_i = pooled_esr_terms(out, target, coeff=coeff, weights=w)
         num += float(n_i.sum().double())
         den += float(d_i.sum().double())
     if was_training:

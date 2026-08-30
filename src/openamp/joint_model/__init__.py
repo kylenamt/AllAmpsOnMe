@@ -17,7 +17,7 @@ survives that gap, and what is shared is the amp.
 - :mod:`~openamp.data.joint` — pairs a generator window with a disjoint
   reference segment of the same device.
 - :mod:`~openamp.joint_model.train` — the joint loop; reconstruction loss only.
-- :mod:`~openamp.joint_model.evaluate` — the collapse and leakage diagnostics
+- :mod:`~openamp.evaluation.joint` — the collapse and leakage diagnostics
   that say whether the embedding means anything, which reconstruction ESR alone
   does not.
 
@@ -26,4 +26,4 @@ survives that gap, and what is shared is the amp.
 
 from __future__ import annotations
 
-__all__ = ["model", "train", "evaluate", "geometry"]
+__all__ = ["model", "train"]

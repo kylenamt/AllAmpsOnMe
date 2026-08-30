@@ -29,6 +29,8 @@ import torch
 
 from openamp.core.config import Config, EmulateConfig
 from openamp.data import CorpusPaths, EmulationDataset
+from openamp.evaluation.metrics import (SILENCE_DBFS, pooled_esr_terms,
+                                        silence_floor, windowed_esr)
 from openamp.models import build_model
 
 # One row of the comparison CSV, in order (spec §3).
@@ -38,20 +40,14 @@ COMPARISON_COLUMNS = [
     "test_MRSL_mean", "train_hours",
 ]
 
-# Per-example ESR divides by target energy, so a near-silent random test window
-# (tiny denominator) can dominate the *mean*. Windows below this RMS are dropped
-# from the ESR stats (the corpus is normalized to -18 dBFS, so -50 dBFS is silence).
-_SILENCE_DBFS = -50.0
-
-
-def _resolve_device(device: str) -> str:
+def resolve_device(device: str) -> str:
     """Fall back to CPU when CUDA is requested but unavailable."""
     return device if (device == "cpu" or torch.cuda.is_available()) else "cpu"
 
 
 def load_model(run_dir: Path, device: str = "cpu"):
     """Reconstruct ``(model, ckpt)`` from a run's ``checkpoint.pt`` (self-contained)."""
-    device = _resolve_device(device)
+    device = resolve_device(device)
     ck = torch.load(Path(run_dir) / "checkpoint.pt", map_location=device,
                     weights_only=False)
     ecfg = EmulateConfig(**ck["emulate_cfg"])
@@ -73,7 +69,7 @@ def evaluate_run(cfg: Config, run_dir: Path, *, device: str = "cpu",
     import auraloss
 
     run_dir = Path(run_dir)
-    dev = torch.device(_resolve_device(device))
+    dev = torch.device(resolve_device(device))
     model, ck = load_model(run_dir, str(dev))
     ecfg = EmulateConfig(**ck["emulate_cfg"])
     R = model.receptive_field
@@ -88,18 +84,16 @@ def evaluate_run(cfg: Config, run_dir: Path, *, device: str = "cpu",
                         num_workers=ecfg.num_workers, pin_memory=True)
     mrstft = auraloss.freq.MultiResolutionSTFTLoss()
 
-    floor = clip * (10.0 ** (_SILENCE_DBFS / 20.0)) ** 2   # min target sum-of-squares
+    floor = silence_floor(clip)
     esrs, mrsls = [], []
     for batch in loader:
         inp = batch["input"].to(dev, non_blocking=True)
         target = batch["target"].to(dev, non_blocking=True)
         di = batch["device_idx"].to(dev, non_blocking=True)
         out = model(inp, di)[..., R:].squeeze(1)       # [B, clip]
-        t = torch.sum(target ** 2, dim=-1)
-        keep = t > floor                               # drop near-silent windows
-        if keep.any():
-            e = torch.sum((out[keep] - target[keep]) ** 2, dim=-1)
-            esrs.append((e / (t[keep] + 1e-8)).cpu())
+        ratios, _ = windowed_esr(out, target, floor)   # drops near-silent windows
+        if ratios.numel():
+            esrs.append(ratios.cpu())
         mrsls.append(float(mrstft(out.unsqueeze(1).float(), target.unsqueeze(1)).item()))
     esrs = torch.cat(esrs) if esrs else torch.tensor([float("nan")])
     meta = _run_metrics(run_dir)
@@ -207,7 +201,7 @@ def validate_per_device(cfg: Config, run_dir: Path, *, device: str = "cpu",
       so rows are comparable to each other.
     - ``test_ESR`` is pooled per device — one ratio of summed energies over that
       device's windows, the same definition training optimizes
-      (:func:`openamp.emulate.train.esr`) — so a quiet window can't dominate a
+      (:func:`openamp.evaluation.metrics.pooled_esr_terms`) — so a quiet window can't dominate a
       device's score. Rows come back sorted best-ESR first.
     """
     import auraloss
@@ -217,7 +211,7 @@ def validate_per_device(cfg: Config, run_dir: Path, *, device: str = "cpu",
     from openamp.data import DeviceGridDataset
 
     run_dir = Path(run_dir)
-    dev = torch.device(_resolve_device(device))
+    dev = torch.device(resolve_device(device))
     model, ck = load_model(run_dir, str(dev))
     ecfg = EmulateConfig(**ck["emulate_cfg"])
     R = model.receptive_field
@@ -231,7 +225,7 @@ def validate_per_device(cfg: Config, run_dir: Path, *, device: str = "cpu",
                            device_ids=list(ck["device_ids"]), clip_samples=clip,
                            n_windows=n_windows,
                            seed=int(seed if seed is not None else cfg.seed + 7),
-                           silence_dbfs=_SILENCE_DBFS)
+                           silence_dbfs=SILENCE_DBFS)
     loader = DataLoader(ds, batch_size=int(batch_size or ecfg.batch_size), shuffle=False,
                         num_workers=ecfg.num_workers, pin_memory=(dev.type == "cuda"))
     mrstft = auraloss.freq.MultiResolutionSTFTLoss()
@@ -253,8 +247,7 @@ def validate_per_device(cfg: Config, run_dir: Path, *, device: str = "cpu",
         di = batch["device_idx"].to(dev, non_blocking=True)
         ids = batch["device_id"]
         out = model(inp, di)[..., R:].squeeze(1)                  # [B, clip]
-        e = torch.sum((out - target) ** 2, dim=-1)
-        t = torch.sum(target ** 2, dim=-1)
+        e, t = pooled_esr_terms(out, target)
         # A batch straddles at most two devices (the grid is device-major), but
         # split by whatever it holds so batch_size need not divide n_windows.
         for did in ids.unique().tolist():
@@ -338,7 +331,7 @@ def export_demos(cfg: Config, run_dir: Path, *, n_devices: int = 4, seconds: flo
     from openamp.core import constants as C
 
     run_dir = Path(run_dir)
-    dev = torch.device(_resolve_device(device))
+    dev = torch.device(resolve_device(device))
     model, ck = load_model(run_dir, str(dev))
     R = model.receptive_field
     name = ck.get("name", run_dir.name)

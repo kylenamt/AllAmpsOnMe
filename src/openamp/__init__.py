@@ -3,7 +3,7 @@
 One package, one pipeline, grouped by purpose into subpackages:
 
     acquire -> corpus.build -> corpus.subset -> corpus.render -> corpus.verify
-        -> emulate.train -> emulate.evaluate
+        -> emulate.train -> evaluation.emulate
 
 Subpackages:
 

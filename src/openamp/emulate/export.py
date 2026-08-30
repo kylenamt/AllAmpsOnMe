@@ -167,7 +167,7 @@ def export_bundle(run_dir: Path, out_path: Path, *,
     the model's best generic-amp prior). ``profile_device_ids`` adds table rows
     by device_id; ``profile_pairs`` adds ``enroll/pairs/<name>`` embeddings.
     """
-    from openamp.emulate.evaluate import load_model
+    from openamp.evaluation import load_model
 
     run_dir = Path(run_dir)
     model, ck = load_model(run_dir, "cpu")
@@ -239,7 +239,7 @@ def export_profile(run_dir: Path, *, device_id: int | None = None,
     label outright; otherwise a ``device_id`` row is labelled from ``names``
     (``{device_id: display name}``), falling back to ``device <id>``.
     """
-    from openamp.emulate.evaluate import load_model
+    from openamp.evaluation import load_model
 
     run_dir = Path(run_dir)
     if sum(x is not None and x is not False
@@ -276,7 +276,7 @@ def export_profiles(run_dir: Path, *, mean: bool = False, pairs: bool = False,
     (name-sorted). Each entry has the same ``aaom_profile`` schema as
     :func:`export_profile`.
     """
-    from openamp.emulate.evaluate import load_model
+    from openamp.evaluation import load_model
 
     run_dir = Path(run_dir)
     names = names or {}

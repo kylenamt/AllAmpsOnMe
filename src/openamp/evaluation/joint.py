@@ -178,7 +178,7 @@ def diagnose(cfg: Config, run_dir: Path, *, device: str = "cuda",
              pairs: int = DEFAULT_PAIRS, n_windows: int = DEFAULT_WINDOWS,
              seed: int | None = None) -> dict:
     """Run every check against a finished run; writes ``diagnostics.json``."""
-    from openamp.joint_model.geometry import _tsne, _write_tsne, knn_retrieval
+    from openamp.evaluation.geometry import _tsne, _write_tsne, knn_retrieval
 
     run_dir = Path(run_dir)
     dev = torch.device(device if torch.cuda.is_available() else "cpu")

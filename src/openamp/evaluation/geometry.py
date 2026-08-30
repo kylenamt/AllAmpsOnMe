@@ -1,8 +1,8 @@
 """Embedding-geometry helpers: k-NN retrieval and a t-SNE writer.
 
-Lifted verbatim from the archived ``openamp.probes.evaluate`` when that package
-was retired, because :mod:`openamp.joint_model.evaluate` is the only remaining
-consumer. Unchanged so the numbers stay comparable with runs made before the move.
+Lifted verbatim from an archived encoder package when that was retired, because
+:mod:`openamp.evaluation.joint` is the only remaining consumer. Unchanged so the
+numbers stay comparable with runs made before the move.
 """
 
 from __future__ import annotations

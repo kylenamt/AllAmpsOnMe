@@ -346,7 +346,7 @@ def emulate(config_path, device, epochs, resume, overfit, limit_devices) -> None
 @click.option("--n-pairs", type=int, default=None, help="Test pairs per run (default: config).")
 def emulate_compare(runs, device, n_pairs) -> None:
     """Evaluate emulation runs on the test split -> results/emulate/comparison.csv."""
-    from openamp.emulate import evaluate as emu_eval
+    from openamp.evaluation import emulate as emu_eval
 
     cfg = _config()
     run_dirs = [Path(r) for r in runs] or sorted(
@@ -376,7 +376,7 @@ def emulate_validate(run, windows, device, batch_size, seed, out) -> None:
     rank amps against each other: what the model learned well, and whether the
     run's headline ESR is skewed by a few bad devices.
     """
-    from openamp.emulate import evaluate as emu_eval
+    from openamp.evaluation import emulate as emu_eval
 
     cfg = _config()
     run_dir = _resolve_run(cfg, run)
@@ -393,7 +393,7 @@ def emulate_validate(run, windows, device, batch_size, seed, out) -> None:
 @click.option("--device", default=None, help="cuda/cpu (default: auto).")
 def emulate_demo(run, n_devices, seconds, device) -> None:
     """Export clean/target/prediction WAVs for a run (the listening check)."""
-    from openamp.emulate import evaluate as emu_eval
+    from openamp.evaluation import emulate as emu_eval
 
     cfg = _config()
     emu_eval.export_demos(cfg, run, n_devices=n_devices, seconds=seconds,
@@ -585,7 +585,7 @@ def joint(config_path, device, epochs, resume, overfit, overfit_batch,
               help="Reference segments per capture for the geometry pass (default 8).")
 def joint_eval(run, device, pairs, windows) -> None:
     """Collapse and leakage diagnostics: does the embedding actually mean anything?"""
-    from openamp.joint_model import evaluate as joint_eval_mod
+    from openamp.evaluation import joint as joint_eval_mod
 
     cfg = _config()
     for cand in (Path(run), cfg.joint_run_dir(str(run))):
