@@ -8,7 +8,7 @@
 #
 # The single change from fp_dac_delta512.yaml (this file is a copy of it): the
 # fixed mean+std pooling in results/fingerprint/dac/sweep_train is replaced by a
-# *trained* cross-attention pool (openamp.encoder.probe.CrossAttentionPool) over
+# *trained* cross-attention pool (openamp.encoders.pooling.CrossAttentionPool) over
 # results/dac_frames/sweep_train's raw per-frame DAC latents. Everything else --
 # generator, adapter shape, training schedule -- is unchanged, so any difference
 # in outcome traces to the pooling method and nothing else.
@@ -32,7 +32,7 @@
 # row, where encode_fingerprints.py undoes only the render's peak normalization
 # and subtracts a dry null (fp_preprocess: dry_l2). Re-extracting frames under
 # the fingerprint arm's exact preprocessing was not done here -- these are the
-# frames openamp.encoder.extract already produced for this purpose -- so a
+# frames openamp.probes.extract already produced for this purpose -- so a
 # result here reflects "attention pooling + LUFS-normalized, no-dry frames"
 # against "mean+std + scale-undone, dry-subtracted frames", not pooling alone.
 #
@@ -81,7 +81,7 @@ emulate:
 joint:
   # --- Conditioning source: the one thing this config changes -----------------
   enc_kind: dac_frames
-  # openamp.encoder.extract's output: per-device [~14700, 1024] fp16 frame
+  # openamp.probes.extract's output: per-device [~14700, 1024] fp16 frame
   # shards, memmapped and looked up by device id -- same lookup design as
   # enc_kind: fingerprint, for the same reason (a codec fingerprint needs long
   # audio to be reliable; a joint reference window is 2 s).

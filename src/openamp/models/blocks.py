@@ -101,7 +101,7 @@ class NormalizedEmbedding:
       at 1, so e=0 is the *neutral* amp and ||e|| is distance from neutral.
       Pinning it at 1 would shrink every embedding to ~22% of the radius the
       table actually learns and systematically under-drive the conditioning
-      (openamp.encoder.probe's objection to L2-normalizing against a frozen
+      (openamp.probes.probe's objection to L2-normalizing against a frozen
       generator). The scale lets the sphere find its own radius instead.
     - NOT LayerNorm: nn.LayerNorm's default elementwise_affine breaks the
       constant norm outright, and even without it LN removes the per-vector mean

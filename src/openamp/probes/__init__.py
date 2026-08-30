@@ -22,10 +22,10 @@ predicted from a 2.8-dimensional input, and that 2.84 is a property of the
 collapses them. Whether a learned pooler recovers more of that is the whole
 experiment, and it has a number to beat before any ESR is measured.
 
-- :mod:`~openamp.encoder.extract` -- frozen DAC over each render, frames kept.
-- :mod:`~openamp.encoder.probe`   -- the pooler, the regression, the report.
+- :mod:`~openamp.probes.extract` -- frozen DAC over each render, frames kept.
+- :mod:`~openamp.probes.probe`   -- the pooler, the regression, the report.
 
-``python -m openamp.encoder.extract`` then ``python -m openamp.encoder.probe``.
+``python -m openamp.probes.extract`` then ``python -m openamp.probes.probe``.
 """
 
 from __future__ import annotations

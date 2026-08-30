@@ -1,8 +1,8 @@
 """Train a cross-attention pooler to predict a trained embedding table; report whether it placed.
 
-    OPENAMP_DATA_DIR=data python -m openamp.encoder.probe
+    OPENAMP_DATA_DIR=data python -m openamp.probes.probe
 
-Reads the DAC frames :mod:`openamp.encoder.extract` wrote and the embedding table
+Reads the DAC frames :mod:`openamp.probes.extract` wrote and the embedding table
 an ``openamp emulate`` run already trained, and learns the map between them. The
 generator is not in the training loop at all -- it is loaded once, frozen, at the
 end, to turn predicted embeddings into the only number that decides anything.

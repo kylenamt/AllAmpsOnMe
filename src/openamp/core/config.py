@@ -167,7 +167,7 @@ class JointConfig:
         if self.enc_kind == "dac_frames" and not str(self.fp_frames_path).strip():
             raise ConfigError("joint.enc_kind 'dac_frames' needs joint.fp_frames_path, "
                               "the directory holding meta.json + frames/ "
-                              "(openamp.encoder.extract's output)")
+                              "(openamp.probes.extract's output)")
         if self.enc_pool_queries < 1:
             raise ConfigError(
                 f"joint.enc_pool_queries must be >= 1, got {self.enc_pool_queries}")

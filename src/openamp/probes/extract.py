@@ -1,7 +1,7 @@
 """Fingerprint every amp with a frozen DAC, keeping the **frames** rather than pooling them.
 
-    python -m openamp.encoder.extract --limit-devices 4     # smoke
-    python -m openamp.encoder.extract                       # full, ~18 min, 12.6 GiB
+    python -m openamp.probes.extract --limit-devices 4     # smoke
+    python -m openamp.probes.extract                       # full, ~18 min, 12.6 GiB
 
 Forked from ``scripts/encode_fingerprints.py``. The encoder plumbing is that
 script's -- hop derivation, chunking with real context, resumability, provenance

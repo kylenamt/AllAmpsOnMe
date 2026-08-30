@@ -9,13 +9,13 @@ fixed mean+std reduction computed once, offline, with no gradient.
 
 Everything else about FingerprintEncoder's design carries over unchanged:
 
-Lookup, not on-the-fly encoding. openamp.encoder.extract precomputes each
+Lookup, not on-the-fly encoding. openamp.probes.extract precomputes each
 device's frames once from the full 171 s capture render; joint.ref_seconds and
 the reference-disjointness machinery are inert under this encoder exactly as
 they are under enc_kind="fingerprint", and for the same reason -- a short
 reference window is not what these frames were extracted from.
 
-No dry-vector subtraction. openamp.encoder.extract keeps wet frames only (see
+No dry-vector subtraction. openamp.probes.extract keeps wet frames only (see
 its docstring): a device's dry frames were never extracted, so there is
 nothing to subtract, and fp_preprocess is not offered here.
 

@@ -269,7 +269,7 @@ class FrameStore:
         meta_path = self.root / "meta.json"
         if not meta_path.is_file():
             raise SystemExit(f"no meta.json under {self.root} — run "
-                             f"`python -m openamp.encoder.extract` first")
+                             f"`python -m openamp.probes.extract` first")
         self.meta = json.loads(meta_path.read_text())
         self.device_ids = [int(d) for d in self.meta["device_ids"]]
         self.n_frames = int(self.meta["n_frames"])
