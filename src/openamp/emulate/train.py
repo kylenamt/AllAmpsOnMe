@@ -13,12 +13,8 @@
 
 from __future__ import annotations
 
-import csv
-import json
-import math
 import time
 from dataclasses import asdict
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -30,10 +26,11 @@ from openamp.data import (CorpusPaths, EmulationDataset, build_device_index,
 from openamp.models import build_model, count_parameters, model_class
 from openamp.losses import (DEFAULT_LOSS, build_loss, device_loss_weights,
                             pre_emphasis)
+from openamp.training import (GRAD_CLIP_NORM, RunDir, amp_setup, build_scheduler,
+                              check_resume_compatible)
 
-# Safety net for loss spikes, not a training knob: healthy grad norms on this
-# model sit at p50~4, p90~7, so 20 leaves normal steps untouched.
-GRAD_CLIP_NORM = 20.0
+LOG_COLUMNS = ["epoch", "step", "train_loss", "train_esr", "train_stft", "val_esr",
+               "lr", "elapsed_s"]
 
 
 # --- Data plumbing -------------------------------------------------------------
@@ -221,20 +218,11 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
               f"max={_w.max():.4g} (mean 1.0, ESR term only; val ESR weighted "
               f"too — not comparable with a strength-0 run)")
     opt = torch.optim.Adam(model.parameters(), lr=ecfg.lr, weight_decay=ecfg.weight_decay)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="min", factor=ecfg.plateau_factor, patience=ecfg.plateau_patience)
-    use_amp = bool(ecfg.amp) and dev.type == "cuda"
-    if ecfg.amp_dtype not in ("fp16", "bf16"):
-        raise ValueError(f"emulate.amp_dtype must be 'fp16' or 'bf16', got {ecfg.amp_dtype!r}")
-    amp_dtype = torch.bfloat16 if ecfg.amp_dtype == "bf16" else torch.float16
-    # bf16 shares fp32's exponent range, so it needs no loss scaling
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype is torch.float16)
+    sched = build_scheduler(opt, ecfg)
+    use_amp, amp_dtype, scaler = amp_setup(ecfg, dev)
 
-    run_dir = cfg.emulate_run_dir(name)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = run_dir / "checkpoint.pt"          # best (min val ESR)
-    last_path = run_dir / "last.pt"
-    log_path = run_dir / "train_log.csv"
+    run = RunDir(cfg.emulate_run_dir(name))
+    ckpt_path, last_path = run.checkpoint, run.last
 
     start_epoch, best_val, since_improved = 0, float("inf"), 0
     resumed_from = None
@@ -254,24 +242,23 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         print(f"[resume] from epoch {start_epoch}, best_val_esr={best_val:.5f}; "
               f"lr={ecfg.lr:.2e} weight_decay={ecfg.weight_decay:g} (from config)")
     else:
-        with log_path.open("w", newline="", encoding="utf-8") as fh:
-            csv.writer(fh).writerow(["epoch", "step", "train_loss", "train_esr",
-                                     "train_stft", "val_esr", "lr", "elapsed_s"])
-    _append_config_history(
-        run_dir, ecfg, mode="resume" if resumed_from is not None else "start",
+        run.start_log(LOG_COLUMNS)
+    run.append_config_history(
+        mode="resume" if resumed_from is not None else "start",
         start_epoch=start_epoch, resumed_from=resumed_from, best_val=best_val,
         max_epochs=max_epochs, applied_lr=opt.param_groups[0]["lr"],
-        applied_wd=opt.param_groups[0]["weight_decay"])
+        applied_weight_decay=opt.param_groups[0]["weight_decay"],
+        emulate_cfg=asdict(ecfg))
 
     def save_ckpt(path: Path, epoch: int, val_esr: float) -> None:
-        torch.save({
+        run.save_checkpoint(path, {
             "model": model.state_dict(), "optim": opt.state_dict(),
             "scaler": scaler.state_dict(), "emulate_cfg": asdict(ecfg),
             "device_ids": ids, "id_to_idx": id_to_idx, "holdout_ids": holdout_ids,
             "manifest_sha256": manifest_sig, "receptive_field": R,
             "params": n_params, "sample_rate": cfg.sample_rate, "seed": cfg.seed,
             "name": name, "epoch": epoch, "val_esr": val_esr, "best_val_esr": best_val,
-        }, path)
+        })
 
     # --- Loop -------------------------------------------------------------------
     t0 = time.time()
@@ -337,11 +324,10 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
                 note = f"lr halved to {opt.param_groups[0]['lr']:.1e}"
             print(f"[nan-guard] epoch {epoch:02d}: non-finite val ESR — reloaded best "
                   f"(epoch {ck['epoch']}, val_esr={float(ck['val_esr']):.5f}); {note}")
-            with log_path.open("a", newline="", encoding="utf-8") as fh:
-                csv.writer(fh).writerow([epoch, step, f"{tr_loss:.6f}", f"{tr_esr:.6f}",
-                                         f"{tr_stft:.6f}", f"{val_esr:.6f}",
-                                         f"{opt.param_groups[0]['lr']:.2e}",
-                                         f"{time.time() - t0:.1f}"])
+            run.append_log([epoch, step, f"{tr_loss:.6f}", f"{tr_esr:.6f}",
+                            f"{tr_stft:.6f}", f"{val_esr:.6f}",
+                            f"{opt.param_groups[0]['lr']:.2e}",
+                            f"{time.time() - t0:.1f}"])
             continue                                # dead epoch: no sched/best/last updates
         if use_amp and not np.isfinite(tr_loss):
             use_amp, scaler = False, torch.amp.GradScaler("cuda", enabled=False)
@@ -357,10 +343,9 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         else:
             since_improved += 1
         save_ckpt(last_path, epoch, val_esr)
-        with log_path.open("a", newline="", encoding="utf-8") as fh:
-            csv.writer(fh).writerow([epoch, step, f"{tr_loss:.6f}", f"{tr_esr:.6f}",
-                                     f"{tr_stft:.6f}", f"{val_esr:.6f}", f"{cur_lr:.2e}",
-                                     f"{time.time() - t0:.1f}"])
+        run.append_log([epoch, step, f"{tr_loss:.6f}", f"{tr_esr:.6f}",
+                        f"{tr_stft:.6f}", f"{val_esr:.6f}", f"{cur_lr:.2e}",
+                        f"{time.time() - t0:.1f}"])
         print(f"[epoch {epoch:02d}] train_esr={tr_esr:.5f} val_esr={val_esr:.5f} "
               f"best={best_val:.5f} lr={cur_lr:.1e}{'  *saved*' if improved else ''}",
               flush=True)
@@ -379,9 +364,9 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
     print(f"[cond]  val_esr={val_true:.5f}  val_esr_shuffled={val_shuf:.5f} "
           f"(shuffle should be worse){' OK' if val_shuf > val_true else ' — weak conditioning'}")
 
-    _save_config_copy(run_dir, ecfg)
+    run.save_config_copy({"emulate": asdict(ecfg)})
     emb_dim = model.embedding_dim
-    save_embedding(run_dir / "embedding.pt", model, ids, manifest_sig, emb_dim, name,
+    save_embedding(run.path / "embedding.pt", model, ids, manifest_sig, emb_dim, name,
                    holdout_ids=holdout_ids)
     metrics = {
         "name": name, "arch": arch["arch"], "params": n_params,
@@ -394,8 +379,8 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         "epochs_run": epoch + 1, "train_hours": round(train_hours, 4),
         "manifest_sha256": manifest_sig,
     }
-    (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    print(f"[done]  best_val_esr={best_val:.5f} train_hours={train_hours:.2f} -> {run_dir}")
+    run.save_metrics(metrics)
+    print(f"[done]  best_val_esr={best_val:.5f} train_hours={train_hours:.2f} -> {run.path}")
     return metrics
 
 
@@ -410,52 +395,14 @@ def save_embedding(path: Path, model, device_ids, manifest_sig, embedding_dim, n
     }, path)
 
 
-def _save_config_copy(run_dir: Path, ecfg) -> None:
-    import yaml
-    (run_dir / "config.yaml").write_text(
-        yaml.safe_dump({"emulate": asdict(ecfg)}, sort_keys=False), encoding="utf-8")
-
-
 def _check_resume_compatible(ck: dict, ecfg, receptive_field: int, n_devices: int) -> None:
-    """Fail fast (before the strict state_dict load) if the config changed a
-    structural knob that would make the checkpoint weights incompatible --
-    turns a cryptic ``load_state_dict`` shape error into a clear message.
-    Training dynamics (lr, weight_decay, plateau_*, epochs, losses, batch_size)
-    are free to change. The arch says which knobs those are."""
-    saved = ck.get("emulate_cfg", {})
-    cur = asdict(ecfg)
-    changed = [f"{k}: {saved[k]!r} -> {cur.get(k)!r}"
-               for k in model_class(ecfg.arch).structural_keys()
-               if k in saved and saved[k] != cur.get(k)]
-    if ck.get("receptive_field") not in (None, receptive_field):
-        changed.append(f"receptive_field: {ck['receptive_field']} -> {receptive_field}")
-    if ck.get("device_ids") is not None and len(ck["device_ids"]) != n_devices:
-        changed.append(f"device_count: {len(ck['device_ids'])} -> {n_devices}")
-    if changed:
-        raise RuntimeError(
-            "cannot --resume: the config changed structural knobs that define the "
-            "checkpoint's shape (" + "; ".join(changed) + "). Start a fresh run under "
-            "a new config name, or revert these fields; only training dynamics (lr, "
-            "weight_decay, plateau_*, epochs, losses, batch_size) may change on resume.")
+    """Fail fast if a config edit made the checkpoint's weights incompatible.
 
-
-def _append_config_history(run_dir: Path, ecfg, *, mode: str, start_epoch: int,
-                           resumed_from, best_val: float, max_epochs: int,
-                           applied_lr: float, applied_wd: float) -> None:
-    """Append one JSON line per training session (start or resume) to
-    ``config_history.jsonl`` — a never-overwritten audit trail of how each run
-    and resume was configured. Complements the end-of-run ``config.yaml`` copy
-    (the as-finished snapshot)."""
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "mode": mode,
-        "start_epoch": start_epoch,
-        "resumed_from_epoch": resumed_from,
-        "best_val_esr_at_start": best_val if math.isfinite(best_val) else None,
-        "max_epochs": max_epochs,
-        "applied_lr": applied_lr,
-        "applied_weight_decay": applied_wd,
-        "emulate_cfg": asdict(ecfg),
-    }
-    with (run_dir / "config_history.jsonl").open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry) + "\n")
+    The arch says which knobs are structural; everything else in EmulateConfig
+    is training dynamics and may change on resume.
+    """
+    check_resume_compatible(
+        ck, [(model_class(ecfg.arch).structural_keys(), ck.get("emulate_cfg", {}),
+              asdict(ecfg), "", {})],
+        receptive_field=receptive_field, n_devices=n_devices,
+        dynamics="lr, weight_decay, plateau_*, epochs, losses, batch_size")

@@ -148,6 +148,10 @@ class FingerprintEncoder(nn.Module):
                    proj_hidden=jcfg.enc_proj_hidden, activation=jcfg.enc_activation,
                    normalize=jcfg.enc_normalize, layernorm=jcfg.fp_layernorm)
 
+    @classmethod
+    def provenance(cls, jcfg) -> tuple[str, dict]:
+        return cls.fingerprint_sha256(jcfg.fp_path), cls.load_pooled(jcfg.fp_path)[3]
+
     # --- Forward ------------------------------------------------------------------
     def preprocess_fp(self, fp: torch.Tensor) -> torch.Tensor:
         """``[B, D_fp] -> [B, D_fp]``. No learned parameters, no corpus statistics.

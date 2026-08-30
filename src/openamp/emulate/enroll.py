@@ -37,7 +37,8 @@ from openamp.core.config import Config, EmulateConfig
 from openamp.data import (CorpusPaths, EmulationDataset, WetDryDataset,
                           make_loader, manifest_signature)
 from openamp.emulate.evaluate import _SILENCE_DBFS, _resolve_device, load_model
-from openamp.emulate.train import GRAD_CLIP_NORM, evaluate_esr
+from openamp.emulate.train import evaluate_esr
+from openamp.training import GRAD_CLIP_NORM
 from openamp.losses import DEFAULT_LOSS, build_loss, pre_emphasis
 from openamp.models import A2_EMBEDDING_STD
 

@@ -64,6 +64,7 @@ and hand the generator an embedding drawn from a distribution it never saw.
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -152,6 +153,11 @@ class FrameAttentionEncoder(nn.Module):
                    n_queries=jcfg.enc_pool_queries, d_model=jcfg.enc_pool_dim,
                    proj_hidden=jcfg.enc_proj_hidden, activation=jcfg.enc_activation,
                    normalize=jcfg.enc_normalize, frame_window=jcfg.enc_frame_window)
+
+    @classmethod
+    def provenance(cls, jcfg) -> tuple[str, dict]:
+        return (cls.frames_sha256(jcfg.fp_frames_path),
+                json.loads((Path(jcfg.fp_frames_path) / "meta.json").read_text()))
 
     # --- Forward ------------------------------------------------------------------
     def rows_for(self, device_ids: torch.Tensor) -> torch.Tensor:

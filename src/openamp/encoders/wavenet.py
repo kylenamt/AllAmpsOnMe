@@ -103,6 +103,17 @@ class WaveNetEncoder(nn.Module):
 
     ref_mode = "audio"                                   # a real (dry, wet) window
 
+    @classmethod
+    def provenance(cls, jcfg) -> tuple[str, dict]:
+        """``(sha256, meta)`` of the precomputed data this arm conditions on.
+
+        Nothing here: the encoder is trained from scratch on the corpus the
+        checkpoint already records. The lookup arms override it, since their
+        data can be regenerated out from under a finished run without anything
+        about the checkpoint's shape noticing.
+        """
+        return "", {}
+
     def __init__(self, *, embedding_dim: int, in_channels: int = 2,
                  channels: int = ENC_CHANNELS, activation: str = A2_ACTIVATION,
                  kernel_sizes: tuple[int, ...] = A2_KERNEL_SIZES,

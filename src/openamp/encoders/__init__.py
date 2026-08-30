@@ -14,6 +14,7 @@ the whole experiment.
 ``pooled_dim: int``        width the pooling head emits, before the projection
 ``capacity_report()``      ``{head, pooled_dim, embedding_dim, ceiling, ...}``
 ``from_config(jcfg, De)``  construction from a ``JointConfig``
+``provenance(jcfg)``       ``(sha256, meta)`` of any precomputed data it reads
 =========================  =====================================================
 
 ``ref_mode`` is a **class** attribute, not a property, because the training and
