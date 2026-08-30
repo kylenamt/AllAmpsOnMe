@@ -1,7 +1,7 @@
 """One training script for the amp foundation models.
 
 - Trains the configured architecture (emulate.arch, built by
-  openamp.emulate.models.build_model) on EmulationDataset against the objective
+  openamp.models.build_model) on EmulationDataset against the objective
   from openamp.losses; Adam, reduce-on-plateau, early stopped at the val-ESR
   plateau. Plain single-GPU PyTorch.
 - Every run writes to results/emulate/<name>/: best/last checkpoints, a copy
@@ -27,8 +27,7 @@ import torch
 from openamp.core.config import Config
 from openamp.data import (CorpusPaths, EmulationDataset, build_device_index,
                           load_or_create_holdout, make_loader, manifest_signature)
-from openamp.emulate.models import arch_summary, build_model
-from openamp.emulate.wavenet import count_parameters
+from openamp.models import build_model, count_parameters, model_class
 from openamp.losses import (DEFAULT_LOSS, build_loss, device_loss_weights,
                             pre_emphasis)
 
@@ -178,7 +177,7 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
     n_params = count_parameters(model)
     clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
     rf_ms = 1000.0 * R / cfg.sample_rate
-    arch = arch_summary(ecfg, model)
+    arch = model.describe()
     print(f"[model] name={name} arch={arch['arch']} params={n_params:,} "
           f"devices={len(ids)} holdout={len(holdout_ids)} "
           f"channels={arch['channels']} layers={arch['blocks_x_layers']} "
@@ -417,27 +416,17 @@ def _save_config_copy(run_dir: Path, ecfg) -> None:
         yaml.safe_dump({"emulate": asdict(ecfg)}, sort_keys=False), encoding="utf-8")
 
 
-# Shape-defining knobs: frozen for the life of a run since the checkpoint's
-# weights depend on them. Everything else in EmulateConfig is training dynamics
-# and may change on resume. Device count / receptive field checked separately.
-# ``wn_activation``/``cond_activation`` are here despite changing no shape: both
-# are parameter-free, so a swap would load cleanly and quietly play a different
-# network than the weights were trained for.
-_STRUCTURAL_KEYS = ("arch", "wn_channels", "wn_activation",
-                    "cond_hidden", "cond_activation", "delta_rank",
-                    "embedding_dim", "embed_normalize")
-
-
 def _check_resume_compatible(ck: dict, ecfg, receptive_field: int, n_devices: int) -> None:
     """Fail fast (before the strict state_dict load) if the config changed a
     structural knob that would make the checkpoint weights incompatible --
     turns a cryptic ``load_state_dict`` shape error into a clear message.
     Training dynamics (lr, weight_decay, plateau_*, epochs, losses, batch_size)
-    are free to change."""
+    are free to change. The arch says which knobs those are."""
     saved = ck.get("emulate_cfg", {})
     cur = asdict(ecfg)
     changed = [f"{k}: {saved[k]!r} -> {cur.get(k)!r}"
-               for k in _STRUCTURAL_KEYS if k in saved and saved[k] != cur.get(k)]
+               for k in model_class(ecfg.arch).structural_keys()
+               if k in saved and saved[k] != cur.get(k)]
     if ck.get("receptive_field") not in (None, receptive_field):
         changed.append(f"receptive_field: {ck['receptive_field']} -> {receptive_field}")
     if ck.get("device_ids") is not None and len(ck["device_ids"]) != n_devices:

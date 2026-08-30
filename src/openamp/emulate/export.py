@@ -32,8 +32,7 @@ import numpy as np
 import torch
 
 from openamp.core.util import sha256_file
-from openamp.emulate.wavenet import (NAM_ACTIVATION_NAMES, DeltaWaveNet,
-                                     FiLMWaveNet, MLPFiLMWaveNet)
+from openamp.models import FiLMWaveNet
 
 __all__ = ["export_bundle", "export_profile", "export_profiles", "folded_model",
            "forward_with_embedding", "run_sha8",
@@ -194,8 +193,6 @@ def export_bundle(run_dir: Path, out_path: Path, *,
         profiles.append({"name": str(blob.get("name", name)),
                          "embedding": blob["embedding"].reshape(-1).tolist()})
 
-    is_delta = isinstance(model, DeltaWaveNet)
-    is_mlp = isinstance(model, MLPFiLMWaveNet)
     bundle = {
         "aaom_bundle": BUNDLE_VERSION,
         "run": {"name": ck.get("name", run_dir.name), "sha8": run_sha8(run_dir),
@@ -204,24 +201,7 @@ def export_bundle(run_dir: Path, out_path: Path, *,
                 "val_esr": float(ck.get("val_esr", float("nan"))),
                 "n_devices": len(ck["device_ids"])},
         "sample_rate": int(ck["sample_rate"]),
-        "arch": {"type": ("delta_wavenet_a2" if is_delta else
-                          "mlpfilm_wavenet_a2" if is_mlp else "film_wavenet_a2"),
-                 "channels": model.channels,
-                 "embedding_dim": model.embedding_dim,
-                 # NAM's own spelling, so the plugin can hand it straight to
-                 # NeuralAmpModelerCore; absent in pre-knob bundles = LeakyReLU.
-                 "activation": NAM_ACTIVATION_NAMES[model.activation],
-                 # Per-arch generator descriptors only, so film_wavenet_a2 bundles
-                 # stay byte-identical to every one already shipped.
-                 **({"delta_rank": model.delta_rank} if is_delta else
-                    {"cond_hidden": model.cond_hidden,
-                     "cond_activation": NAM_ACTIVATION_NAMES[model.cond_activation]}
-                    if is_mlp else {}),
-                 "kernel_sizes": list(model.kernel_sizes),
-                 "dilations": list(model.dilations),
-                 "head_kernel": model.head_kernel,
-                 "head_scale": float(model.head_scale),
-                 "receptive_field": model.receptive_field},
+        "arch": model.export_descriptor(),
         "weights": {"rechannel_w": _blob(model.rechannel.weight),
                     "layers": layers,
                     "head_w": _blob(model.head_rechannel.weight),

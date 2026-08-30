@@ -1,7 +1,7 @@
 """The two halves wired together: encoder -> embedding -> generator.
 
 Deliberately thin. The generator is
-:class:`~openamp.emulate.wavenet.FiLMWaveNet` exactly as it trains anywhere else
+:class:`~openamp.models.FiLMWaveNet` exactly as it trains anywhere else
 — this only drives it through ``forward_emb`` (a vector) instead of ``forward``
 (a table row), which is the one seam the joint model needs.
 
@@ -21,7 +21,7 @@ import torch
 from torch import nn
 
 from openamp.core.config import EmulateConfig, JointConfig
-from openamp.emulate.models import build_model
+from openamp.models import build_model
 from openamp.joint_model.fingerprint_encoder import FingerprintEncoder
 from openamp.joint_model.frame_encoder import FrameAttentionEncoder
 from openamp.joint_model.wavenet_encoder import WaveNetEncoder

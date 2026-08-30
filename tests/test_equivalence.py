@@ -143,7 +143,7 @@ def test_dataset_items_are_unchanged(tmp_path, write_corpus):
 # --- 2. Models and encoders: init order + forward arithmetic ---------------------
 @torch.no_grad()
 def test_model_init_and_forward_are_unchanged():
-    from openamp.emulate.models import ARCHS, build_model
+    from openamp.models import ARCHS, build_model
 
     x = torch.linspace(-0.8, 0.8, 512).reshape(1, 1, 512).repeat(2, 1, 1)
     idx = torch.tensor([0, 2])

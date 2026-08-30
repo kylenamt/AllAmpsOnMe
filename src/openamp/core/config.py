@@ -36,7 +36,7 @@ class EmulateConfig:
     overrides just this section, run named after the file stem.
     """
 
-    # Model architecture, see emulate/wavenet.py:
+    # Model architecture, see openamp/models/a2_wavenet.py:
     # film_wavenet | mlpfilm_wavenet | delta_wavenet
     arch: str = "film_wavenet"
 

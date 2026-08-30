@@ -19,7 +19,7 @@ from dataclasses import asdict
 torch = pytest.importorskip("torch")
 
 from openamp.core.config import JointConfig, load_config  # noqa: E402
-from openamp.emulate.wavenet import FiLMWaveNet  # noqa: E402
+from openamp.models import FiLMWaveNet  # noqa: E402
 from openamp.joint_model.model import JointModel, build_joint  # noqa: E402
 from openamp.joint_model.wavenet_encoder import (AttentiveStatsPool,  # noqa: E402
                                                  WaveNetEncoder)

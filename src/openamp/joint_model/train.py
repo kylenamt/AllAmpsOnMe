@@ -42,7 +42,7 @@ import torch.nn.functional as F
 
 from openamp.core.config import Config
 from openamp.data import CorpusPaths, JointDataset, make_loader, manifest_signature
-from openamp.emulate.wavenet import count_parameters
+from openamp.models import count_parameters, model_class
 from openamp.emulate.train import GRAD_CLIP_NORM, _device_index
 from openamp.losses import (DEFAULT_LOSS, build_loss, device_loss_weights,
                             pre_emphasis)
@@ -622,11 +622,13 @@ def _save_config_copy(run_dir: Path, ecfg, jcfg) -> None:
         encoding="utf-8")
 
 
-# Shape-defining knobs, frozen for the life of a run. Beyond emulate's list:
-# every encoder-shape knob, plus enc_normalize/fp_path/fp_preprocess -- these
-# change no shape, but a swap would quietly feed the generator a different vector.
-_STRUCTURAL_EMULATE = ("arch", "wn_channels", "wn_activation", "cond_hidden",
-                       "cond_activation", "delta_rank", "embedding_dim")
+# Shape-defining knobs, frozen for the life of a run. The generator's own list
+# comes from the arch (models.structural_keys); on top of it, every
+# encoder-shape knob plus enc_normalize/fp_path/fp_preprocess -- these change no
+# shape, but a swap would quietly feed the generator a different vector.
+# embed_normalize is dropped on purpose: this check has never included it, and
+# adding it would reject resumes that work today (see FINDINGS).
+_SKIP_EMULATE = ("embed_normalize",)
 _STRUCTURAL_JOINT = ("enc_channels", "enc_activation", "enc_attn_hidden",
                      "enc_proj_hidden", "enc_normalize", "enc_head", "enc_taps",
                      "enc_tap_stride", "enc_expand_dim", "enc_n_heads",
@@ -657,9 +659,11 @@ def _same(a, b) -> bool:
 def _check_resume_compatible(ck: dict, ecfg, jcfg, receptive_field: int,
                              n_devices: int) -> None:
     """Fail fast if a config edit made the checkpoint's weights incompatible."""
+    emulate_keys = tuple(k for k in model_class(ecfg.arch).structural_keys()
+                         if k not in _SKIP_EMULATE)
     changed = []
     for keys, saved, cur, prefix, legacy in (
-            (_STRUCTURAL_EMULATE, ck.get("emulate_cfg", {}), asdict(ecfg), "emulate", {}),
+            (emulate_keys, ck.get("emulate_cfg", {}), asdict(ecfg), "emulate", {}),
             (_STRUCTURAL_JOINT, ck.get("joint_cfg", {}), asdict(jcfg), "joint",
              _LEGACY_JOINT_DEFAULTS)):
         for k in keys:

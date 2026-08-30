@@ -29,7 +29,7 @@ import torch
 
 from openamp.core.config import Config, EmulateConfig
 from openamp.data import CorpusPaths, EmulationDataset
-from openamp.emulate.models import arch_summary, build_model
+from openamp.models import build_model
 
 # One row of the comparison CSV, in order (spec §3).
 COMPARISON_COLUMNS = [
@@ -105,7 +105,7 @@ def evaluate_run(cfg: Config, run_dir: Path, *, device: str = "cpu",
     meta = _run_metrics(run_dir)
     return {
         "run_name": ck.get("name", run_dir.name),
-        **arch_summary(ecfg, model),
+        **model.describe(),
         "params": int(meta.get("params", ck.get("params", 0))),
         "receptive_field_ms": round(1000.0 * R / cfg.sample_rate, 3),
         "embedding_dim": model.embedding_dim,

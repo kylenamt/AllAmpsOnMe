@@ -34,8 +34,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from openamp.emulate.wavenet import (A2_ACTIVATION, A2_DILATIONS, A2_KERNEL_SIZES,
-                                     make_activation, normalize_activation)
+from openamp.models import (A2_ACTIVATION, A2_DILATIONS, A2_KERNEL_SIZES,
+                            make_activation, normalize_activation)
 
 __all__ = ["WaveNetEncoder", "WaveNetEncoderLayer", "AttentiveStatsPool",
            "MultiHeadAttentiveStatsPool", "MultiTapStatsHead",

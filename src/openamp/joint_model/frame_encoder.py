@@ -71,7 +71,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from openamp.emulate.wavenet import make_activation, normalize_activation
+from openamp.models import make_activation, normalize_activation
 from openamp.encoder.probe import CrossAttentionPool, FrameStore
 
 __all__ = ["FrameAttentionEncoder"]

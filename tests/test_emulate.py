@@ -12,10 +12,9 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from openamp.core.config import EmulateConfig, load_config
-from openamp.emulate.models import build_model
-from openamp.emulate.wavenet import (A2_DILATIONS, A2_KERNEL_SIZES, DeltaWaveNet,
-                                     DeltaWaveNetLayer, FiLMWaveNet, MLPFiLMWaveNet,
-                                     count_parameters, film_output_linear)
+from openamp.models import (A2_DILATIONS, A2_KERNEL_SIZES, DeltaWaveNet,
+                            DeltaWaveNetLayer, FiLMWaveNet, MLPFiLMWaveNet,
+                            build_model, count_parameters, film_output_linear)
 
 # A shrunken A2-shaped schedule shared by the weight-conditioned arch tests.
 SMALL_SCHEDULE = dict(kernel_sizes=(3, 3, 3), dilations=(1, 2, 4), head_kernel=4)
@@ -242,7 +241,7 @@ def test_delta_family_contains_the_film_hook():
     hook, not about something the arch cannot express. Build the delta that
     reproduces a given (gamma, beta) and check the two layers agree sample-for-sample.
     """
-    from openamp.emulate.wavenet import FiLMWaveNetLayer
+    from openamp.models import FiLMWaveNetLayer
 
     torch.manual_seed(0)
     C, K, D, E = 4, 3, 2, 6
@@ -317,29 +316,38 @@ def test_wavenet_activation_option_swaps_the_nonlinearity():
 
 
 def test_wavenet_activation_from_config_and_validation():
-    from openamp.emulate.models import arch_summary
-
     m = FiLMWaveNet.from_config(
         EmulateConfig(arch="film_wavenet", wn_channels=4, wn_activation="TanH"), 3)
     assert m.activation == "tanh"                     # case-insensitive
     assert isinstance(m.layers[-1].act, torch.nn.Tanh)
     default = FiLMWaveNet.from_config(EmulateConfig(arch="film_wavenet"), 3)
     assert default.activation == "leakyrelu"          # the capture default
-    # The comparison CSV tags a non-capture activation onto the topology column.
-    assert arch_summary(EmulateConfig(arch="film_wavenet"))["blocks_x_layers"] == "a2-23L"
-    assert arch_summary(EmulateConfig(arch="film_wavenet", wn_activation="tanh")
-                        )["blocks_x_layers"] == "a2-23L-tanh"
-    # The generator is tagged the same way, so delta runs are distinguishable in
-    # the existing comparison table without a new column.
-    assert arch_summary(EmulateConfig(arch="delta_wavenet", delta_rank=6)
-                        )["blocks_x_layers"] == "a2-23L-delta6"
-    assert arch_summary(EmulateConfig(arch="delta_wavenet", delta_rank=8,
-                                      wn_activation="tanh")
-                        )["blocks_x_layers"] == "a2-23L-delta8-tanh"
     with pytest.raises(ValueError, match="wn_activation"):
         FiLMWaveNet(n_devices=1, activation="relu")
     with pytest.raises(ValueError, match="wn_activation"):
         build_model(EmulateConfig(arch="film_wavenet", wn_activation="silu"), 3)
+
+
+def test_describe_tags_the_topology_column():
+    """Each arch labels itself for the logs and the comparison CSV: a non-capture
+    activation and the conditioning generator tag onto the topology string rather
+    than getting their own columns, and the two film_wavenet strings stay
+    untouched so old rows stay comparable."""
+    def tag(**kw):
+        return build_model(EmulateConfig(wn_channels=4, embedding_dim=8, **kw),
+                           2).describe()["blocks_x_layers"]
+
+    assert tag(arch="film_wavenet") == "a2-23L"
+    assert tag(arch="film_wavenet", wn_activation="tanh") == "a2-23L-tanh"
+    assert tag(arch="mlpfilm_wavenet", cond_hidden=16) == "a2-23L-mlp16"
+    assert tag(arch="mlpfilm_wavenet", cond_hidden=16,
+               cond_activation="tanh") == "a2-23L-mlp16-ctanh"
+    assert tag(arch="delta_wavenet", delta_rank=6) == "a2-23L-delta6"
+    assert tag(arch="delta_wavenet", delta_rank=8,
+               wn_activation="tanh") == "a2-23L-delta8-tanh"
+    d = build_model(EmulateConfig(arch="delta_wavenet", wn_channels=4,
+                                  embedding_dim=8), 2).describe()
+    assert d["arch"] == "delta_wavenet" and d["channels"] == 4
 
 
 def test_build_model_dispatches_on_arch():

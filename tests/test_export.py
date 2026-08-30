@@ -11,7 +11,7 @@ torch = pytest.importorskip("torch")
 
 from openamp.emulate.export import (_blob, _unblob, folded_model,
                                     forward_with_embedding)
-from openamp.emulate.wavenet import DeltaWaveNet, FiLMWaveNet, MLPFiLMWaveNet
+from openamp.models import DeltaWaveNet, FiLMWaveNet, MLPFiLMWaveNet
 
 # Small-but-real schedule: mixed kernels like A2, a few hundred samples of RF.
 KW = dict(n_devices=4, channels=4, embedding_dim=8,
@@ -97,7 +97,7 @@ def test_fold_matches_film_under_tanh_activation(cond_hidden):
     """Folding rewrites conv/mixin weights *upstream* of the nonlinearity, so a
     ``wn_activation: tanh`` run must fold exactly like the LeakyReLU one — and the
     bundle must name it in NAM's spelling so the plugin picks the right one."""
-    from openamp.emulate.wavenet import NAM_ACTIVATION_NAMES
+    from openamp.models import NAM_ACTIVATION_NAMES
 
     m = _model(5, cond_hidden=cond_hidden, activation="tanh")
     assert NAM_ACTIVATION_NAMES[m.activation] == "Tanh"   # what export_bundle writes
@@ -211,7 +211,7 @@ def test_bundle_conditioning_payload_is_arch_specific(tmp_path):
     def _bundle(arch, **extra):
         ecfg = EmulateConfig(arch=arch, wn_channels=KW["channels"],
                              embedding_dim=KW["embedding_dim"], **extra)
-        from openamp.emulate.models import build_model
+        from openamp.models import build_model
         mm = build_model(ecfg, 2).eval()
         run = tmp_path / arch
         run.mkdir()

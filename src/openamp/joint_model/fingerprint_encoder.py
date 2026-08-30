@@ -33,7 +33,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from openamp.emulate.wavenet import make_activation, normalize_activation
+from openamp.models import make_activation, normalize_activation
 
 __all__ = ["FingerprintEncoder", "FINGERPRINT_PREPROCESS", "DRY_ID"]
 

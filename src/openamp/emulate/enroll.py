@@ -39,7 +39,7 @@ from openamp.data import (CorpusPaths, EmulationDataset, WetDryDataset,
 from openamp.emulate.evaluate import _SILENCE_DBFS, _resolve_device, load_model
 from openamp.emulate.train import GRAD_CLIP_NORM, evaluate_esr
 from openamp.losses import DEFAULT_LOSS, build_loss, pre_emphasis
-from openamp.emulate.wavenet import A2_EMBEDDING_STD
+from openamp.models import A2_EMBEDDING_STD
 
 ENROLL_LR = 1e-2                 # only embeddings train (the table trained at 5e-4-2e-3 with the network)
 ENROLL_EPOCHS = 30               # max; early-stopped on val ESR
