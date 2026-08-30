@@ -52,27 +52,35 @@
 # Corpus/device notes are inherited from nam_a2_256_mixed.yaml: 88 EGDB files +
 # the TONE3000 v3 capture signal, 404 devices (486 held out), A1 captures.
 
-emulate:
-  # --- Model -------------------------------------------------------------------
-  arch: film_wavenet
-  wn_channels: 8           # A2 full-width submodel
-  embedding_dim: 256
+data_dir: data_mixed   # was an OPENAMP_DATA_DIR prefix in the commands above
 
-  # --- Training ----------------------------------------------------------------
+model:
+  arch: film_wavenet
+  channels: 8  # A2 full-width submodel
+  embedding_dim: 256
+  embed_normalize: true  # NEW: e = embed_scale * normalize(row)
+
+data:
+  dataset: emulation
+
   holdout_frac: 0.1
-  clip_seconds: 2.0        # must match the corpus clip grid
-  batch_size: 32
+  clip_seconds: 2.0  # must match the corpus clip grid
   pairs_per_epoch: 50000
-  epochs: 400              # early-stop still ends it sooner (see note 4 above)
-  lr: 4.0e-4                # keep the decimal point -- PyYAML reads bare 4e-4 as a string.
+
+loss:
+  name: esr_mrstft
+  stft_weight: 0.05  # held at nam_a2_256_mixed's value
+  preemph_coeff: 0.95  # CHANGED from 0.85
+  device_loss_weighting: 1.0  # per-device ESR weighting (train loss + val ESR)
+
+training:
+  batch_size: 32
+  epochs: 400  # early-stop still ends it sooner (see note 4 above)
+  lr: 4.0e-4  # keep the decimal point -- PyYAML reads bare 4e-4 as a string.
   weight_decay: 3.17e-7
   plateau_patience: 3
-  plateau_factor: 0.9      # very gentle anneal (0.5 in nam_a2_256_mixed)
+  plateau_factor: 0.9  # very gentle anneal (0.5 in nam_a2_256_mixed)
   early_stop_patience: 999
-  stft_weight: 0.05        # held at nam_a2_256_mixed's value
-  preemph: 0.95            # CHANGED from 0.85
-  device_loss_weighting: 1.0   # per-device ESR weighting (train loss + val ESR)
-  embed_normalize: true        # NEW: e = embed_scale * normalize(row)
   num_workers: 6
   amp: true
   amp_dtype: bf16

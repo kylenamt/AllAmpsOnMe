@@ -45,11 +45,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from openamp.core.config import Config, EmulateConfig, load_config
+from openamp.core.config import Config, load_config
 from openamp.data import CorpusPaths, EmulationDataset, make_loader
 from openamp.encoders import CrossAttentionPool, FrameStore
 from openamp.evaluation import (SILENCE_DBFS, load_model, per_device_esr,
                                 resolve_device)
+from openamp.spec import spec_from_checkpoint
 
 # What mean+std pooling of the same DAC latents achieves, measured over the same
 # 405 devices. The pooler has to beat these or the input was never the problem.
@@ -136,11 +137,11 @@ def holdout_esr(cfg: Config, run_dir: Path, pred: dict[int, np.ndarray], *,
     """
     dev = torch.device(resolve_device(device))
     model, ck = load_model(run_dir, str(dev))
-    ecfg = EmulateConfig(**ck["emulate_cfg"])
+    spec = spec_from_checkpoint(ck)
     ids = sorted(pred)
     idx = {d: i for i, d in enumerate(ids)}
 
-    emb = nn.Embedding(len(ids), ecfg.embedding_dim).to(dev)
+    emb = nn.Embedding(len(ids), model.embedding_dim).to(dev)
     with torch.no_grad():
         emb.weight.copy_(torch.from_numpy(np.stack([pred[d] for d in ids])).to(dev))
     model.requires_grad_(False)
@@ -148,11 +149,12 @@ def holdout_esr(cfg: Config, run_dir: Path, pred: dict[int, np.ndarray], *,
     model.eval()
 
     R = model.receptive_field
-    clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
+    clip = int(round(spec.data.clip_seconds * cfg.sample_rate))
     ds = EmulationDataset(CorpusPaths.from_config(cfg), "test", receptive_field=R,
                           id_to_idx=idx, clip_samples=clip,
                           pairs_per_epoch=test_pairs * len(ids), seed=cfg.seed + 7)
-    loader = make_loader(ds, ecfg.batch_size, ecfg.num_workers, shuffle=False,
+    loader = make_loader(ds, spec.training.batch_size, spec.training.num_workers,
+                         shuffle=False,
                           seed=cfg.seed + 7, drop_last=False)
     per_dev = per_device_esr(model, loader, dev, len(ids),
                               silence_dbfs=SILENCE_DBFS, clip=clip)

@@ -10,26 +10,32 @@
 #
 # Full copy of nam_a2.yaml's numbers -- see delta_a2_256.yaml.
 
-emulate:
-  # --- Model -------------------------------------------------------------------
-  arch: delta_wavenet      # A2 topology; embedding -> low-rank residual on each conv
-  wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
+model:
+  arch: delta_wavenet  # A2 topology; embedding -> low-rank residual on each conv
+  channels: 8  # A2 full-width submodel (the exports' other width is 3)
   embedding_dim: 256
-  delta_rank: 6            # parameter-matched to nam_a2_256's linear FiLM (see above)
+  delta_rank: 6  # parameter-matched to nam_a2_256's linear FiLM (see above)
 
-  # --- Training (NAM's A2 numbers where the knob exists) -----------------------
+data:
+  dataset: emulation
+
   holdout_frac: 0.1
-  clip_seconds: 2.0        # must match the corpus clip grid
-  batch_size: 32
+  clip_seconds: 2.0  # must match the corpus clip grid
   pairs_per_epoch: 50000
-  epochs: 100              # NAM trainer.max_epochs; early-stop still ends it sooner
-  lr: 4.0e-3                # keep the decimal point -- PyYAML reads bare 4e-3 as a string
+
+loss:
+  name: esr_mrstft
+  stft_weight: 0.05  # NAM's MRSTFT weight, rescaled from MSE to this trainer's ESR term
+  preemph_coeff: 0.85  # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
+
+training:
+  batch_size: 32
+  epochs: 100  # NAM trainer.max_epochs; early-stop still ends it sooner
+  lr: 4.0e-3  # keep the decimal point -- PyYAML reads bare 4e-3 as a string
   weight_decay: 3.17e-7
   plateau_patience: 3
   plateau_factor: 0.5
   early_stop_patience: 15
-  stft_weight: 0.05         # NAM's MRSTFT weight, rescaled from MSE to this trainer's ESR term
-  preemph: 0.85            # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
   num_workers: 6
   amp: true
   amp_dtype: bf16

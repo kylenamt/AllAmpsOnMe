@@ -8,10 +8,19 @@
 #   openamp emulate --config configs/emulate/wavenet_a2.yaml                     # full run
 #
 # Training knobs inherit the paper defaults; only arch selection lives here.
-emulate:
+
+model:
   arch: film_wavenet
-  wn_channels: 8           # A2 full-width; width sweeps = copy file, change number
+  channels: 8  # A2 full-width; width sweeps = copy file, change number
   embedding_dim: 128
+
+data:
+  dataset: emulation
+
+loss:
+  name: esr_mrstft
+
+training:
   # NAM trains this exact topology at lr 4e-3; the paper default 5e-4 (tuned for
   # the TCN) starts it far too cold. 2e-3 splits the difference for 405-device
   # conditioning + MRSTFT; ReduceLROnPlateau walks it down from there.

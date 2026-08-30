@@ -1,11 +1,12 @@
 """One training script for the amp foundation models.
 
-- Trains the configured architecture (emulate.arch, built by
-  openamp.models.build_model) on EmulationDataset against the objective
-  from openamp.losses; Adam, reduce-on-plateau, early stopped at the val-ESR
-  plateau. Plain single-GPU PyTorch.
-- Every run writes to results/emulate/<name>/: best/last checkpoints, a copy
-  of the config, metrics.json, train_log.csv (per-epoch train/val curves).
+- Takes a :class:`~openamp.spec.RunSpec` and nothing else: the architecture
+  (``model:``), the dataset (``data:``), the objective (``loss:``) and the
+  schedule (``training:``) all arrive through registries, so the loop below
+  never names one of them. Adam, reduce-on-plateau, early stopped at the
+  val-ESR plateau. Plain single-GPU PyTorch.
+- Every run writes to results/emulate/<name>/: best/last checkpoints,
+  resolved_config.yaml, metrics.json, train_log.csv (per-epoch curves).
 - Sanity ladder before any long job: overfit_one_batch (one batch -> ESR ~0),
   then a mini-run (--limit-devices) checking val_esr_shuffled is worse than
   val_esr (proves the conditioning is doing real work).
@@ -14,18 +15,17 @@
 from __future__ import annotations
 
 import time
-from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from openamp.core.config import Config
-from openamp.data import (CorpusPaths, EmulationDataset, build_device_index,
+from openamp.data import (build_dataset, build_device_index,
                           load_or_create_holdout, make_loader, manifest_signature)
 from openamp.evaluation.metrics import pooled_esr_terms
-from openamp.models import build_model, count_parameters, model_class
-from openamp.losses import DEFAULT_LOSS, build_loss, device_loss_weights
+from openamp.models import build_model, count_parameters
+from openamp.losses import build_loss, device_loss_weights
+from openamp.spec import RunSpec
 from openamp.training import (GRAD_CLIP_NORM, RunDir, amp_setup, build_scheduler,
                               check_resume_compatible)
 
@@ -34,14 +34,14 @@ LOG_COLUMNS = ["epoch", "step", "train_loss", "train_esr", "train_stft", "val_es
 
 
 # --- Data plumbing -------------------------------------------------------------
-def _device_index(cfg: Config, ecfg, limit_devices: int | None):
+def _device_index(spec: RunSpec, limit_devices: int | None):
     """Resolve ``(device_ids, id_to_idx, holdout_ids)`` for a run.
 
-    The ``holdout_frac`` device holdout is excluded first, then
+    The ``data.holdout_frac`` device holdout is excluded first, then
     ``--limit-devices N`` keeps the first N (the mini-run).
     """
-    paths = CorpusPaths.from_config(cfg)
-    holdout = load_or_create_holdout(paths, ecfg.holdout_frac, cfg.seed)
+    paths = spec.paths
+    holdout = load_or_create_holdout(paths, spec.data.holdout_frac, spec.seed)
     ids, _ = build_device_index(paths, exclude=holdout)
     if limit_devices:
         ids = ids[:int(limit_devices)]
@@ -105,31 +105,32 @@ def evaluate_esr(model, loader, device, coeff: float, *, n_batches: int | None =
 
 
 # --- Sanity ladder -------------------------------------------------------------
-def overfit_one_batch(cfg: Config, *, name: str = "overfit", device: str = "cuda",
+def overfit_one_batch(spec: RunSpec, *, device: str = "cuda",
                       steps: int = 400, limit_devices: int = 8) -> float:
     """Sanity #1: a single batch should reach ~zero ESR (spec §4.2)."""
-    ecfg = cfg.emulate
+    tcfg = spec.training
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(cfg.seed)
+    torch.manual_seed(spec.seed)
 
-    ids, id_to_idx, _ = _device_index(cfg, ecfg, limit_devices)
-    model = build_model(ecfg, len(ids)).to(dev)
+    ids, id_to_idx, _ = _device_index(spec, limit_devices)
+    model = build_model(spec.model, len(ids)).to(dev)
     R = model.receptive_field
-    clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
-    ds = EmulationDataset(CorpusPaths.from_config(cfg), "train", receptive_field=R,
-                          id_to_idx=id_to_idx, clip_samples=clip,
-                          pairs_per_epoch=ecfg.batch_size, seed=cfg.seed)
-    loader = make_loader(ds, ecfg.batch_size, 0, shuffle=False, seed=cfg.seed, drop_last=False)
+    ds = build_dataset(spec.data.dataset, paths=spec.paths, split="train",
+                       receptive_field=R, id_to_idx=id_to_idx,
+                       clip_samples=spec.clip_samples,
+                       pairs_per_epoch=tcfg.batch_size, seed=spec.seed,
+                       sources=spec.data.sources, **spec.data.kwargs)
+    loader = make_loader(ds, tcfg.batch_size, 0, shuffle=False, seed=spec.seed,
+                         drop_last=False)
     batch = next(iter(loader))
     inp = batch["input"].to(dev)
     target = batch["target"].to(dev).unsqueeze(1)     # [B, 1, clip]
     di = batch["device_idx"].to(dev)
 
-    lossfn = build_loss(DEFAULT_LOSS, preemph_coeff=ecfg.preemph,
-                        stft_weight=ecfg.stft_weight).to(dev)
-    opt = torch.optim.Adam(model.parameters(), lr=ecfg.lr)
+    lossfn = build_loss(spec.loss).to(dev)
+    opt = torch.optim.Adam(model.parameters(), lr=tcfg.lr)
     print(f"[overfit] devices={len(ids)} params={count_parameters(model):,} "
-          f"receptive_field={R} ({1000 * R / cfg.sample_rate:.1f} ms)")
+          f"receptive_field={R} ({1000 * R / spec.sample_rate:.1f} ms)")
     final = float("nan")
     for step in range(steps):
         opt.zero_grad(set_to_none=True)
@@ -148,28 +149,27 @@ def overfit_one_batch(cfg: Config, *, name: str = "overfit", device: str = "cuda
 
 
 # --- Main training loop --------------------------------------------------------
-def train(cfg: Config, *, name: str = "default", device: str = "cuda",
-          epochs: int | None = None, resume: bool = False,
-          limit_devices: int | None = None) -> dict:
-    """Train the FiLM-TCN to a val-ESR plateau; returns a small summary dict."""
-    ecfg = cfg.emulate
-    max_epochs = int(epochs if epochs is not None else ecfg.epochs)
+def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
+          resume: bool = False, limit_devices: int | None = None) -> dict:
+    """Train the conditioned model to a val-ESR plateau; returns a summary dict."""
+    tcfg, name = spec.training, spec.name
+    max_epochs = int(epochs if epochs is not None else tcfg.epochs)
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
+    torch.manual_seed(spec.seed)
+    np.random.seed(spec.seed)
     torch.backends.cudnn.benchmark = True
 
     # --- Table + model ----------------------------------------------------------
-    ids, id_to_idx, holdout_ids = _device_index(cfg, ecfg, limit_devices)
+    ids, id_to_idx, holdout_ids = _device_index(spec, limit_devices)
     if not ids:
         raise RuntimeError("No render-ok devices. Run `openamp render` first.")
-    paths = CorpusPaths.from_config(cfg)
+    paths = spec.paths
     manifest_sig = manifest_signature(paths)
-    model = build_model(ecfg, len(ids)).to(dev)
+    model = build_model(spec.model, len(ids)).to(dev)
     R = model.receptive_field
     n_params = count_parameters(model)
-    clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
-    rf_ms = 1000.0 * R / cfg.sample_rate
+    clip = spec.clip_samples
+    rf_ms = 1000.0 * R / spec.sample_rate
     arch = model.describe()
     print(f"[model] name={name} arch={arch['arch']} params={n_params:,} "
           f"devices={len(ids)} holdout={len(holdout_ids)} "
@@ -178,53 +178,55 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
     print(f"[model] receptive_field={R} samples ({rf_ms:.1f} ms)  clip={clip}")
 
     # Embedding noise: train steps only (val/eval read the table verbatim).
-    if ecfg.embed_noise_frac < 0.0:
-        raise ValueError("emulate.embed_noise_frac must be >= 0 (fraction of the "
-                         f"embedding table's std), got {ecfg.embed_noise_frac}")
-    noise_frac = float(ecfg.embed_noise_frac)
+    if tcfg.embed_noise_frac < 0.0:
+        raise ValueError("training.embed_noise_frac must be >= 0 (fraction of the "
+                         f"embedding table's std), got {tcfg.embed_noise_frac}")
+    noise_frac = float(tcfg.embed_noise_frac)
     if noise_frac > 0.0:
         print(f"[model] embed_noise_frac={noise_frac:g}")
 
     # --- Data -------------------------------------------------------------------
-    train_ds = EmulationDataset(paths, "train", receptive_field=R, id_to_idx=id_to_idx,
-                                clip_samples=clip, pairs_per_epoch=ecfg.pairs_per_epoch,
-                                seed=cfg.seed)
-    val_ds = EmulationDataset(paths, "val", receptive_field=R, id_to_idx=id_to_idx,
-                              clip_samples=clip, pairs_per_epoch=ecfg.val_pairs,
-                              seed=cfg.seed + 999)
-    val_loader = make_loader(val_ds, ecfg.batch_size, ecfg.num_workers,
-                              shuffle=False, seed=cfg.seed + 999, drop_last=False)
+    common = dict(paths=paths, receptive_field=R, id_to_idx=id_to_idx,
+                  clip_samples=clip, sources=spec.data.sources, **spec.data.kwargs)
+    train_ds = build_dataset(spec.data.dataset, split="train",
+                             pairs_per_epoch=spec.data.pairs_per_epoch,
+                             seed=spec.seed, **common)
+    val_ds = build_dataset(spec.data.dataset, split="val",
+                           pairs_per_epoch=tcfg.val_pairs,
+                           seed=spec.seed + 999, **common)
+    val_loader = make_loader(val_ds, tcfg.batch_size, tcfg.num_workers,
+                              shuffle=False, seed=spec.seed + 999, drop_last=False)
     print(f"[data]  train_devices={len(train_ds.device_ids)} "
-          f"val_devices={len(val_ds.device_ids)} pairs/epoch={ecfg.pairs_per_epoch}")
+          f"val_devices={len(val_ds.device_ids)} "
+          f"pairs/epoch={spec.data.pairs_per_epoch}")
 
     # --- Optim / loss / bookkeeping --------------------------------------------
-    lossfn = build_loss(DEFAULT_LOSS, preemph_coeff=ecfg.preemph,
-                        stft_weight=ecfg.stft_weight).to(dev)
+    lossfn = build_loss(spec.loss).to(dev)
     # Per-device ESR weighting, applied to the train loss and val ESR alike.
-    if ecfg.device_loss_weighting < 0.0:
-        raise ValueError("emulate.device_loss_weighting must be >= 0, got "
-                         f"{ecfg.device_loss_weighting}")
+    strength = float(spec.loss.device_loss_weighting)
+    if strength < 0.0:
+        raise ValueError(f"loss.device_loss_weighting must be >= 0, got {strength}")
     dev_w = None
-    if ecfg.device_loss_weighting > 0.0:
-        _w = device_loss_weights(cfg.renders_manifest_path, ids,
-                                 float(ecfg.device_loss_weighting))
+    if strength > 0.0:
+        _w = device_loss_weights(paths.renders_manifest, ids, strength)
         dev_w = torch.as_tensor(_w, dtype=torch.float32, device=dev)
-        print(f"[loss]  device_loss_weighting={ecfg.device_loss_weighting:g} "
+        print(f"[loss]  device_loss_weighting={strength:g} "
               f"weights min={_w.min():.4g} p50={np.median(_w):.4g} "
               f"max={_w.max():.4g} (mean 1.0, ESR term only; val ESR weighted "
               f"too — not comparable with a strength-0 run)")
-    opt = torch.optim.Adam(model.parameters(), lr=ecfg.lr, weight_decay=ecfg.weight_decay)
-    sched = build_scheduler(opt, ecfg)
-    use_amp, amp_dtype, scaler = amp_setup(ecfg, dev)
+    opt = torch.optim.Adam(model.parameters(), lr=tcfg.lr,
+                           weight_decay=tcfg.weight_decay)
+    sched = build_scheduler(opt, tcfg)
+    use_amp, amp_dtype, scaler = amp_setup(tcfg, dev)
 
-    run = RunDir(cfg.emulate_run_dir(name))
+    run = RunDir(spec.run_dir)
     ckpt_path, last_path = run.checkpoint, run.last
 
     start_epoch, best_val, since_improved = 0, float("inf"), 0
     resumed_from = None
     if resume and last_path.is_file():
         ck = torch.load(last_path, map_location=dev, weights_only=False)
-        _check_resume_compatible(ck, ecfg, R, len(ids))
+        _check_resume_compatible(ck, spec, R, len(ids))
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["optim"])
         scaler.load_state_dict(ck["scaler"])
@@ -234,9 +236,9 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         # Config wins over the checkpoint's own lr/weight_decay, so a resumed
         # run can be hand-annealed; Adam's moment buffers are still preserved.
         for g in opt.param_groups:
-            g["lr"], g["weight_decay"] = ecfg.lr, ecfg.weight_decay
+            g["lr"], g["weight_decay"] = tcfg.lr, tcfg.weight_decay
         print(f"[resume] from epoch {start_epoch}, best_val_esr={best_val:.5f}; "
-              f"lr={ecfg.lr:.2e} weight_decay={ecfg.weight_decay:g} (from config)")
+              f"lr={tcfg.lr:.2e} weight_decay={tcfg.weight_decay:g} (from config)")
     else:
         run.start_log(LOG_COLUMNS)
     run.append_config_history(
@@ -244,26 +246,26 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         start_epoch=start_epoch, resumed_from=resumed_from, best_val=best_val,
         max_epochs=max_epochs, applied_lr=opt.param_groups[0]["lr"],
         applied_weight_decay=opt.param_groups[0]["weight_decay"],
-        emulate_cfg=asdict(ecfg))
+        spec=spec.to_dict())
 
     def save_ckpt(path: Path, epoch: int, val_esr: float) -> None:
         run.save_checkpoint(path, {
             "model": model.state_dict(), "optim": opt.state_dict(),
-            "scaler": scaler.state_dict(), "emulate_cfg": asdict(ecfg),
+            "scaler": scaler.state_dict(), "spec": spec.to_dict(),
             "device_ids": ids, "id_to_idx": id_to_idx, "holdout_ids": holdout_ids,
             "manifest_sha256": manifest_sig, "receptive_field": R,
-            "params": n_params, "sample_rate": cfg.sample_rate, "seed": cfg.seed,
+            "params": n_params, "sample_rate": spec.sample_rate, "seed": spec.seed,
             "name": name, "epoch": epoch, "val_esr": val_esr, "best_val_esr": best_val,
         })
 
     # --- Loop -------------------------------------------------------------------
     t0 = time.time()
-    step = start_epoch * (ecfg.pairs_per_epoch // ecfg.batch_size)
+    step = start_epoch * (spec.data.pairs_per_epoch // tcfg.batch_size)
     epoch = start_epoch - 1                         # defined even if the loop is empty
     for epoch in range(start_epoch, max_epochs):
-        train_ds.seed = cfg.seed + epoch           # fresh window positions each epoch
-        loader = make_loader(train_ds, ecfg.batch_size, ecfg.num_workers,
-                              shuffle=True, seed=cfg.seed + epoch, drop_last=True)
+        train_ds.seed = spec.seed + epoch          # fresh window positions each epoch
+        loader = make_loader(train_ds, tcfg.batch_size, tcfg.num_workers,
+                              shuffle=True, seed=spec.seed + epoch, drop_last=True)
         model.train()
         ep_loss = ep_esr = ep_stft = 0.0
         n_steps = 0
@@ -287,8 +289,8 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
             ep_loss += loss.item(); ep_esr += parts["esr"]; ep_stft += parts["stft"]
             n_steps += 1
             step += 1
-            if step % ecfg.log_every == 0:
-                sps = n_steps * ecfg.batch_size / (time.time() - ep_t0 + 1e-9)
+            if step % tcfg.log_every == 0:
+                sps = n_steps * tcfg.batch_size / (time.time() - ep_t0 + 1e-9)
                 print(f"  e{epoch:02d} step {step:>7d} loss {loss.item():.5f} "
                       f"esr {parts['esr']:.5f} stft {parts['stft']:.4f} {sps:5.0f} smp/s",
                       flush=True)      # stdout is block-buffered under nohup/redirects
@@ -296,7 +298,7 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         tr_loss = ep_loss / max(n_steps, 1)
         tr_esr = ep_esr / max(n_steps, 1)
         tr_stft = ep_stft / max(n_steps, 1)
-        val_esr = evaluate_esr(model, val_loader, dev, ecfg.preemph, weights=dev_w)
+        val_esr = evaluate_esr(model, val_loader, dev, lossfn.coeff, weights=dev_w)
 
         # NaN guard: recover from an fp16 forward overflow instead of dying.
         # - Non-finite val ESR: weights are poisoned. Reload best, drop to fp32
@@ -345,7 +347,7 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         print(f"[epoch {epoch:02d}] train_esr={tr_esr:.5f} val_esr={val_esr:.5f} "
               f"best={best_val:.5f} lr={cur_lr:.1e}{'  *saved*' if improved else ''}",
               flush=True)
-        if since_improved >= ecfg.early_stop_patience:
+        if since_improved >= tcfg.early_stop_patience:
             print(f"[stop] no val improvement for {since_improved} epochs")
             break
 
@@ -353,14 +355,14 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
     if ckpt_path.is_file():
         model.load_state_dict(torch.load(ckpt_path, map_location=dev,
                                          weights_only=False)["model"])
-    val_true = evaluate_esr(model, val_loader, dev, ecfg.preemph, weights=dev_w)
-    val_shuf = evaluate_esr(model, val_loader, dev, ecfg.preemph, shuffle_devices=True,
+    val_true = evaluate_esr(model, val_loader, dev, lossfn.coeff, weights=dev_w)
+    val_shuf = evaluate_esr(model, val_loader, dev, lossfn.coeff, shuffle_devices=True,
                             weights=dev_w)
     train_hours = (time.time() - t0) / 3600.0
     print(f"[cond]  val_esr={val_true:.5f}  val_esr_shuffled={val_shuf:.5f} "
           f"(shuffle should be worse){' OK' if val_shuf > val_true else ' — weak conditioning'}")
 
-    run.save_config_copy({"emulate": asdict(ecfg)})
+    run.save_spec(spec)
     emb_dim = model.embedding_dim
     save_embedding(run.path / "embedding.pt", model, ids, manifest_sig, emb_dim, name,
                    holdout_ids=holdout_ids)
@@ -369,7 +371,7 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         "receptive_field_samples": R, "receptive_field_ms": round(rf_ms, 3),
         "embedding_dim": emb_dim, "channels": arch["channels"],
         "blocks_x_layers": arch["blocks_x_layers"], "n_devices": len(ids),
-        "device_loss_weighting": ecfg.device_loss_weighting,
+        "device_loss_weighting": strength,
         "best_val_esr": best_val,
         "val_esr": val_true, "val_esr_shuffled": val_shuf,
         "epochs_run": epoch + 1, "train_hours": round(train_hours, 4),
@@ -391,14 +393,14 @@ def save_embedding(path: Path, model, device_ids, manifest_sig, embedding_dim, n
     }, path)
 
 
-def _check_resume_compatible(ck: dict, ecfg, receptive_field: int, n_devices: int) -> None:
+def _check_resume_compatible(ck: dict, spec: RunSpec, receptive_field: int,
+                             n_devices: int) -> None:
     """Fail fast if a config edit made the checkpoint's weights incompatible.
 
-    The arch says which knobs are structural; everything else in EmulateConfig
-    is training dynamics and may change on resume.
+    The whole ``model:`` section is structural -- every key in it changes the
+    network. Everything else in the spec is training dynamics and may change.
     """
     check_resume_compatible(
-        ck, [(model_class(ecfg.arch).structural_keys(), ck.get("emulate_cfg", {}),
-              asdict(ecfg), "", {})],
+        ck, [(ck.get("spec", {}).get("model", {}), spec.model.to_dict(), "model.")],
         receptive_field=receptive_field, n_devices=n_devices,
-        dynamics="lr, weight_decay, plateau_*, epochs, losses, batch_size")
+        dynamics="lr, weight_decay, plateau_*, epochs, loss, batch_size")

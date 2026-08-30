@@ -33,6 +33,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from openamp.core.config import ConfigError
 from openamp.models import make_activation, normalize_activation
 
 __all__ = ["FingerprintEncoder", "FINGERPRINT_PREPROCESS", "DRY_ID"]
@@ -59,8 +60,13 @@ class FingerprintEncoder(nn.Module):
                  device_ids: np.ndarray, dry: np.ndarray,
                  preprocess: str = "dry_l2", proj_hidden: int = 128,
                  activation: str = "tanh", normalize: bool = True,
-                 layernorm: bool = False, eps: float = 1e-12):
+                 layernorm: bool = False, eps: float = 1e-12,
+                 grad_checkpoint: bool = False):
         super().__init__()
+        # Accepted and ignored: this arm has no layer array whose activations
+        # could be recomputed. Part of the contract so the knob stays uniform
+        # across encoders rather than becoming a kind test in build_joint.
+        del grad_checkpoint
         fp = np.asarray(fingerprints, dtype=np.float32)
         ids = np.asarray(device_ids, dtype=np.int64)
         dry_v = np.asarray(dry, dtype=np.float32).reshape(-1)
@@ -139,18 +145,25 @@ class FingerprintEncoder(nn.Module):
         return hashlib.sha256((Path(path) / "pooled.npz").read_bytes()).hexdigest()
 
     @classmethod
-    def from_config(cls, jcfg, embedding_dim: int) -> "FingerprintEncoder":
-        """Mirrors ``WaveNetEncoder.from_config``: ``embedding_dim`` comes from the
-        *generator's* config, so the interface width has one source of truth."""
-        ids, pooled, dry, _ = cls.load_pooled(jcfg.fp_path)
+    def from_spec(cls, spec, embedding_dim: int, **extra) -> "FingerprintEncoder":
+        """Mirrors ``WaveNetEncoder.from_spec``, but ``path`` is opened first: the
+        matrix this conditions on comes off disk, not out of the config."""
+        kwargs = dict(spec.kwargs)
+        ids, pooled, dry, _ = cls.load_pooled(cls._path(kwargs.pop("path", "")))
         return cls(embedding_dim=embedding_dim, fingerprints=pooled, device_ids=ids,
-                   dry=dry, preprocess=jcfg.fp_preprocess,
-                   proj_hidden=jcfg.enc_proj_hidden, activation=jcfg.enc_activation,
-                   normalize=jcfg.enc_normalize, layernorm=jcfg.fp_layernorm)
+                   dry=dry, **kwargs, **extra)
+
+    @staticmethod
+    def _path(path) -> str:
+        if not str(path).strip():
+            raise ConfigError("encoder kind 'fingerprint' needs joint.encoder.path, "
+                              "the directory holding pooled.npz")
+        return str(path)
 
     @classmethod
-    def provenance(cls, jcfg) -> tuple[str, dict]:
-        return cls.fingerprint_sha256(jcfg.fp_path), cls.load_pooled(jcfg.fp_path)[3]
+    def provenance(cls, spec) -> tuple[str, dict]:
+        path = cls._path(spec.kwargs.get("path", ""))
+        return cls.fingerprint_sha256(path), cls.load_pooled(path)[3]
 
     # --- Forward ------------------------------------------------------------------
     def preprocess_fp(self, fp: torch.Tensor) -> torch.Tensor:

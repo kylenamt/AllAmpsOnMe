@@ -9,25 +9,31 @@
 # Was a film_tcn config until that arch was retired; the training schedule is
 # unchanged, so smoke timings before and after are not comparable.
 
-emulate:
-  # --- Model -------------------------------------------------------------------
+model:
   arch: film_wavenet
-  wn_channels: 8           # A2 full-width submodel
+  channels: 8  # A2 full-width submodel
   embedding_dim: 64
 
-  # --- Training (shortened) ------------------------------------------------------
-  holdout_frac: 0.1        # device holdout for Phase 5 enrollment (emulate_holdout.txt)
+data:
+  dataset: emulation
+
+  holdout_frac: 0.1  # device holdout for Phase 5 enrollment (emulate_holdout.txt)
   clip_seconds: 2.0
-  batch_size: 16
   pairs_per_epoch: 20000
+
+loss:
+  name: esr_mrstft
+  stft_weight: 1.0
+  preemph_coeff: 0.85
+
+training:
+  batch_size: 16
   epochs: 15
   lr: 5.0e-4
   weight_decay: 0.0
   plateau_patience: 3
   plateau_factor: 0.5
   early_stop_patience: 8
-  stft_weight: 1.0
-  preemph: 0.85
   num_workers: 6
   amp: true
   val_pairs: 2000

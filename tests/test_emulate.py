@@ -11,10 +11,28 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from openamp.core.config import EmulateConfig, load_config
+from openamp.core.config import load_config
 from openamp.models import (A2_DILATIONS, A2_KERNEL_SIZES, DeltaWaveNet,
                             DeltaWaveNetLayer, FiLMWaveNet, MLPFiLMWaveNet,
                             build_model, count_parameters, film_output_linear)
+from openamp.spec import DataSpec, LossSpec, ModelSpec, RunSpec, TrainingSpec
+
+
+def _mspec(arch="film_wavenet", **kwargs):
+    """A ModelSpec; kwargs use the constructor's names, as the ``model:`` yaml does."""
+    return ModelSpec(arch, kwargs)
+
+
+def _rspec(tmp_path, model=None, **kw):
+    """A whole RunSpec, for the tests that save a checkpoint and read it back."""
+    return RunSpec(name="run", data_dir=tmp_path / "data",
+                   results_dir=tmp_path / "results", seed=1234,
+                   model=model or _mspec("film_wavenet", channels=4, embedding_dim=8),
+                   data=DataSpec(clip_seconds=kw.pop("clip_seconds", 2.0)),
+                   loss=LossSpec(kwargs={"preemph_coeff": 0.85, "stft_weight": 1.0}),
+                   training=TrainingSpec(batch_size=kw.pop("batch_size", 4),
+                                         num_workers=0, **kw))
+
 
 # A shrunken A2-shaped schedule shared by the weight-conditioned arch tests.
 SMALL_SCHEDULE = dict(kernel_sizes=(3, 3, 3), dilations=(1, 2, 4), head_kernel=4)
@@ -43,14 +61,13 @@ def test_wavenet_receptive_field_matches_a2_captures():
     # 3 kernel-6 runs over (1,3,7,17,41,101,239) + two kernel-15 layers + head k16:
     # 1 + 3*5*409 + 14*(1+13) + 15 = 6347 — the R of every A2 capture in the corpus.
     assert FiLMWaveNet.compute_receptive_field() == 6347
-    m = FiLMWaveNet.from_config(EmulateConfig(arch="film_wavenet"), n_devices=4)
+    m = build_model(_mspec("film_wavenet"), n_devices=4)
     assert m.receptive_field == 6347
     assert FiLMWaveNet.compute_receptive_field((3, 3), (1, 2), head_kernel=4) == 10
 
 
 def test_wavenet_forward_shape_and_from_config():
-    m = FiLMWaveNet.from_config(EmulateConfig(arch="film_wavenet", wn_channels=4),
-                                n_devices=6)
+    m = build_model(_mspec("film_wavenet", channels=4), n_devices=6)
     x = torch.randn(3, 4000)
     y = m(x, torch.tensor([0, 1, 2]))
     assert y.shape == (3, 1, 4000)                    # [B, T] -> [B, 1, T], same length
@@ -128,8 +145,8 @@ def _small_delta_wavenet(rank=3, **kw):
 
 def test_delta_wavenet_shape_causality_and_from_config():
     torch.manual_seed(0)
-    m = DeltaWaveNet.from_config(
-        EmulateConfig(arch="delta_wavenet", wn_channels=4, delta_rank=3), n_devices=6)
+    m = build_model(
+        _mspec("delta_wavenet", channels=4, delta_rank=3), n_devices=6)
     assert m.delta_rank == 3 and m.receptive_field == 6347   # the A2 schedule, unchanged
     assert m(torch.randn(3, 4000), torch.tensor([0, 1, 2])).shape == (3, 1, 4000)
 
@@ -194,7 +211,7 @@ def test_delta_generator_shape_accounting_and_rejects_degenerate_rank():
     with pytest.raises(ValueError, match="delta_rank"):
         DeltaWaveNet(n_devices=4, delta_rank=0)
     with pytest.raises(ValueError, match="delta_rank"):
-        build_model(EmulateConfig(arch="delta_wavenet", delta_rank=-1), 3)
+        build_model(_mspec("delta_wavenet", delta_rank=-1), 3)
 
 
 def test_delta_magnitude_lives_only_in_scale():
@@ -316,16 +333,16 @@ def test_wavenet_activation_option_swaps_the_nonlinearity():
 
 
 def test_wavenet_activation_from_config_and_validation():
-    m = FiLMWaveNet.from_config(
-        EmulateConfig(arch="film_wavenet", wn_channels=4, wn_activation="TanH"), 3)
+    m = build_model(
+        _mspec("film_wavenet", channels=4, activation="TanH"), 3)
     assert m.activation == "tanh"                     # case-insensitive
     assert isinstance(m.layers[-1].act, torch.nn.Tanh)
-    default = FiLMWaveNet.from_config(EmulateConfig(arch="film_wavenet"), 3)
+    default = build_model(_mspec("film_wavenet"), 3)
     assert default.activation == "leakyrelu"          # the capture default
     with pytest.raises(ValueError, match="wn_activation"):
         FiLMWaveNet(n_devices=1, activation="relu")
     with pytest.raises(ValueError, match="wn_activation"):
-        build_model(EmulateConfig(arch="film_wavenet", wn_activation="silu"), 3)
+        build_model(_mspec("film_wavenet", activation="silu"), 3)
 
 
 def test_describe_tags_the_topology_column():
@@ -333,62 +350,61 @@ def test_describe_tags_the_topology_column():
     activation and the conditioning generator tag onto the topology string rather
     than getting their own columns, and the two film_wavenet strings stay
     untouched so old rows stay comparable."""
-    def tag(**kw):
-        return build_model(EmulateConfig(wn_channels=4, embedding_dim=8, **kw),
+    def tag(arch, **kw):
+        return build_model(_mspec(arch, channels=4, embedding_dim=8, **kw),
                            2).describe()["blocks_x_layers"]
 
-    assert tag(arch="film_wavenet") == "a2-23L"
-    assert tag(arch="film_wavenet", wn_activation="tanh") == "a2-23L-tanh"
-    assert tag(arch="mlpfilm_wavenet", cond_hidden=16) == "a2-23L-mlp16"
-    assert tag(arch="mlpfilm_wavenet", cond_hidden=16,
+    assert tag("film_wavenet") == "a2-23L"
+    assert tag("film_wavenet", activation="tanh") == "a2-23L-tanh"
+    assert tag("mlpfilm_wavenet", cond_hidden=16) == "a2-23L-mlp16"
+    assert tag("mlpfilm_wavenet", cond_hidden=16,
                cond_activation="tanh") == "a2-23L-mlp16-ctanh"
-    assert tag(arch="delta_wavenet", delta_rank=6) == "a2-23L-delta6"
-    assert tag(arch="delta_wavenet", delta_rank=8,
-               wn_activation="tanh") == "a2-23L-delta8-tanh"
-    d = build_model(EmulateConfig(arch="delta_wavenet", wn_channels=4,
-                                  embedding_dim=8), 2).describe()
+    assert tag("delta_wavenet", delta_rank=6) == "a2-23L-delta6"
+    assert tag("delta_wavenet", delta_rank=8,
+               activation="tanh") == "a2-23L-delta8-tanh"
+    d = build_model(_mspec("delta_wavenet", channels=4, embedding_dim=8), 2).describe()
     assert d["arch"] == "delta_wavenet" and d["channels"] == 4
 
 
 def test_build_model_dispatches_on_arch():
     # `type is` not isinstance: MLPFiLMWaveNet subclasses FiLMWaveNet, so isinstance
     # would no longer distinguish the two archs.
-    assert type(build_model(EmulateConfig(arch="film_wavenet"), 5)) is FiLMWaveNet
-    mlp = build_model(EmulateConfig(arch="mlpfilm_wavenet", cond_hidden=8), 5)
+    assert type(build_model(_mspec("film_wavenet"), 5)) is FiLMWaveNet
+    mlp = build_model(_mspec("mlpfilm_wavenet", cond_hidden=8), 5)
     assert type(mlp) is MLPFiLMWaveNet and mlp.cond_hidden == 8
-    # film_wavenet must ignore cond_hidden entirely — that is what freezes every
-    # existing run at the linear generator regardless of the config default.
-    plain = build_model(EmulateConfig(arch="film_wavenet", cond_hidden=8), 5)
+    # film_wavenet's generator is the single Linear. Under v1 this was guaranteed
+    # by from_config never forwarding cond_hidden, whatever EmulateConfig's shared
+    # default said; under v2 a model: section holds only its own arch's keys, so
+    # the guarantee is that nothing puts cond_hidden there (see
+    # scripts/migrate_config_v2.py's MODEL_KEYS).
+    plain = build_model(_mspec("film_wavenet"), 5)
     assert isinstance(plain.layers[0].film, torch.nn.Linear)
-    delta = build_model(EmulateConfig(arch="delta_wavenet", delta_rank=3), 5)
+    delta = build_model(_mspec("delta_wavenet", delta_rank=3), 5)
     assert type(delta) is DeltaWaveNet and delta.delta_rank == 3
     assert isinstance(delta.layers[0], DeltaWaveNetLayer)
     with pytest.raises(ValueError, match="arch"):
-        build_model(EmulateConfig(arch="nope"), 5)
+        build_model(_mspec("nope"), 5)
 
 
 def test_load_model_rebuilds_arch_from_the_checkpoint(tmp_path):
-    from dataclasses import asdict
-
     from openamp.evaluation import load_model
 
     torch.manual_seed(0)
-    ecfg = EmulateConfig(arch="film_wavenet", wn_channels=4)
-    m = build_model(ecfg, 3).eval()
+    spec = _rspec(tmp_path, model=_mspec("film_wavenet", channels=4))
+    m = build_model(spec.model, 3).eval()
     run = tmp_path / "wn"; run.mkdir()
-    torch.save({"model": m.state_dict(), "emulate_cfg": asdict(ecfg),
+    torch.save({"model": m.state_dict(), "spec": spec.to_dict(),
                 "device_ids": [1, 2, 3]}, run / "checkpoint.pt")
     loaded, ck = load_model(run)
     assert isinstance(loaded, FiLMWaveNet)
     x = torch.randn(1, 500)
     assert torch.allclose(loaded(x, torch.tensor([1])), m(x, torch.tensor([1])))
 
-    # a pre-mlpfilm film_wavenet checkpoint (no cond_* keys) must still rebuild
-    # with the linear generator, whatever EmulateConfig now defaults cond_hidden to
-    pre = asdict(EmulateConfig(arch="film_wavenet", wn_channels=4))
-    pre.pop("cond_hidden"); pre.pop("cond_activation")
+    # A model: section that names no cond_* key rebuilds with the linear
+    # generator — the constructor's own default, now that there is no shared
+    # config default for every arch to fall through.
     run3 = tmp_path / "pre_mlp"; run3.mkdir()
-    torch.save({"model": m.state_dict(), "emulate_cfg": pre,
+    torch.save({"model": m.state_dict(), "spec": spec.to_dict(),
                 "device_ids": [1, 2, 3]}, run3 / "checkpoint.pt")
     loaded3, _ = load_model(run3)
     assert type(loaded3) is FiLMWaveNet
@@ -401,11 +417,11 @@ def test_mlpfilm_checkpoint_roundtrip_and_cross_arch_load_is_loud(tmp_path):
     from openamp.evaluation import load_model
 
     torch.manual_seed(0)
-    ecfg = EmulateConfig(arch="mlpfilm_wavenet", wn_channels=4, embedding_dim=8,
-                         cond_hidden=6)
-    m = build_model(ecfg, 3).eval()
+    spec = _rspec(tmp_path, model=_mspec("mlpfilm_wavenet", channels=4,
+                                         embedding_dim=8, cond_hidden=6))
+    m = build_model(spec.model, 3).eval()
     run = tmp_path / "mlp"; run.mkdir()
-    torch.save({"model": m.state_dict(), "emulate_cfg": asdict(ecfg),
+    torch.save({"model": m.state_dict(), "spec": spec.to_dict(),
                 "device_ids": [1, 2, 3]}, run / "checkpoint.pt")
     loaded, _ = load_model(run)
     assert type(loaded) is MLPFiLMWaveNet and loaded.cond_hidden == 6
@@ -425,11 +441,11 @@ def test_delta_checkpoint_roundtrip_and_cross_arch_load_is_loud(tmp_path):
     from openamp.evaluation import load_model
 
     torch.manual_seed(0)
-    ecfg = EmulateConfig(arch="delta_wavenet", wn_channels=4, embedding_dim=8,
-                         delta_rank=3)
-    m = build_model(ecfg, 3).eval()
+    spec = _rspec(tmp_path, model=_mspec("delta_wavenet", channels=4,
+                                         embedding_dim=8, delta_rank=3))
+    m = build_model(spec.model, 3).eval()
     run = tmp_path / "delta"; run.mkdir()
-    torch.save({"model": m.state_dict(), "emulate_cfg": asdict(ecfg),
+    torch.save({"model": m.state_dict(), "spec": spec.to_dict(),
                 "device_ids": [1, 2, 3]}, run / "checkpoint.pt")
     loaded, _ = load_model(run)
     assert type(loaded) is DeltaWaveNet and loaded.delta_rank == 3
@@ -766,19 +782,17 @@ def _tiny_run(cfg, tmp_path, device_ids, *, clip):
     """A saved checkpoint over ``device_ids`` (tiny net) -> its run dir."""
     from dataclasses import asdict
 
-    ecfg = EmulateConfig(arch="film_wavenet", wn_channels=4, embedding_dim=8,
-                         clip_seconds=clip / cfg.sample_rate, batch_size=4,
-                         num_workers=0)
+    spec = _rspec(tmp_path, clip_seconds=clip / cfg.sample_rate)
     torch.manual_seed(0)
-    model = build_model(ecfg, len(device_ids)).eval()
+    model = build_model(spec.model, len(device_ids)).eval()
     run = tmp_path / "run"
     run.mkdir(exist_ok=True)
-    torch.save({"model": model.state_dict(), "emulate_cfg": asdict(ecfg),
+    torch.save({"model": model.state_dict(), "spec": spec.to_dict(),
                 "device_ids": list(device_ids),
                 "id_to_idx": {d: i for i, d in enumerate(device_ids)},
                 "holdout_ids": [], "name": "run", "epoch": 1, "manifest_sha256": ""},
                run / "checkpoint.pt")
-    return run, model, ecfg
+    return run, model, spec
 
 
 def test_validate_per_device_writes_a_row_per_amp(tmp_path):
@@ -796,7 +810,7 @@ def test_validate_per_device_writes_a_row_per_amp(tmp_path):
     files = [(f"f{i}", "test", (0.3 * rng.standard_normal(clip + 3000)).astype(np.float32))
              for i in range(2)]
     _build_corpus(cfg, files, devices=[0, 1, 2])
-    run, model, ecfg = _tiny_run(cfg, tmp_path, [0, 1, 2], clip=clip)
+    run, model, spec = _tiny_run(cfg, tmp_path, [0, 1, 2], clip=clip)
 
     rows = validate_per_device(cfg, run, device="cpu", n_windows=6)
 
@@ -815,7 +829,7 @@ def test_validate_per_device_writes_a_row_per_amp(tmp_path):
     # renders must give byte-identical per-device scores, not just close ones.
     with torch.no_grad():
         model.embedding.weight.copy_(model.embedding.weight[:1].expand(3, -1))
-    torch.save({"model": model.state_dict(), "emulate_cfg": asdict(ecfg),
+    torch.save({"model": model.state_dict(), "spec": spec.to_dict(),
                 "device_ids": [0, 1, 2], "id_to_idx": {0: 0, 1: 1, 2: 2}, "name": "run"},
                run / "checkpoint.pt")
     tied = validate_per_device(cfg, run, device="cpu", n_windows=6,
@@ -842,12 +856,11 @@ def test_enroll_end_to_end(tmp_path):
     _build_corpus(cfg, files, devices=[0, 1, 2, 3])   # identity renders, all splits
 
     torch.manual_seed(0)
-    ecfg = EmulateConfig(arch="film_wavenet", wn_channels=4, embedding_dim=8,
-                         clip_seconds=clip / cfg.sample_rate, batch_size=4,
-                         num_workers=0, val_pairs=8, log_every=10**9)
-    m = build_model(ecfg, 2).eval()                   # trained table = devices [0, 1]
+    spec = _rspec(tmp_path, clip_seconds=clip / cfg.sample_rate,
+                  val_pairs=8, log_every=10 ** 9)
+    m = build_model(spec.model, 2).eval()                   # trained table = devices [0, 1]
     run = tmp_path / "run"; run.mkdir()
-    torch.save({"model": m.state_dict(), "emulate_cfg": asdict(ecfg),
+    torch.save({"model": m.state_dict(), "spec": spec.to_dict(),
                 "device_ids": [0, 1], "holdout_ids": [2, 3], "name": "run",
                 "epoch": 5, "manifest_sha256": ""}, run / "checkpoint.pt")
     before = {k: v.clone() for k, v in m.state_dict().items()}
@@ -886,39 +899,38 @@ def test_enroll_end_to_end(tmp_path):
         assert np.isfinite(float(r["baseline_test_esr"]))
 
 
-def test_swap_embedding_init_modes():
+def test_swap_embedding_init_modes(tmp_path):
     """New rows start at the trainer's own init scale by default, not the mean."""
     from openamp.emulate.enroll import ENROLL_INIT_A, _swap_embedding
 
-    ecfg = EmulateConfig(arch="film_wavenet", wn_channels=4, embedding_dim=8,
-                         num_workers=0)
+    spec = _rspec(tmp_path)
     dev = torch.device("cpu")
 
     torch.manual_seed(0)
-    m = build_model(ecfg, 4)
+    m = build_model(spec.model, 4)
     with torch.no_grad():                              # a table with a nonzero mean
         m.embedding.weight.add_(torch.arange(1.0, 5.0)[:, None])
     mean = m.embedding.weight.detach().mean(dim=0).clone()
 
     torch.manual_seed(1)
-    rows = _swap_embedding(m, ecfg, 3, dev)            # default: uniform
+    rows = _swap_embedding(m, 3, dev)            # default: uniform
     assert rows.shape == (3, 8)
     assert torch.equal(rows, m.embedding.weight.detach())
     assert rows.abs().max() <= ENROLL_INIT_A           # inside U(-a, a)
     assert not torch.allclose(rows[0], rows[1])        # rows start apart...
     assert not torch.allclose(rows, mean.expand_as(rows))   # ...and not at the mean
 
-    m2 = build_model(ecfg, 4)                          # same seed -> same init
+    m2 = build_model(spec.model, 4)                          # same seed -> same init
     torch.manual_seed(1)
-    assert torch.equal(_swap_embedding(m2, ecfg, 3, dev), rows)
+    assert torch.equal(_swap_embedding(m2, 3, dev), rows)
 
-    m3 = build_model(ecfg, 4)                          # opt back into the old prior
+    m3 = build_model(spec.model, 4)                          # opt back into the old prior
     mean3 = m3.embedding.weight.detach().mean(dim=0).clone()
-    rows3 = _swap_embedding(m3, ecfg, 3, dev, init="table_mean")
+    rows3 = _swap_embedding(m3, 3, dev, init="table_mean")
     assert torch.equal(rows3, mean3.expand(3, 8))
 
     with pytest.raises(ValueError, match="init must be one of"):
-        _swap_embedding(build_model(ecfg, 4), ecfg, 3, dev, init="normal")
+        _swap_embedding(build_model(spec.model, 4), 3, dev, init="normal")
 
 
 def test_enrollment_csv_merges_by_device(tmp_path):
@@ -1034,12 +1046,11 @@ def test_enroll_pair_end_to_end(tmp_path):
     cfg = load_config(data_dir=tmp_path)
     clip = 8192                                        # >= the largest STFT window
     torch.manual_seed(0)
-    ecfg = EmulateConfig(arch="film_wavenet", wn_channels=4, embedding_dim=8,
-                         clip_seconds=clip / cfg.sample_rate, batch_size=4,
-                         num_workers=0, val_pairs=8, log_every=10**9)
-    m = build_model(ecfg, 2).eval()
+    spec = _rspec(tmp_path, clip_seconds=clip / cfg.sample_rate,
+                  val_pairs=8, log_every=10 ** 9)
+    m = build_model(spec.model, 2).eval()
     run = tmp_path / "run"; run.mkdir()
-    torch.save({"model": m.state_dict(), "emulate_cfg": asdict(ecfg),
+    torch.save({"model": m.state_dict(), "spec": spec.to_dict(),
                 "device_ids": [0, 1], "holdout_ids": [], "name": "run",
                 "epoch": 5, "manifest_sha256": ""}, run / "checkpoint.pt")
 
@@ -1084,12 +1095,11 @@ def test_enroll_pair_batch_size_overrides_the_runs_value(tmp_path):
     cfg = load_config(data_dir=tmp_path)
     clip = 8192
     torch.manual_seed(0)
-    ecfg = EmulateConfig(arch="film_wavenet", wn_channels=4, embedding_dim=8,
-                         clip_seconds=clip / cfg.sample_rate, batch_size=4,
-                         num_workers=0, val_pairs=8, log_every=10**9)
-    m = build_model(ecfg, 2).eval()
+    spec = _rspec(tmp_path, clip_seconds=clip / cfg.sample_rate,
+                  val_pairs=8, log_every=10 ** 9)
+    m = build_model(spec.model, 2).eval()
     run = tmp_path / "run"; run.mkdir()
-    torch.save({"model": m.state_dict(), "emulate_cfg": asdict(ecfg),
+    torch.save({"model": m.state_dict(), "spec": spec.to_dict(),
                 "device_ids": [0, 1], "holdout_ids": [], "name": "run",
                 "epoch": 5, "manifest_sha256": ""}, run / "checkpoint.pt")
 

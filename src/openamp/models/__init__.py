@@ -13,15 +13,19 @@ model provides:
 ``embed(device_idx)``      ``[B] long -> [B,E]``, the effective embedding
 ``embedding_table()``      the full effective ``[n_devices, E]`` table
 ``describe()``             ``{arch, channels, blocks_x_layers}`` for logs and the CSV
-``structural_keys()``      config knobs a ``--resume`` may not change
 ``export_descriptor()``    the plugin bundle's ``arch`` block
-``from_config(ecfg, n)``   construction from an ``EmulateConfig``
 =========================  =====================================================
 
-The last four are why this contract is worth having: each was previously a
-branch in a *different* file (``arch_summary``'s string ladder, two
-``_STRUCTURAL_*`` lists, export's isinstance chain), so adding an architecture
-meant editing six files. Now it is one file plus a line in :data:`MODELS`.
+Construction is ``MODELS[arch](n_devices=n, **spec.kwargs)`` -- the config's
+``model:`` keys are the constructor's own parameter names, so no model here
+reads a config object and a new arch's knobs need no schema change.
+
+``describe`` and ``export_descriptor`` are why this contract is worth having:
+each was previously a branch in a *different* file (``arch_summary``'s string
+ladder, export's isinstance chain), so adding an architecture meant editing
+several. Now it is one file plus a line in :data:`MODELS`. The third of those,
+the ``--resume`` key list, needs no method at all now: the ``model:`` section
+*is* the structural set, by construction.
 
 Documented, not enforced -- this is a research codebase, and a model that
 breaks the contract fails loudly at the call site anyway.
@@ -78,10 +82,10 @@ def register_model(name: str):
 def model_class(arch: str) -> type:
     """The class for an arch name -- descriptors readable without building it."""
     if arch not in MODELS:
-        raise ValueError(f"emulate.arch must be one of {tuple(MODELS)}, got {arch!r}")
+        raise ValueError(f"model.arch must be one of {tuple(MODELS)}, got {arch!r}")
     return MODELS[arch]
 
 
-def build_model(ecfg, n_devices: int):
-    """Construct the configured architecture from an ``EmulateConfig``."""
-    return model_class(ecfg.arch).from_config(ecfg, n_devices)
+def build_model(spec, n_devices: int):
+    """Construct the architecture a :class:`~openamp.spec.ModelSpec` names."""
+    return model_class(spec.arch)(n_devices=n_devices, **spec.kwargs)

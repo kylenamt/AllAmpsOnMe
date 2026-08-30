@@ -22,8 +22,9 @@ __all__ = ["MLPFiLM", "DeltaWeightGen", "NormalizedEmbedding", "film_output_line
 A2_EMBEDDING_STD = 0.1               # init std of the [N_devices x E] table
 
 # --- Activation (wn_activation) --------------------------------------------------
-# Parameter-free, so a checkpoint's state_dict is identical either way -- in the
-# archs' structural_keys() to stop a silent architecture swap on resume.
+# Parameter-free, so a checkpoint's state_dict is identical either way -- which
+# is why the resume check covers the whole model: section, not just the shapes:
+# a swap would load cleanly and quietly play a different network.
 ACTIVATIONS = ("leakyrelu", "tanh")
 A2_ACTIVATION = "leakyrelu"          # what every A2 capture uses
 A2_LEAKY_SLOPE = 0.01

@@ -7,35 +7,6 @@
       1,
       2
     ],
-    "emulate_cfg": {
-      "amp": false,
-      "amp_dtype": "fp16",
-      "arch": "film_wavenet",
-      "batch_size": 4,
-      "clip_seconds": 0.08533333333333333,
-      "cond_activation": "leakyrelu",
-      "cond_hidden": 32,
-      "delta_rank": 8,
-      "device_loss_weighting": 0.0,
-      "early_stop_patience": 8,
-      "embed_noise_frac": 0.0,
-      "embed_normalize": false,
-      "embedding_dim": 8,
-      "epochs": 2,
-      "holdout_frac": 0.25,
-      "log_every": 1000000000,
-      "lr": 0.0005,
-      "num_workers": 0,
-      "pairs_per_epoch": 16,
-      "plateau_factor": 0.5,
-      "plateau_patience": 3,
-      "preemph": 0.85,
-      "stft_weight": 1.0,
-      "val_pairs": 8,
-      "weight_decay": 0.0,
-      "wn_activation": "leakyrelu",
-      "wn_channels": 4
-    },
     "encoder_params": 3356,
     "epoch": 0,
     "generator_params": 4865,
@@ -46,39 +17,6 @@
       "0": 0,
       "1": 1,
       "2": 2
-    },
-    "joint_cfg": {
-      "enc_activation": "tanh",
-      "enc_attn_hidden": 4,
-      "enc_channels": 4,
-      "enc_expand_dim": 256,
-      "enc_expand_norm": "batch",
-      "enc_frame_window": 0,
-      "enc_head": "stats",
-      "enc_kind": "wavenet",
-      "enc_lr": 0.004,
-      "enc_n_heads": 2,
-      "enc_norm_groups": 32,
-      "enc_normalize": false,
-      "enc_pool_dim": 64,
-      "enc_pool_queries": 4,
-      "enc_proj_hidden": 4,
-      "enc_tap_stride": 8,
-      "enc_taps": [
-        6,
-        13,
-        22
-      ],
-      "enc_weight_decay": -1.0,
-      "fp_frames_path": "",
-      "fp_layernorm": false,
-      "fp_path": "",
-      "fp_preprocess": "dry_l2",
-      "grad_checkpoint_encoder": false,
-      "ref_different_file": true,
-      "ref_min_gap_seconds": 1.0,
-      "ref_seconds": 0.08533333333333333,
-      "sources": []
     },
     "name": "eq",
     "receptive_field": 6347,
@@ -155,6 +93,62 @@
     "val_esr": 1.009758236989153,
     "val_esr_shuffled": 1.009758392625399,
     "val_esr_zero": 1.0096316658120676
+  },
+  "spec": {
+    "data": {
+      "clip_seconds": 0.08533333333333333,
+      "dataset": "joint",
+      "holdout_frac": 0.25,
+      "pairs_per_epoch": 16,
+      "sources": []
+    },
+    "joint": {
+      "enc_lr": 0.004,
+      "enc_weight_decay": -1.0,
+      "encoder": {
+        "activation": "tanh",
+        "attn_hidden": 4,
+        "channels": 4,
+        "kind": "wavenet",
+        "proj_hidden": 4
+      },
+      "grad_checkpoint_encoder": false,
+      "ref": {
+        "different_file": true,
+        "min_gap_seconds": 1.0,
+        "seconds": 0.08533333333333333
+      }
+    },
+    "loss": {
+      "device_loss_weighting": 0.0,
+      "name": "esr_mrstft",
+      "preemph_coeff": 0.85,
+      "stft_weight": 1.0
+    },
+    "model": {
+      "arch": "film_wavenet",
+      "channels": 4,
+      "embedding_dim": 8
+    },
+    "name": "eq",
+    "output_format": "flac",
+    "sample_rate": 48000,
+    "seed": 1234,
+    "training": {
+      "amp": false,
+      "amp_dtype": "fp16",
+      "batch_size": 4,
+      "early_stop_patience": 8,
+      "embed_noise_frac": 0.0,
+      "epochs": 2,
+      "log_every": 1000000000,
+      "lr": 0.0005,
+      "num_workers": 0,
+      "plateau_factor": 0.5,
+      "plateau_patience": 3,
+      "val_pairs": 8,
+      "weight_decay": 0.0
+    }
   },
   "weights/encoder/layers.0.conv.bias": "6dadb5c1e2ff371f",
   "weights/encoder/layers.0.conv.weight": "6c64648b8c442ff6",

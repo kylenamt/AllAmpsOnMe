@@ -12,9 +12,10 @@ the whole experiment.
 ``receptive_field: int``   left context the reference needs; 0 for a lookup arm
 ``__call__(ref, mask)``    ``-> [B, embedding_dim]``; ``mask`` may be ignored
 ``pooled_dim: int``        width the pooling head emits, before the projection
+``grad_checkpoint``        constructor kwarg; a lookup arm accepts and ignores it
 ``capacity_report()``      ``{head, pooled_dim, embedding_dim, ceiling, ...}``
-``from_config(jcfg, De)``  construction from a ``JointConfig``
-``provenance(jcfg)``       ``(sha256, meta)`` of any precomputed data it reads
+``from_spec(spec, De)``    construction from an ``EncoderSpec``
+``provenance(spec)``       ``(sha256, meta)`` of any precomputed data it reads
 =========================  =====================================================
 
 ``ref_mode`` is a **class** attribute, not a property, because the training and
@@ -29,6 +30,10 @@ That one attribute is why it is here: the same
 ``enc_kind in ("fingerprint", "dac_frames")`` test used to be written out in
 three separate files (``build_joint``, ``train.ref_mode_for``,
 ``evaluate.ref_mode_for_ck``), so a fourth encoder meant remembering all three.
+
+``spec.kwargs`` reaches the constructor, so the config's ``joint.encoder:`` keys
+are the encoder's own parameter names -- except for the one path key each lookup
+arm opens before constructing anything.
 
 Documented, not enforced -- a mismatch fails loudly at the call site.
 
@@ -71,9 +76,10 @@ def register_encoder(name: str):
 
 
 def encoder_class(kind: str) -> type:
-    """The class for an ``enc_kind`` -- ``ref_mode`` readable without building it."""
+    """The class for an encoder kind -- ``ref_mode`` readable without building it."""
     if kind not in ENCODERS:
-        raise ValueError(f"joint.enc_kind must be one of {tuple(ENCODERS)}, got {kind!r}")
+        raise ValueError(f"joint.encoder.kind must be one of {tuple(ENCODERS)}, "
+                         f"got {kind!r}")
     return ENCODERS[kind]
 
 
@@ -86,10 +92,10 @@ def ref_mode_for(kind: str) -> str:
     return encoder_class(kind or "wavenet").ref_mode
 
 
-def build_encoder(jcfg, embedding_dim: int):
-    """Construct the configured encoder from a ``JointConfig``.
+def build_encoder(spec, embedding_dim: int, **extra):
+    """Construct the encoder an :class:`~openamp.spec.EncoderSpec` names.
 
-    ``embedding_dim`` comes from the *generator's* config, not this one -- it is
+    ``embedding_dim`` comes from the *generator's* spec, not this one -- it is
     the interface contract, so it has exactly one source of truth.
     """
-    return encoder_class(jcfg.enc_kind).from_config(jcfg, embedding_dim)
+    return encoder_class(spec.kind).from_spec(spec, embedding_dim, **extra)

@@ -1,5 +1,12 @@
-"""One configuration object for the whole pipeline: env/.env for API access,
-configs/openamp.yaml for pipeline knobs, one data_dir/results_dir for all paths.
+"""The pipeline's configuration: env/.env for API access, configs/openamp.yaml for
+acquisition/corpus/render knobs, one data_dir/results_dir for all paths.
+
+Training is *not* here. An experiment is a :class:`~openamp.spec.RunSpec`, read
+from its own ``configs/{emulate,joint}/<name>.yaml`` by
+:func:`~openamp.spec.load_run_spec`, which carries the corpus it trained on
+rather than picking it up from the environment. This object stays what the
+acquisition, corpus and render stages need: fixed API facts, split ratios, and
+every derived path.
 """
 
 from __future__ import annotations
@@ -28,188 +35,6 @@ class ConfigError(RuntimeError):
 
 
 # --- Nested pipeline sections (yaml) -------------------------------------------
-@dataclass
-class EmulateConfig:
-    """One-to-many amp emulation: model architecture + its training.
-
-    Read from the ``emulate:`` yaml section; ``configs/emulate/<name>.yaml``
-    overrides just this section, run named after the file stem.
-    """
-
-    # Model architecture, see openamp/models/a2_wavenet.py:
-    # film_wavenet | mlpfilm_wavenet | delta_wavenet
-    arch: str = "film_wavenet"
-
-    # --- FiLM-WaveNet model (NAM A2 kernel/dilation schedule) ----------------------
-    wn_channels: int = 8             # A2 full-width value; the width sweep knob
-    wn_activation: str = "leakyrelu"   # "leakyrelu" | "tanh", both A2-schema
-
-    # --- MLP-FiLM WaveNet: per-layer FiLM generator ---------------------------------
-    cond_hidden: int = 32            # generator MLP hidden width; ignored by film_wavenet
-    cond_activation: str = "leakyrelu"
-
-    # --- Delta WaveNet: embedding -> low-rank residual on each layer's kernel ------
-    delta_rank: int = 8              # capacity knob; ignored by the other archs
-
-    # --- Shared model knobs ----------------------------------------------------------
-    embedding_dim: int = 64          # per-device embedding, fed to every layer
-    # Read the table as e = embed_scale * normalize(row): direction on the unit
-    # sphere, magnitude one global learned scalar. Structural (adds embed_scale
-    # to the state_dict), so it cannot change on --resume. See
-    # wavenet.NormalizedEmbedding.
-    embed_normalize: bool = False
-
-    # --- Training (Adam + reduce-on-plateau) ------------------------------------------
-    holdout_frac: float = 0.1        # fraction of devices excluded from training (enrolled later, Phase 5)
-    clip_seconds: float = 2.0        # training clip length (must match corpus grid)
-    batch_size: int = 16
-    pairs_per_epoch: int = 50_000    # dataset length: random (device, file, window) draws
-    epochs: int = 60                 # max epochs; early-stopped at val plateau
-    lr: float = 5e-4
-    weight_decay: float = 0.0
-    plateau_patience: int = 3        # ReduceLROnPlateau patience (epochs)
-    plateau_factor: float = 0.5
-    early_stop_patience: int = 8     # stop after N epochs with no val-ESR improvement
-    stft_weight: float = 1.0         # multi-resolution STFT term weight (ESR term = 1.0)
-    preemph: float = 0.85            # 1st-order pre-emphasis coefficient for ESR
-    # Offsets the corpus's ~37 dB output-level spread in the pooled ESR term.
-    # The ESR term pools error and signal energy over the whole batch, so a
-    # device's share of the gradient tracks its own output power -- quiet
-    # devices are starved. Weight each item by (device power)**-strength:
-    # 0.0 = off (pooling exactly as before), 1.0 = every device weighted equally.
-    # Applies to the train loss and to val ESR alike, so checkpoint selection,
-    # ReduceLROnPlateau and early stopping all score the objective being
-    # optimized. Non-zero values are NOT comparable with a strength-0 run's
-    # val ESR; compare per-device ESR instead. See train.device_loss_weights.
-    device_loss_weighting: float = 0.0
-    # Train-time Gaussian jitter on the device embedding, as a fraction of the
-    # table's *current* std (0 = off; train steps only, never val/eval).
-    embed_noise_frac: float = 0.0
-    num_workers: int = 6
-    amp: bool = True                 # CUDA mixed precision (STFT loss forced fp32)
-    amp_dtype: str = "fp16"          # "fp16" | "bf16"
-    val_pairs: int = 2000            # #pairs used for each val-ESR estimate
-    log_every: int = 50
-
-
-@dataclass
-class JointConfig:
-    """Encoder trained jointly with a FiLM generator.
-
-    Read from the ``joint:`` yaml section. A joint run also reads ``emulate:``
-    for the generator + every shared training knob.
-    """
-
-    # --- Conditioning source ---------------------------------------------------------
-    # "wavenet": encode a (dry, wet) clip | "fingerprint": lookup a precomputed
-    # mean+std pooled vector by device id | "dac_frames": lookup precomputed
-    # per-frame DAC latents by device id and pool them with a trained
-    # cross-attention head (openamp.encoders.pooling.CrossAttentionPool) instead of
-    # a fixed mean+std reduction.
-    enc_kind: str = "wavenet"
-    fp_path: str = ""                # fingerprint run dir (pooled.npz); required if enc_kind="fingerprint"
-    fp_preprocess: str = "dry_l2"    # "dry_l2" (subtract dry null, L2) | "dry" | "l2" | "raw"
-    fp_layernorm: bool = False       # LayerNorm as the adapter's first layer
-    fp_frames_path: str = ""         # frame-shard run dir (meta.json + frames/); required if enc_kind="dac_frames"
-    enc_pool_queries: int = 4        # "dac_frames" only: learned attention queries
-    enc_pool_dim: int = 64           # "dac_frames" only: K/V projection width the queries attend in
-    # "dac_frames" only: attend over a random contiguous window of this many
-    # frames per training step instead of all of them (0 = all frames, the
-    # original behaviour). One device id then maps to many possible encoder
-    # inputs instead of exactly one, which is what removes the encoder's option
-    # to memorize a fixed tensor per amp. Contiguous rather than scattered:
-    # DAC's encoder receptive field is 181 ms, so adjacent frames overlap ~94%
-    # and a scattered draw only re-samples the same average.
-    enc_frame_window: int = 0
-
-    # --- Reference segment (window B) --------------------------------------------------
-    ref_seconds: float = 2.0
-    ref_different_file: bool = True  # draw window B from a different file than window A (content vs tone)
-    ref_min_gap_seconds: float = 1.0   # same-file fallback only
-    sources: list = field(default_factory=list)   # [] = every source
-
-    # --- Encoder ---------------------------------------------------------------------
-    enc_channels: int = 16           # pooled width = 2 * enc_channels; the real embedding bottleneck
-    enc_activation: str = "tanh"       # "leakyrelu" | "tanh"
-    enc_attn_hidden: int = 64          # attentive-pooling bottleneck
-    enc_proj_hidden: int = 128         # pooled -> embedding_dim projection width; 0 = derive as pooled_dim // 4
-    enc_normalize: bool = False        # L2-project e onto the unit sphere
-
-    # --- Pooling head ------------------------------------------------------------------
-    enc_head: str = "stats"            # "stats" | "multitap" -- structural, not checkpoint-compatible
-    enc_taps: list = field(default_factory=lambda: [6, 13, 22])   # A2 dilation-run ends
-    enc_tap_stride: int = 8            # avg-pool before the head
-    enc_expand_dim: int = 256          # E: pooled width is enc_n_heads * 2 * E
-    enc_n_heads: int = 2               # K
-    enc_expand_norm: str = "batch"     # "batch": pools a per-amp deviation | "group": per-sample, destroys it
-    enc_norm_groups: int = 32          # "group" only; clamped to divide enc_expand_dim
-    grad_checkpoint_encoder: bool = False   # recompute activations in backward: slower, less memory
-
-    # --- Optimization ---------------------------------------------------------------
-    enc_lr: float = 4.0e-3             # separate from emulate.lr -- see joint_model/guidelines.md §9
-    enc_weight_decay: float = -1.0     # < 0 inherits emulate.weight_decay
-
-    def __post_init__(self) -> None:
-        if self.ref_seconds <= 0:
-            raise ConfigError(f"joint.ref_seconds must be positive, got {self.ref_seconds}")
-        if self.ref_min_gap_seconds < 0:
-            raise ConfigError("joint.ref_min_gap_seconds must be >= 0, got "
-                              f"{self.ref_min_gap_seconds}")
-        if self.enc_kind not in ("wavenet", "fingerprint", "dac_frames"):
-            raise ConfigError("joint.enc_kind must be 'wavenet', 'fingerprint' or "
-                              f"'dac_frames', got {self.enc_kind!r}")
-        if self.fp_preprocess not in ("dry_l2", "dry", "l2", "raw"):
-            raise ConfigError("joint.fp_preprocess must be one of ('dry_l2', 'dry', "
-                              f"'l2', 'raw'), got {self.fp_preprocess!r}")
-        if self.enc_kind == "fingerprint" and not str(self.fp_path).strip():
-            raise ConfigError("joint.enc_kind 'fingerprint' needs joint.fp_path, the "
-                              "directory holding pooled.npz")
-        if self.enc_kind == "dac_frames" and not str(self.fp_frames_path).strip():
-            raise ConfigError("joint.enc_kind 'dac_frames' needs joint.fp_frames_path, "
-                              "the directory holding meta.json + frames/ "
-                              "(openamp.probes.extract's output)")
-        if self.enc_pool_queries < 1:
-            raise ConfigError(
-                f"joint.enc_pool_queries must be >= 1, got {self.enc_pool_queries}")
-        if self.enc_pool_dim < 1:
-            raise ConfigError(f"joint.enc_pool_dim must be >= 1, got {self.enc_pool_dim}")
-        if self.enc_frame_window < 0:
-            raise ConfigError("joint.enc_frame_window must be >= 0 (0 = all frames), "
-                              f"got {self.enc_frame_window}")
-        if self.enc_channels < 1:
-            raise ConfigError(f"joint.enc_channels must be >= 1, got {self.enc_channels}")
-        if self.enc_attn_hidden < 1:
-            raise ConfigError(f"joint.enc_attn_hidden must be >= 1, got {self.enc_attn_hidden}")
-        if self.enc_proj_hidden < 0:
-            raise ConfigError("joint.enc_proj_hidden must be >= 0 (0 = derive as "
-                              f"pooled_dim // 4), got {self.enc_proj_hidden}")
-        if self.enc_head not in ("stats", "multitap"):
-            raise ConfigError("joint.enc_head must be 'stats' or 'multitap', got "
-                              f"{self.enc_head!r}")
-        taps = [int(t) for t in self.enc_taps]
-        if not taps or any(t < 0 for t in taps):
-            raise ConfigError(f"joint.enc_taps must be non-empty layer indices >= 0, "
-                              f"got {self.enc_taps}")
-        if taps != sorted(set(taps)):
-            raise ConfigError("joint.enc_taps must be strictly increasing and unique, "
-                              f"got {self.enc_taps}")
-        if self.enc_tap_stride < 1:
-            raise ConfigError(f"joint.enc_tap_stride must be >= 1, got {self.enc_tap_stride}")
-        if self.enc_expand_dim < 1 or self.enc_n_heads < 1:
-            raise ConfigError("joint.enc_expand_dim and joint.enc_n_heads must be >= 1")
-        if self.enc_expand_norm not in ("batch", "group", "none"):
-            raise ConfigError("joint.enc_expand_norm must be one of ('batch', 'group', "
-                              f"'none'), got {self.enc_expand_norm!r}")
-        if self.enc_norm_groups < 1:
-            raise ConfigError(f"joint.enc_norm_groups must be >= 1, got {self.enc_norm_groups}")
-        if self.enc_lr <= 0:
-            raise ConfigError(f"joint.enc_lr must be positive, got {self.enc_lr}")
-        bad = [s for s in self.sources if s not in (C.SOURCE_EGDB, C.SOURCE_SWEEP)]
-        if bad:
-            raise ConfigError(f"joint.sources must be drawn from "
-                              f"{(C.SOURCE_EGDB, C.SOURCE_SWEEP)}, got {bad}")
-
-
 @dataclass
 class EnrollConfig:
     """Phase 5 enrollment: fit embeddings for unseen devices against a frozen run.
@@ -259,9 +84,8 @@ class Config:
     final_target: int = FINAL_TARGET
     architecture: int = DEFAULT_ARCHITECTURE   # NAM capture arch to acquire: 2 (A2) or 1 (legacy A1)
 
-    # Nested sub-sections (yaml).
-    emulate: EmulateConfig = field(default_factory=EmulateConfig)
-    joint: JointConfig = field(default_factory=JointConfig)
+    # Nested sub-sections (yaml). Training lives in a RunSpec, not here:
+    # openamp.spec.load_run_spec reads configs/{emulate,joint}/<name>.yaml.
     enroll: EnrollConfig = field(default_factory=EnrollConfig)
 
     def __post_init__(self) -> None:
@@ -486,8 +310,6 @@ def load_config(path: Path | None = None, *, data_dir: Path | None = None,
     kw: dict = {
         "data_dir": Path(data_dir).expanduser(),
         "publishable_key": key,
-        "emulate": _coerce(EmulateConfig, y.get("emulate", {})),
-        "joint": _coerce(JointConfig, y.get("joint", {})),
         "enroll": _coerce(EnrollConfig, y.get("enroll", {})),
     }
 

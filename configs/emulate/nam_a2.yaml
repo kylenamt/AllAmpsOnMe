@@ -14,28 +14,34 @@
 # plain-MSE loss (here (pre-emphasized) ESR, absorbed by stft_weight below),
 # and its ny=8192 (0.17s) segments (here a fixed 2.0s clip grid).
 
-emulate:
-  # --- Model -------------------------------------------------------------------
+model:
   arch: film_wavenet
-  wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
-  embedding_dim: 128       # no NAM analogue (a capture is single-device); _256/_512 sweep this
+  channels: 8  # A2 full-width submodel (the exports' other width is 3)
+  embedding_dim: 128  # no NAM analogue (a capture is single-device); _256/_512 sweep this
 
-  # --- Training ----------------------------------------------------------------
+data:
+  dataset: emulation
+
   holdout_frac: 0.1
-  clip_seconds: 2.0        # must match the corpus clip grid
-  batch_size: 16           # NAM train_dataloader.batch_size
+  clip_seconds: 2.0  # must match the corpus clip grid
   pairs_per_epoch: 50000
-  epochs: 100              # NAM trainer.max_epochs; early-stop still ends it sooner
-  lr: 4.0e-3                # keep the decimal point -- PyYAML reads bare 4e-3 as a string
+
+loss:
+  name: esr_mrstft
+  stft_weight: 0.05  # NAM's 5e-4 MRSTFT weight (vs MSE), rescaled to this trainer's
+                     # ESR term by /mean(t^2) (corpus median ~0.0096)
+  preemph_coeff: 0.85  # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
+
+training:
+  batch_size: 16  # NAM train_dataloader.batch_size
+  epochs: 100  # NAM trainer.max_epochs; early-stop still ends it sooner
+  lr: 4.0e-3  # keep the decimal point -- PyYAML reads bare 4e-3 as a string
   weight_decay: 3.17e-7
   plateau_patience: 3
   plateau_factor: 0.5
   early_stop_patience: 8
-  stft_weight: 0.05         # NAM's 5e-4 MRSTFT weight (vs MSE), rescaled to this trainer's
-                            # ESR term by /mean(t^2) (corpus median ~0.0096)
-  preemph: 0.85             # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
   num_workers: 6
-  amp: true                 # bf16, not NAM's fp32 -- fp16 NaN-killed two TCN runs
+  amp: true  # bf16, not NAM's fp32 -- fp16 NaN-killed two TCN runs
   amp_dtype: bf16
   val_pairs: 2000
   log_every: 50

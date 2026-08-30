@@ -12,9 +12,12 @@
 - All share one [N_devices x embedding_dim] table.
 
 Each class carries the three arch-aware descriptors the rest of the codebase
-used to hardcode elsewhere -- ``describe`` (log/CSV labels), ``structural_keys``
-(the resume check) and ``export_descriptor`` (the plugin bundle's ``arch``
-block); see :mod:`openamp.models` for the contract.
+used to hardcode elsewhere -- ``describe`` (log/CSV labels) and
+``export_descriptor`` (the plugin bundle's ``arch`` block); see
+:mod:`openamp.models` for the contract.
+
+Constructor parameter names *are* the config's ``model:`` keys -- a ModelSpec's
+kwargs reach ``__init__`` untouched, so nothing here reads a config object.
 """
 
 from __future__ import annotations
@@ -43,17 +46,6 @@ A2_HEAD_KERNEL = 16
 A2_CHANNELS = 8
 A2_HEAD_SCALE = 0.02
 A2_FILM_INIT_STD = 0.01              # near-identity FiLM start
-
-# Shape-defining config knobs, frozen for the life of a run since the
-# checkpoint's weights depend on them. Everything else in EmulateConfig is
-# training dynamics and may change on resume. Device count / receptive field are
-# checked separately. The two activation knobs are here despite changing no
-# shape: both are parameter-free, so a swap would load cleanly and quietly play
-# a different network than the weights were trained for.
-_STRUCTURAL_KEYS = ("arch", "wn_channels", "wn_activation",
-                    "cond_hidden", "cond_activation", "delta_rank",
-                    "embedding_dim", "embed_normalize")
-
 
 # --- FiLM family: film_wavenet / mlpfilm_wavenet --------------------------------
 
@@ -152,14 +144,6 @@ class FiLMWaveNet(NormalizedEmbedding, nn.Module):
             elif hasattr(layer, "film"):
                 init_film_identity(layer.film, self.channels)
 
-    @classmethod
-    def from_config(cls, ecfg, n_devices: int) -> "FiLMWaveNet":
-        """Construct from an EmulateConfig."""
-        return cls(n_devices=n_devices, channels=ecfg.wn_channels,
-                   embedding_dim=ecfg.embedding_dim,
-                   activation=ecfg.wn_activation,
-                   embed_normalize=ecfg.embed_normalize)
-
     @staticmethod
     def compute_receptive_field(kernel_sizes=A2_KERNEL_SIZES, dilations=A2_DILATIONS,
                                 head_kernel: int = A2_HEAD_KERNEL) -> int:
@@ -195,16 +179,6 @@ class FiLMWaveNet(NormalizedEmbedding, nn.Module):
         """
         return {"arch": self.arch, "channels": self.channels,
                 "blocks_x_layers": f"a2-{len(self.dilations)}L{self._topology_tag()}"}
-
-    @classmethod
-    def structural_keys(cls) -> tuple[str, ...]:
-        """Config knobs a ``--resume`` may not change (see ``_STRUCTURAL_KEYS``).
-
-        The list is the union over every A2 arch, not just this one's own knobs:
-        that is what the trainers have always checked, and narrowing it would
-        wave through edits they reject today.
-        """
-        return _STRUCTURAL_KEYS
 
     def _export_generator(self) -> dict:
         """This arch's conditioning-generator entries in the bundle descriptor.
@@ -266,16 +240,6 @@ class MLPFiLMWaveNet(FiLMWaveNet):
                              f"(0 is film_wavenet's linear FiLM), got {cond_hidden}")
         super().__init__(cond_hidden=int(cond_hidden),
                          cond_activation=cond_activation, **kwargs)
-
-    @classmethod
-    def from_config(cls, ecfg, n_devices: int) -> "MLPFiLMWaveNet":
-        """Construct from an EmulateConfig."""
-        return cls(n_devices=n_devices, channels=ecfg.wn_channels,
-                   embedding_dim=ecfg.embedding_dim,
-                   activation=ecfg.wn_activation,
-                   cond_hidden=ecfg.cond_hidden,
-                   cond_activation=ecfg.cond_activation,
-                   embed_normalize=ecfg.embed_normalize)
 
     def _topology_tag(self) -> str:
         cact = ("" if self.cond_activation == A2_COND_ACTIVATION
@@ -356,15 +320,6 @@ class DeltaWaveNet(FiLMWaveNet):
     def _make_layer(self, kernel_size: int, dilation: int) -> nn.Module:
         return DeltaWaveNetLayer(self.channels, kernel_size, dilation,
                                  self.embedding_dim, self.delta_rank, self.activation)
-
-    @classmethod
-    def from_config(cls, ecfg, n_devices: int) -> "DeltaWaveNet":
-        """Construct from an EmulateConfig."""
-        return cls(n_devices=n_devices, channels=ecfg.wn_channels,
-                   embedding_dim=ecfg.embedding_dim,
-                   activation=ecfg.wn_activation,
-                   delta_rank=ecfg.delta_rank,
-                   embed_normalize=ecfg.embed_normalize)
 
     def _topology_tag(self) -> str:
         return f"-delta{self.delta_rank}{super()._topology_tag()}"

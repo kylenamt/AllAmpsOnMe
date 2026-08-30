@@ -309,10 +309,20 @@ def verify(config_path) -> None:
     click.secho(f"Report: {cfg.render_report_path}", fg="green")
 
 
-# ===================== Emulation foundation model (FiLM-TCN) ===================
-def _emulate_name(config_path: Path | None) -> str:
-    """Run name = config file stem (``configs/emulate/<name>.yaml``), else 'default'."""
-    return Path(config_path).stem if config_path else "default"
+# ===================== Emulation foundation model ==============================
+def _run_spec(config_path: Path | None):
+    """The experiment a training verb runs. The one place a config file is read.
+
+    The run name still defaults to the file stem, but a config may now set
+    ``name:`` (and ``data_dir:``) itself, so a run records which corpus it used
+    instead of leaving that to an environment variable.
+    """
+    from openamp.spec import RunSpec, load_run_spec
+
+    if config_path is None:
+        return RunSpec(name="default", data_dir=_config().data_dir,
+                       results_dir=_config().results_dir)
+    return load_run_spec(Path(config_path))
 
 
 @cli.command()
@@ -330,13 +340,12 @@ def emulate(config_path, device, epochs, resume, overfit, limit_devices) -> None
     """Train the FiLM-conditioned TCN amp foundation model (one-to-many)."""
     from openamp.emulate import train as emu_train
 
-    cfg = _config(config_path)
-    name = _emulate_name(config_path)
+    spec = _run_spec(config_path)
     if overfit:
-        emu_train.overfit_one_batch(cfg, name=name, device=device,
+        emu_train.overfit_one_batch(spec, device=device,
                                     limit_devices=limit_devices or 8)
         return
-    emu_train.train(cfg, name=name, device=device, epochs=epochs, resume=resume,
+    emu_train.train(spec, device=device, epochs=epochs, resume=resume,
                     limit_devices=limit_devices)
 
 
@@ -558,7 +567,7 @@ def emulate_export_profiles(run, mean, pairs, out) -> None:
 @click.option("--overfit", is_flag=True,
               help="Sanity #1: drive one batch's ESR to ~0 through the encoder.")
 @click.option("--overfit-batch", type=int, default=None,
-              help="Batch size for --overfit (default: emulate.batch_size).")
+              help="Batch size for --overfit (default: training.batch_size).")
 @click.option("--limit-devices", type=int, default=None,
               help="Mini-run on the first N training devices (sanity #2).")
 def joint(config_path, device, epochs, resume, overfit, overfit_batch,
@@ -566,14 +575,13 @@ def joint(config_path, device, epochs, resume, overfit, overfit_batch,
     """Train the reference encoder and the FiLM generator jointly, from scratch."""
     from openamp.joint_model import train as joint_train
 
-    cfg = _config(config_path)
-    name = _emulate_name(config_path)
+    spec = _run_spec(config_path)
     if overfit:
-        joint_train.overfit_one_batch(cfg, name=name, device=device,
+        joint_train.overfit_one_batch(spec, device=device,
                                       limit_devices=limit_devices or 8,
                                       batch_size=overfit_batch)
         return
-    joint_train.train(cfg, name=name, device=device, epochs=epochs, resume=resume,
+    joint_train.train(spec, device=device, epochs=epochs, resume=resume,
                       limit_devices=limit_devices)
 
 

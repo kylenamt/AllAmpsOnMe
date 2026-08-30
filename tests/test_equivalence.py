@@ -46,7 +46,8 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("soundfile")
 pytest.importorskip("auraloss")
 
-from openamp.core.config import Config, EmulateConfig, JointConfig  # noqa: E402
+from openamp.spec import (DataSpec, EncoderSpec, JointSpec,  # noqa: E402
+                          LossSpec, ModelSpec, RefSpec, RunSpec, TrainingSpec)
 
 SNAPSHOTS = Path(__file__).resolve().parent / "snapshots"
 UPDATE = os.environ.get("OPENAMP_UPDATE_SNAPSHOTS") == "1"
@@ -92,27 +93,32 @@ def check(name: str, payload) -> None:
                     f"OPENAMP_UPDATE_SNAPSHOTS=1 and review the diff.")
 
 
-def _config(tmp_path, **emulate) -> Config:
-    """A Config built here rather than through load_config, so the repo's own
-    configs/openamp.yaml cannot leak into a snapshot."""
-    cfg = Config(data_dir=tmp_path / "data", results_dir=tmp_path / "results",
-                 seed=SEED)
-    cfg.emulate = EmulateConfig(
-        arch="film_wavenet", wn_channels=4, embedding_dim=8,
-        clip_seconds=CLIP / cfg.sample_rate, batch_size=4, pairs_per_epoch=16,
-        epochs=2, val_pairs=8, num_workers=0, amp=False, holdout_frac=0.25,
-        log_every=10 ** 9, **emulate)
-    return cfg
+SAMPLE_RATE = 48_000
+
+
+def _spec(tmp_path, **changes) -> RunSpec:
+    """A RunSpec built here rather than through load_run_spec, so the repo's own
+    configs cannot leak into a snapshot."""
+    base = dict(
+        name="eq", data_dir=tmp_path / "data", results_dir=tmp_path / "results",
+        seed=SEED, sample_rate=SAMPLE_RATE,
+        model=ModelSpec("film_wavenet", {"channels": 4, "embedding_dim": 8}),
+        data=DataSpec(dataset="emulation", clip_seconds=CLIP / SAMPLE_RATE,
+                      pairs_per_epoch=16, holdout_frac=0.25),
+        loss=LossSpec(kwargs={"preemph_coeff": 0.85, "stft_weight": 1.0}),
+        training=TrainingSpec(batch_size=4, epochs=2, val_pairs=8, num_workers=0,
+                              amp=False, log_every=10 ** 9))
+    return RunSpec(**{**base, **changes})
 
 
 # --- 1. Datasets: the RNG-order guard -------------------------------------------
 def test_dataset_items_are_unchanged(tmp_path, write_corpus):
-    from openamp.data import (CorpusPaths, DeviceGridDataset, EmulationDataset,
-                              JointDataset, WetDryDataset, build_device_index)
+    from openamp.data import (DeviceGridDataset, EmulationDataset, JointDataset,
+                              WetDryDataset, build_device_index)
 
-    cfg = _config(tmp_path)
-    write_corpus(cfg, DEVICES, samples=SAMPLES, splits=("train", "val", "test"))
-    paths = CorpusPaths.from_config(cfg)
+    spec = _spec(tmp_path)
+    write_corpus(spec, DEVICES, samples=SAMPLES, splits=("train", "val", "test"))
+    paths = spec.paths
     _, id_to_idx = build_device_index(paths)
     common = dict(receptive_field=64, id_to_idx=id_to_idx, clip_samples=CLIP)
     out: dict = {}
@@ -144,6 +150,7 @@ def test_dataset_items_are_unchanged(tmp_path, write_corpus):
 @torch.no_grad()
 def test_model_init_and_forward_are_unchanged():
     from openamp.models import ARCHS, build_model
+    from openamp.spec import ModelSpec as MS
 
     x = torch.linspace(-0.8, 0.8, 512).reshape(1, 1, 512).repeat(2, 1, 1)
     idx = torch.tensor([0, 2])
@@ -151,10 +158,13 @@ def test_model_init_and_forward_are_unchanged():
     for arch in ARCHS:
         for norm in (False, True):
             tag = f"{arch}{'-norm' if norm else ''}"
+            kw = {"channels": 4, "embedding_dim": 8, "embed_normalize": norm}
+            if arch == "mlpfilm_wavenet":
+                kw["cond_hidden"] = 6
+            if arch == "delta_wavenet":
+                kw["delta_rank"] = 3
             torch.manual_seed(0)
-            m = build_model(EmulateConfig(arch=arch, wn_channels=4, embedding_dim=8,
-                                          cond_hidden=6, delta_rank=3,
-                                          embed_normalize=norm), n_devices=4).eval()
+            m = build_model(MS(arch, kw), n_devices=4).eval()
             out[f"{tag}/receptive_field"] = m.receptive_field
             out[f"{tag}/embedding_dim"] = m.embedding_dim
             out[f"{tag}/forward"] = _h(m(x, idx))
@@ -220,6 +230,8 @@ def test_encoder_init_and_forward_are_unchanged(tmp_path):
 # --- 3. Training: a whole tiny run of each trainer -------------------------------
 _DROP_METRICS = ("train_hours", "manifest_sha256")
 _DROP_CKPT = ("manifest_sha256", "fingerprint_sha256", "fingerprint_meta")
+# The spec carries absolute tmp_path directories, which differ every run.
+_DROP_SPEC = ("data_dir", "results_dir")
 
 
 def _run_payload(run_dir: Path, weight_keys: tuple[str, ...]) -> dict:
@@ -239,26 +251,33 @@ def _run_payload(run_dir: Path, weight_keys: tuple[str, ...]) -> dict:
     payload["checkpoint"] = {
         k: v for k, v in ck.items()
         if k not in weight_keys and k not in _DROP_CKPT
-        and k not in ("optim", "scaler")}
+        and k not in ("optim", "scaler", "spec")}
+    payload["spec"] = {k: v for k, v in ck["spec"].items() if k not in _DROP_SPEC}
     return payload
 
 
 def test_emulate_training_is_unchanged(tmp_path, write_corpus):
     from openamp.emulate import train as emu_train
 
-    cfg = _config(tmp_path)
-    write_corpus(cfg, DEVICES, samples=SAMPLES)
-    emu_train.train(cfg, name="eq", device="cpu")
-    check("training_emulate", _run_payload(cfg.emulate_run_dir("eq"), ("model",)))
+    spec = _spec(tmp_path)
+    write_corpus(spec, DEVICES, samples=SAMPLES)
+    emu_train.train(spec, device="cpu")
+    check("training_emulate", _run_payload(spec.run_dir, ("model",)))
 
 
 def test_joint_training_is_unchanged(tmp_path, write_corpus):
     from openamp.joint_model import train as joint_train
 
-    cfg = _config(tmp_path)
-    cfg.joint = JointConfig(ref_seconds=REF / cfg.sample_rate, enc_channels=4,
-                            enc_attn_hidden=4, enc_proj_hidden=4)
-    write_corpus(cfg, DEVICES, samples=SAMPLES)
-    joint_train.train(cfg, name="eq", device="cpu")
-    check("training_joint",
-          _run_payload(cfg.joint_run_dir("eq"), ("encoder", "generator")))
+    spec = _spec(tmp_path, data=DataSpec(dataset="joint",
+                                         clip_seconds=CLIP / SAMPLE_RATE,
+                                         pairs_per_epoch=16, holdout_frac=0.25),
+                 joint=JointSpec(
+                     ref=RefSpec(seconds=REF / SAMPLE_RATE),
+                     encoder=EncoderSpec("wavenet", {"channels": 4, "attn_hidden": 4,
+                                                     "proj_hidden": 4,
+                                                     # v1's JointConfig default;
+                                                     # the constructor's is leakyrelu
+                                                     "activation": "tanh"})))
+    write_corpus(spec, DEVICES, samples=SAMPLES)
+    joint_train.train(spec, device="cpu")
+    check("training_joint", _run_payload(spec.run_dir, ("encoder", "generator")))

@@ -19,27 +19,35 @@
 # 171s/device of unique audio vs 1913s/device on EGDB (pairs_per_epoch left
 # at 50000 anyway, so the optimization budget matches).
 
-emulate:
-  # --- Model -------------------------------------------------------------------
+data_dir: data_sweep   # was an OPENAMP_DATA_DIR prefix in the commands above
+
+model:
   arch: film_wavenet
-  wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
+  channels: 8  # A2 full-width submodel (the exports' other width is 3)
   embedding_dim: 256
 
-  # --- Training (NAM's A2 numbers where the knob exists) -----------------------
+data:
+  dataset: emulation
+
   holdout_frac: 0.1
-  clip_seconds: 2.0        # must match the corpus clip grid
-  batch_size: 32
+  clip_seconds: 2.0  # must match the corpus clip grid
   pairs_per_epoch: 50000
+
+loss:
+  name: esr_mrstft
+  stft_weight: 0.05  # held at the EGDB-derived value deliberately, to keep the corpus
+                     # as the only variable vs nam_a2_256 (this corpus's own NAM-scaled
+                     # weight would be ~0.104; the STFT term misbehaves on this signal)
+  preemph_coeff: 0.85
+
+training:
+  batch_size: 32
   epochs: 100
-  lr: 4.0e-3                # keep the decimal point -- PyYAML reads bare 4e-3 as a string
+  lr: 4.0e-3  # keep the decimal point -- PyYAML reads bare 4e-3 as a string
   weight_decay: 3.17e-7
   plateau_patience: 3
   plateau_factor: 0.5
   early_stop_patience: 8
-  stft_weight: 0.05         # held at the EGDB-derived value deliberately, to keep the corpus
-                            # as the only variable vs nam_a2_256 (this corpus's own NAM-scaled
-                            # weight would be ~0.104; the STFT term misbehaves on this signal)
-  preemph: 0.85
   num_workers: 6
   amp: true
   amp_dtype: bf16

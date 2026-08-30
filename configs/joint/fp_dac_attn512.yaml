@@ -42,34 +42,29 @@
 #   mean+std fingerprint (this generator, resumed to convergence)  results/joint/fp_dac_delta512
 #     best_val_esr 0.12109 seen, holdout 1.07654 (≈ zero-conditioning baseline 1.11689)
 
-emulate:
-  # --- Model: delta_a2_tanh_r32_512, unchanged -------------------------------
+data_dir: data   # was an OPENAMP_DATA_DIR prefix in the commands above
+
+model:
   arch: delta_wavenet
-  wn_channels: 8
-  wn_activation: tanh
+  channels: 8
+  activation: tanh
   embedding_dim: 512
   delta_rank: 32
 
-  # --- Training: fp_dac_delta512's original fresh-start schedule, not its
+data:
+  dataset: joint
+
   # later hand-annealed resume state -- this is a new run and should get a
   # normal schedule, not one tuned to a different run's trajectory. -----------
   holdout_frac: 0.1
   clip_seconds: 2.0
-  batch_size: 32
   pairs_per_epoch: 50000
-  epochs: 150
-  lr: 4.0e-3
-  weight_decay: 3.17e-7
-  plateau_patience: 3
-  plateau_factor: 0.5
-  early_stop_patience: 15
+  sources: []
+
+loss:
+  name: esr_mrstft
   stft_weight: 0.05
-  preemph: 0.85
-  num_workers: 6
-  amp: true
-  amp_dtype: bf16
-  val_pairs: 2000
-  log_every: 50
+  preemph_coeff: 0.85
   # NEW vs fp_dac_delta512 (which ran at the 0.0 default): equalizes each
   # device's expected share of the pooled ESR gradient instead of letting it
   # track render power. joint_model/train.py did not read this field at all
@@ -78,45 +73,55 @@ emulate:
   # holdout note there, the holdout probe stays unweighted regardless.
   device_loss_weighting: 1.0
 
-joint:
-  # --- Conditioning source: the one thing this config changes -----------------
-  enc_kind: dac_frames
-  # openamp.probes.extract's output: per-device [~14700, 1024] fp16 frame
-  # shards, memmapped and looked up by device id -- same lookup design as
-  # enc_kind: fingerprint, for the same reason (a codec fingerprint needs long
-  # audio to be reliable; a joint reference window is 2 s).
-  fp_frames_path: results/dac_frames/sweep_train
+training:
+  batch_size: 32
+  epochs: 150
+  lr: 4.0e-3
+  weight_decay: 3.17e-7
+  plateau_patience: 3
+  plateau_factor: 0.5
+  early_stop_patience: 15
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50
 
-  # --- Adapter: pool + projection, both trained ------------------------------
-  # CrossAttentionPool(latent_dim=1024, n_queries, d_model) -> pooled
-  # n_queries*d_model -> proj (Linear -> tanh -> Linear) -> 512. Same
-  # projection shape FingerprintEncoder and WaveNetEncoder both use, so this
-  # arm differs from the fingerprint arm in exactly one place: a trained pool
-  # stands where a frozen mean+std vector was looked up.
-  # 8x64=512, not probe.py's own 4x64=256 default: the fingerprint arm pools to
-  # 2048-d (ceiling exactly embedding_dim=512), so leaving this at 256 would
-  # hand the comparison a capacity handicap that has nothing to do with the
-  # pooling method being tested.
-  enc_pool_queries: 8
-  enc_pool_dim: 64
-  enc_proj_hidden: 128
-  enc_activation: tanh
-  # ON, for the same reason fp_dac_delta512 turns it on: nothing else bounds
-  # |e| and the reconstruction gradient inflates it.
-  enc_normalize: true
+joint:
+  encoder:
+    kind: dac_frames
+    # openamp.probes.extract's output: per-device [~14700, 1024] fp16 frame
+    # shards, memmapped and looked up by device id -- same lookup design as
+    # enc_kind: fingerprint, for the same reason (a codec fingerprint needs long
+    # audio to be reliable; a joint reference window is 2 s).
+    frames_path: results/dac_frames/sweep_train
+
+    # CrossAttentionPool(latent_dim=1024, n_queries, d_model) -> pooled
+    # n_queries*d_model -> proj (Linear -> tanh -> Linear) -> 512. Same
+    # projection shape FingerprintEncoder and WaveNetEncoder both use, so this
+    # arm differs from the fingerprint arm in exactly one place: a trained pool
+    # stands where a frozen mean+std vector was looked up.
+    # 8x64=512, not probe.py's own 4x64=256 default: the fingerprint arm pools to
+    # 2048-d (ceiling exactly embedding_dim=512), so leaving this at 256 would
+    # hand the comparison a capacity handicap that has nothing to do with the
+    # pooling method being tested.
+    n_queries: 8
+    d_model: 64
+    proj_hidden: 128
+    activation: tanh
+    # ON, for the same reason fp_dac_delta512 turns it on: nothing else bounds
+    # |e| and the reconstruction gradient inflates it.
+    normalize: true
+
+  ref:
+    # fp_path / fp_preprocess / fp_layernorm belong to enc_kind: fingerprint and
+    # do nothing here -- dac_frames has no precomputed pooled vector to look up
+    # and no dry row to subtract (extract.py keeps wet frames only). Left at
+    # their JointConfig defaults rather than restated.
+    seconds: 2.0
+    different_file: true
+    min_gap_seconds: 1.0
+
   enc_lr: 5.0e-4
   enc_weight_decay: 1.0e-4
-
-  # --- Inert under enc_kind: dac_frames --------------------------------------
-  # fp_path / fp_preprocess / fp_layernorm belong to enc_kind: fingerprint and
-  # do nothing here -- dac_frames has no precomputed pooled vector to look up
-  # and no dry row to subtract (extract.py keeps wet frames only). Left at
-  # their JointConfig defaults rather than restated.
-  ref_seconds: 2.0
-  ref_different_file: true
-  ref_min_gap_seconds: 1.0
-  sources: []
-  enc_channels: 16
-  enc_attn_hidden: 64
-  enc_head: stats
   grad_checkpoint_encoder: false

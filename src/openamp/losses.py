@@ -44,11 +44,11 @@ def register_loss(name: str):
     return wrap
 
 
-def build_loss(name: str, **kwargs):
-    """Construct a registered objective."""
-    if name not in LOSSES:
-        raise ValueError(f"unknown loss {name!r}; known: {sorted(LOSSES)}")
-    return LOSSES[name](**kwargs)
+def build_loss(spec):
+    """Construct the objective a :class:`~openamp.spec.LossSpec` names."""
+    if spec.name not in LOSSES:
+        raise ValueError(f"unknown loss {spec.name!r}; known: {sorted(LOSSES)}")
+    return LOSSES[spec.name](**spec.kwargs)
 
 
 # --- Terms ----------------------------------------------------------------------

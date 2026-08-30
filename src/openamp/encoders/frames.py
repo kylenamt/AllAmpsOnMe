@@ -72,6 +72,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from openamp.core.config import ConfigError
 from openamp.encoders.pooling import CrossAttentionPool, FrameStore
 from openamp.models import make_activation, normalize_activation
 
@@ -98,8 +99,10 @@ class FrameAttentionEncoder(nn.Module):
     def __init__(self, *, embedding_dim: int, frames: FrameStore,
                  n_queries: int = 4, d_model: int = 64, proj_hidden: int = 128,
                  activation: str = "tanh", normalize: bool = True,
-                 frame_window: int = 0):
+                 frame_window: int = 0, grad_checkpoint: bool = False):
         super().__init__()
+        # Accepted and ignored -- see FingerprintEncoder.
+        del grad_checkpoint
         self.embedding_dim = int(embedding_dim)
         self.normalize = bool(normalize)
         self.frame_window = int(frame_window)
@@ -145,19 +148,25 @@ class FrameAttentionEncoder(nn.Module):
         return hashlib.sha256((Path(path) / "meta.json").read_bytes()).hexdigest()
 
     @classmethod
-    def from_config(cls, jcfg, embedding_dim: int) -> "FrameAttentionEncoder":
-        """Mirrors FingerprintEncoder.from_config: ``embedding_dim`` comes from
-        the *generator's* config, so the interface width has one source of truth."""
-        store = FrameStore(jcfg.fp_frames_path)
-        return cls(embedding_dim=embedding_dim, frames=store,
-                   n_queries=jcfg.enc_pool_queries, d_model=jcfg.enc_pool_dim,
-                   proj_hidden=jcfg.enc_proj_hidden, activation=jcfg.enc_activation,
-                   normalize=jcfg.enc_normalize, frame_window=jcfg.enc_frame_window)
+    def from_spec(cls, spec, embedding_dim: int, **extra) -> "FrameAttentionEncoder":
+        """Mirrors FingerprintEncoder.from_spec: ``frames_path`` is opened first."""
+        kwargs = dict(spec.kwargs)
+        store = FrameStore(cls._path(kwargs.pop("frames_path", "")))
+        return cls(embedding_dim=embedding_dim, frames=store, **kwargs, **extra)
+
+    @staticmethod
+    def _path(path) -> str:
+        if not str(path).strip():
+            raise ConfigError("encoder kind 'dac_frames' needs "
+                              "joint.encoder.frames_path, the directory holding "
+                              "meta.json + frames/ (openamp.probes.extract's output)")
+        return str(path)
 
     @classmethod
-    def provenance(cls, jcfg) -> tuple[str, dict]:
-        return (cls.frames_sha256(jcfg.fp_frames_path),
-                json.loads((Path(jcfg.fp_frames_path) / "meta.json").read_text()))
+    def provenance(cls, spec) -> tuple[str, dict]:
+        path = cls._path(spec.kwargs.get("frames_path", ""))
+        return (cls.frames_sha256(path),
+                json.loads((Path(path) / "meta.json").read_text()))
 
     # --- Forward ------------------------------------------------------------------
     def rows_for(self, device_ids: torch.Tensor) -> torch.Tensor:

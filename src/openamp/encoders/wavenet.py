@@ -104,7 +104,7 @@ class WaveNetEncoder(nn.Module):
     ref_mode = "audio"                                   # a real (dry, wet) window
 
     @classmethod
-    def provenance(cls, jcfg) -> tuple[str, dict]:
+    def provenance(cls, spec) -> tuple[str, dict]:
         """``(sha256, meta)`` of the precomputed data this arm conditions on.
 
         Nothing here: the encoder is trained from scratch on the corpus the
@@ -169,20 +169,17 @@ class WaveNetEncoder(nn.Module):
                                       nn.Linear(hidden, self.embedding_dim))
 
     @classmethod
-    def from_config(cls, jcfg, embedding_dim: int) -> "WaveNetEncoder":
-        """Construct from a :class:`~openamp.core.config.JointConfig`.
+    def from_spec(cls, spec, embedding_dim: int, **extra) -> "WaveNetEncoder":
+        """Construct from an :class:`~openamp.spec.EncoderSpec`.
 
-        ``embedding_dim`` comes from the *generator's* config, not this one — it is
-        the interface contract, so it has exactly one source of truth.
+        ``embedding_dim`` comes from the *generator's* spec, not this one -- it is
+        the interface contract, so it has exactly one source of truth. This arm
+        takes its kwargs verbatim; the lookup arms open a file first.
         """
-        return cls(embedding_dim=embedding_dim, channels=jcfg.enc_channels,
-                   activation=jcfg.enc_activation, attn_hidden=jcfg.enc_attn_hidden,
-                   proj_hidden=jcfg.enc_proj_hidden, normalize=jcfg.enc_normalize,
-                   grad_checkpoint=jcfg.grad_checkpoint_encoder,
-                   head=jcfg.enc_head, taps=tuple(jcfg.enc_taps),
-                   tap_stride=jcfg.enc_tap_stride, expand_dim=jcfg.enc_expand_dim,
-                   n_heads=jcfg.enc_n_heads, expand_norm=jcfg.enc_expand_norm,
-                   norm_groups=jcfg.enc_norm_groups)
+        kwargs = dict(spec.kwargs)
+        if "taps" in kwargs:
+            kwargs["taps"] = tuple(kwargs["taps"])
+        return cls(embedding_dim=embedding_dim, **kwargs, **extra)
 
     @staticmethod
     def compute_receptive_field(kernel_sizes=A2_KERNEL_SIZES,

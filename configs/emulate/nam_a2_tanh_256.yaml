@@ -7,26 +7,32 @@
 #
 # Full copy of nam_a2_256.yaml's numbers -- see nam_a2.yaml for the derivation.
 
-emulate:
-  # --- Model -------------------------------------------------------------------
+model:
   arch: film_wavenet
-  wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
-  embedding_dim: 256       # the only change from nam_a2.yaml (128)
-  wn_activation: tanh      # "leakyrelu" (the capture default) | "tanh"  <- the knob
+  channels: 8  # A2 full-width submodel (the exports' other width is 3)
+  embedding_dim: 256  # the only change from nam_a2.yaml (128)
+  activation: tanh  # "leakyrelu" (the capture default) | "tanh"  <- the knob
 
-  # --- Training (NAM's A2 numbers where the knob exists) -----------------------
+data:
+  dataset: emulation
+
   holdout_frac: 0.1
-  clip_seconds: 2.0        # must match the corpus clip grid
-  batch_size: 32           # NAM uses 16; doubled since this model is launch-bound, not compute-bound
+  clip_seconds: 2.0  # must match the corpus clip grid
   pairs_per_epoch: 50000
-  epochs: 100              # NAM trainer.max_epochs; early-stop still ends it sooner
-  lr: 4.0e-3                # keep the decimal point -- PyYAML reads bare 4e-3 as a string
+
+loss:
+  name: esr_mrstft
+  stft_weight: 0.05  # NAM's MRSTFT weight, rescaled from MSE to this trainer's ESR term
+  preemph_coeff: 0.85  # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
+
+training:
+  batch_size: 32  # NAM uses 16; doubled since this model is launch-bound, not compute-bound
+  epochs: 100  # NAM trainer.max_epochs; early-stop still ends it sooner
+  lr: 4.0e-3  # keep the decimal point -- PyYAML reads bare 4e-3 as a string
   weight_decay: 3.17e-7
   plateau_patience: 3
   plateau_factor: 0.5
   early_stop_patience: 8
-  stft_weight: 0.05         # NAM's MRSTFT weight, rescaled from MSE to this trainer's ESR term
-  preemph: 0.85            # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
   num_workers: 6
   amp: true
   amp_dtype: bf16

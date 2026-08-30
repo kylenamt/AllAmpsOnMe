@@ -11,7 +11,16 @@ torch = pytest.importorskip("torch")
 
 from openamp.emulate.export import (_blob, _unblob, folded_model,
                                     forward_with_embedding)
-from openamp.models import DeltaWaveNet, FiLMWaveNet, MLPFiLMWaveNet
+from openamp.models import DeltaWaveNet, FiLMWaveNet, MLPFiLMWaveNet, build_model
+from openamp.spec import ModelSpec, RunSpec
+
+
+def _spec(arch, **extra):
+    """A RunSpec whose model: section is what a checkpoint now stores."""
+    return RunSpec(name=arch, data_dir="data", results_dir="results",
+                   model=ModelSpec(arch, dict(channels=KW["channels"],
+                                              embedding_dim=KW["embedding_dim"],
+                                              **extra)))
 
 # Small-but-real schedule: mixed kernels like A2, a few hundred samples of RF.
 KW = dict(n_devices=4, channels=4, embedding_dim=8,
@@ -127,17 +136,15 @@ def test_blob_roundtrip_exact():
 
 def test_export_bundle_and_profile_from_fake_run(tmp_path):
     # Fake a run dir: a checkpoint with exactly the keys export reads.
-    from openamp.core.config import EmulateConfig
     from openamp.emulate import export as ex
 
     m = _model(4)
-    ecfg = EmulateConfig(arch="film_wavenet", wn_channels=KW["channels"],
-                         embedding_dim=KW["embedding_dim"])
-    # from_config rebuilds with the A2 schedule; store our small schedule's
+    spec = _spec("film_wavenet")
+    # build_model rebuilds with the A2 schedule; store our small schedule's
     # weights under a matching model instead: monkeypatch via direct save/load
-    # is overkill — just verify against a real from_config-shaped model.
-    m2 = FiLMWaveNet.from_config(ecfg, n_devices=3).eval()
-    ck = {"model": m2.state_dict(), "emulate_cfg": ecfg.__dict__.copy(),
+    # is overkill — just verify against a real spec-shaped model.
+    m2 = build_model(spec.model, n_devices=3).eval()
+    ck = {"model": m2.state_dict(), "spec": spec.to_dict(),
           "device_ids": [11, 22, 33], "id_to_idx": {11: 0, 22: 1, 33: 2},
           "holdout_ids": [], "manifest_sha256": "x", "sample_rate": 48000,
           "receptive_field": m2.receptive_field, "name": "fake", "epoch": 1,
@@ -205,17 +212,14 @@ def test_bundle_conditioning_payload_is_arch_specific(tmp_path):
     the regression guard on the already-shipped contract."""
     import json
 
-    from openamp.core.config import EmulateConfig
     from openamp.emulate import export as ex
 
     def _bundle(arch, **extra):
-        ecfg = EmulateConfig(arch=arch, wn_channels=KW["channels"],
-                             embedding_dim=KW["embedding_dim"], **extra)
-        from openamp.models import build_model
-        mm = build_model(ecfg, 2).eval()
+        spec = _spec(arch, **extra)
+        mm = build_model(spec.model, 2).eval()
         run = tmp_path / arch
         run.mkdir()
-        torch.save({"model": mm.state_dict(), "emulate_cfg": ecfg.__dict__.copy(),
+        torch.save({"model": mm.state_dict(), "spec": spec.to_dict(),
                     "device_ids": [1, 2], "id_to_idx": {1: 0, 2: 1},
                     "sample_rate": 48000, "name": arch},
                    run / "checkpoint.pt")

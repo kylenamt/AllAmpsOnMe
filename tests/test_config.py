@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from openamp.core.config import (Config, ConfigError, EmulateConfig,
-                                 load_config)
+from openamp.core.config import Config, ConfigError, load_config
+from openamp.spec import load_run_spec
 
 
 # --- Defaults & derived paths --------------------------------------------------
@@ -52,21 +52,24 @@ def test_corpus_and_render_from_yaml(tmp_path):
     assert cfg.split_ratios == {"train": 0.7, "val": 0.2, "test": 0.1}
 
 
-def test_emulate_defaults_and_overrides(tmp_path):
-    cfg = load_config(tmp_path / "missing.yaml", data_dir=tmp_path)
-    assert isinstance(cfg.emulate, EmulateConfig)
-    assert cfg.emulate.arch == "film_wavenet"
-    assert cfg.emulate.wn_channels == 8
-    assert cfg.emulate.embedding_dim == 64
+def test_run_spec_defaults_and_overrides(tmp_path):
+    """Training config is a RunSpec now, read from its own per-run file."""
+    p = tmp_path / "nam_a2_256.yaml"
+    p.write_text("model:\n  arch: film_wavenet\n", encoding="utf-8")
+    spec = load_run_spec(p)
+    assert spec.name == "nam_a2_256"            # the file stem, as it always was
+    assert spec.model.arch == "film_wavenet"
+    assert spec.training.batch_size == 16       # omitted keys keep their defaults
 
-    p = tmp_path / "openamp.yaml"
-    p.write_text(
-        "emulate:\n  wn_channels: 16\n  embedding_dim: 256\n  batch_size: 8\n",
-        encoding="utf-8",
-    )
-    cfg = load_config(p, data_dir=tmp_path)
-    assert cfg.emulate.wn_channels == 16 and cfg.emulate.embedding_dim == 256
-    assert cfg.emulate.batch_size == 8
+    p.write_text("name: custom\ndata_dir: data_mixed\n"
+                 "model:\n  arch: film_wavenet\n  channels: 16\n"
+                 "  embedding_dim: 256\ntraining:\n  batch_size: 8\n",
+                 encoding="utf-8")
+    spec = load_run_spec(p)
+    assert spec.name == "custom"                # a config may name itself
+    assert spec.data_dir.name == "data_mixed"   # ...and its corpus
+    assert spec.model.kwargs == {"channels": 16, "embedding_dim": 256}
+    assert spec.training.batch_size == 8
 
 
 
@@ -83,9 +86,17 @@ def test_missing_split_key_rejected(tmp_path):
 
 def test_unknown_section_key_raises(tmp_path):
     p = tmp_path / "openamp.yaml"
-    p.write_text("emulate:\n  nonsense: 1\n", encoding="utf-8")
-    with pytest.raises(ConfigError):
-        load_config(p, data_dir=tmp_path)
+    p.write_text("corpus:\n  nonsense: 1\n", encoding="utf-8")
+    load_config(p, data_dir=tmp_path)           # corpus keys are read selectively
+
+    # A run spec is stricter: model/loss kwargs are opaque by design, but a
+    # mistyped *section* or training knob must not be silently ignored.
+    p.write_text("nonsense:\n  x: 1\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="unknown top-level"):
+        load_run_spec(p)
+    p.write_text("training:\n  nonsense: 1\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="training"):
+        load_run_spec(p)
 
 
 # --- Environment ---------------------------------------------------------------
@@ -120,4 +131,16 @@ def test_repo_config_yaml_is_valid():
     cfg = load_config(repo_yaml, data_dir="/tmp/openamp-test")
     assert abs(sum(cfg.split_ratios.values()) - 1.0) < 1e-9
     assert cfg.minutes_total > 0
-    assert cfg.emulate.embedding_dim > 0
+
+
+def test_every_repo_run_config_loads():
+    """Every configs/{emulate,joint}/*.yaml must resolve to a RunSpec."""
+    root = Path(__file__).resolve().parents[1] / "configs"
+    files = [f for f in sorted(root.glob("emulate/*.yaml"))
+             + sorted(root.glob("joint/*.yaml")) if f.stem != "enroll"]
+    specs = [load_run_spec(f) for f in files]
+    assert len(specs) >= 30
+    for spec, f in zip(specs, files):
+        assert spec.model.arch in ("film_wavenet", "mlpfilm_wavenet", "delta_wavenet")
+        assert spec.training.batch_size > 0
+        assert (spec.joint is not None) == (f.parent.name == "joint")

@@ -38,21 +38,32 @@
 # The second is the placement ceiling: what this generator does when an unseen
 # amp's vector is optimized directly rather than predicted.
 
-emulate:
-  # --- Model: delta_a2_tanh_r32_512, unchanged --------------------------------
+data_dir: data   # was an OPENAMP_DATA_DIR prefix in the commands above
+
+model:
   # FULL copy, not a delta. Anything omitted falls back to the EmulateConfig
   # dataclass defaults, silently undoing the recipe.
-  arch: delta_wavenet      # A2 topology; embedding -> low-rank residual on each conv
-  wn_channels: 8           # A2 full-width submodel
-  wn_activation: tanh
-  embedding_dim: 512       # widened with the rank so 23*32=736 DOF is not clipped
+  arch: delta_wavenet  # A2 topology; embedding -> low-rank residual on each conv
+  channels: 8  # A2 full-width submodel
+  activation: tanh
+  embedding_dim: 512  # widened with the rank so 23*32=736 DOF is not clipped
   delta_rank: 32
 
-  # --- Training ---------------------------------------------------------------
+data:
+  dataset: joint
+
   holdout_frac: 0.1
   clip_seconds: 2.0
-  batch_size: 32
   pairs_per_epoch: 50000
+  sources: []
+
+loss:
+  name: esr_mrstft
+  stft_weight: 0.05
+  preemph_coeff: 0.85
+
+training:
+  batch_size: 32
   # Extended from 150 at the epoch-127 resume, to give the adapter a real window
   # at its raised learning rate.
   epochs: 300
@@ -76,8 +87,6 @@ emulate:
   # 142 and make the extension to 300 a no-op. The number this run exists to move
   # is val_esr_holdout, which early stopping does not look at.
   early_stop_patience: 100000
-  stft_weight: 0.05
-  preemph: 0.85
   num_workers: 6
   amp: true
   amp_dtype: bf16
@@ -85,33 +94,38 @@ emulate:
   log_every: 50
 
 joint:
-  # --- Conditioning source ----------------------------------------------------
-  enc_kind: fingerprint
-  # DAC (descript/dac_44khz), pre-quantization trunk, mean+std pooled over ~14,700
-  # frames of the 171 s sweep_train render, output_scale undone (how hard a device
-  # pushes is amp information). 450 devices plus the dry null at id -1.
-  fp_path: results/fingerprint/dac/sweep_train
-  # No corpus-scale standardization: per-dimension z-scoring over the amp
-  # population would rescale each axis by how much this particular 450-amp sample
-  # varied along it, which is a property of the corpus rather than of an amp, and
-  # would measure a new amp in units derived from amps it has nothing to do with.
-  # dry_l2 uses only the single fixed dry vector and per-sample arithmetic.
-  # Measured: dry subtraction drops mean pairwise cosine 0.886 -> 0.576, i.e. most
-  # of a raw fingerprint is "what DAC does to this audio", not "what this amp does".
-  fp_preprocess: dry_l2
-  fp_layernorm: false
+  encoder:
+    kind: fingerprint
+    # DAC (descript/dac_44khz), pre-quantization trunk, mean+std pooled over ~14,700
+    # frames of the 171 s sweep_train render, output_scale undone (how hard a device
+    # pushes is amp information). 450 devices plus the dry null at id -1.
+    path: results/fingerprint/dac/sweep_train
+    # No corpus-scale standardization: per-dimension z-scoring over the amp
+    # population would rescale each axis by how much this particular 450-amp sample
+    # varied along it, which is a property of the corpus rather than of an amp, and
+    # would measure a new amp in units derived from amps it has nothing to do with.
+    # dry_l2 uses only the single fixed dry vector and per-sample arithmetic.
+    # Measured: dry subtraction drops mean pairwise cosine 0.886 -> 0.576, i.e. most
+    # of a raw fingerprint is "what DAC does to this audio", not "what this amp does".
+    preprocess: dry_l2
+    layernorm: false
 
-  # --- Adapter: the only thing learned on the conditioning side ----------------
-  # Same two-layer shape WaveNetEncoder projects with, so this arm differs from an
-  # encoder arm in exactly one place: where the pooled vector comes from.
-  # 2048 -> 128 -> 512 = 327,680 params, against the generator's 928,360. The 128
-  # bottleneck is not a throttle here: the fingerprint cloud's own effective
-  # dimensionality is ~2.8, so the input, not the adapter, is the narrow part.
-  enc_proj_hidden: 128
-  enc_activation: tanh
-  # ON. Nothing else bounds |e| and the reconstruction gradient inflates it: proto
-  # measured |e| -> 123 and total collapse (shuffled ratio exactly 1.00) with it off.
-  enc_normalize: true
+    # Same two-layer shape WaveNetEncoder projects with, so this arm differs from an
+    # encoder arm in exactly one place: where the pooled vector comes from.
+    # 2048 -> 128 -> 512 = 327,680 params, against the generator's 928,360. The 128
+    # bottleneck is not a throttle here: the fingerprint cloud's own effective
+    # dimensionality is ~2.8, so the input, not the adapter, is the narrow part.
+    proj_hidden: 128
+    activation: tanh
+    # ON. Nothing else bounds |e| and the reconstruction gradient inflates it: proto
+    # measured |e| -> 123 and total collapse (shuffled ratio exactly 1.00) with it off.
+    normalize: true
+
+  ref:
+    seconds: 2.0
+    different_file: true
+    min_gap_seconds: 1.0
+
   # Raised to parity with the generator at the epoch-126 resume. It had annealed to
   # 3.91e-6 -- 8x below the generator and effectively frozen since ~epoch 105 --
   # because the shared scheduler tied it to the generator's plateau. The adapter is
@@ -123,13 +137,4 @@ joint:
   # would see a fresh window each time -- and emulate.weight_decay is 3.17e-7, i.e.
   # effectively none. Shrinkage is the natural guard.
   enc_weight_decay: 1.0e-4
-
-  # --- Inert under enc_kind: fingerprint, kept so this is a full copy ----------
-  ref_seconds: 2.0
-  ref_different_file: true
-  ref_min_gap_seconds: 1.0
-  sources: []
-  enc_channels: 16
-  enc_attn_hidden: 64
-  enc_head: stats
   grad_checkpoint_encoder: false

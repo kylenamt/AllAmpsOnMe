@@ -7,7 +7,8 @@ Both trainers produce the same set of files under ``results/<stage>/<name>/``:
 ``last.pt``                  most recent epoch, what ``--resume`` reads
 ``train_log.csv``            one row per epoch; the columns are the loop's own
 ``config_history.jsonl``     append-only, one line per start or resume
-``config.yaml``              the as-finished config snapshot
+``resolved_config.yaml``     the whole :class:`~openamp.spec.RunSpec`, corpus and
+                             seed included -- enough to rebuild the experiment
 ``metrics.json``             the end-of-run summary
 ===========================  ===================================================
 
@@ -79,10 +80,16 @@ class RunDir:
         with (self.path / "config_history.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
 
-    def save_config_copy(self, payload: dict) -> None:
+    def save_spec(self, spec) -> None:
+        """Write the resolved experiment beside its outputs.
+
+        Not the config *file* the user passed: the resolved spec, so a run
+        records the corpus, seed and name it actually used rather than leaving
+        them to an environment variable nobody wrote down.
+        """
         import yaml
-        (self.path / "config.yaml").write_text(
-            yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+        (self.path / "resolved_config.yaml").write_text(
+            yaml.safe_dump(spec.to_dict(), sort_keys=False), encoding="utf-8")
 
     def save_metrics(self, metrics: dict) -> dict:
         (self.path / "metrics.json").write_text(json.dumps(metrics, indent=2),
@@ -104,23 +111,18 @@ def check_resume_compatible(ck: dict, sections, *, receptive_field: int,
     knob that defines the checkpoint's shape -- turning a cryptic shape error
     into a message naming the field.
 
-    ``sections`` is one ``(keys, saved, current, prefix, legacy)`` tuple per
-    config dataclass the run stores. ``legacy`` gives the behaviour a checkpoint
-    written before a knob existed actually ran, so its absence is not silently
-    waved through. ``dynamics`` names the fields that *are* free to change, for
-    the error message.
+    ``sections`` is one ``(saved, current, prefix)`` tuple per *structural*
+    section of the run spec. There is no key list: the v2 schema draws ``model:``
+    and ``joint.encoder:`` so that every key in them changes the network, so the
+    whole section is compared and a new architecture's knobs are covered without
+    anyone remembering to add them. ``dynamics`` names the fields that *are* free
+    to change, for the error message.
     """
     changed = []
-    for keys, saved, current, prefix, legacy in sections:
-        for k in keys:
-            if k in saved:
-                was = saved[k]
-            elif k in legacy:
-                was = legacy[k]
-            else:
-                continue
-            if not same_config_value(was, current.get(k)):
-                changed.append(f"{prefix}{k}: {was!r} -> {current.get(k)!r}")
+    for saved, current, prefix in sections:
+        for k in sorted(set(saved) | set(current)):
+            if not same_config_value(saved.get(k), current.get(k)):
+                changed.append(f"{prefix}{k}: {saved.get(k)!r} -> {current.get(k)!r}")
     if ck.get("receptive_field") not in (None, receptive_field):
         changed.append(f"receptive_field: {ck['receptive_field']} -> {receptive_field}")
     if ck.get("device_ids") is not None and len(ck["device_ids"]) != n_devices:

@@ -27,11 +27,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from openamp.core.config import Config, EmulateConfig
+from openamp.core.config import Config
 from openamp.data import CorpusPaths, EmulationDataset
 from openamp.evaluation.metrics import (SILENCE_DBFS, pooled_esr_terms,
                                         silence_floor, windowed_esr)
 from openamp.models import build_model
+from openamp.spec import spec_from_checkpoint
 
 # One row of the comparison CSV, in order (spec §3).
 COMPARISON_COLUMNS = [
@@ -50,8 +51,7 @@ def load_model(run_dir: Path, device: str = "cpu"):
     device = resolve_device(device)
     ck = torch.load(Path(run_dir) / "checkpoint.pt", map_location=device,
                     weights_only=False)
-    ecfg = EmulateConfig(**ck["emulate_cfg"])
-    model = build_model(ecfg, len(ck["device_ids"]))
+    model = build_model(spec_from_checkpoint(ck).model, len(ck["device_ids"]))
     model.load_state_dict(ck["model"])
     model.to(device).eval()
     return model, ck
@@ -71,17 +71,18 @@ def evaluate_run(cfg: Config, run_dir: Path, *, device: str = "cpu",
     run_dir = Path(run_dir)
     dev = torch.device(resolve_device(device))
     model, ck = load_model(run_dir, str(dev))
-    ecfg = EmulateConfig(**ck["emulate_cfg"])
+    spec = spec_from_checkpoint(ck)
     R = model.receptive_field
-    clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
-    n_pairs = int(n_pairs if n_pairs is not None else max(ecfg.val_pairs, 2000))
+    clip = int(round(spec.data.clip_seconds * cfg.sample_rate))
+    n_pairs = int(n_pairs if n_pairs is not None
+                  else max(spec.training.val_pairs, 2000))
 
     ds = EmulationDataset(CorpusPaths.from_config(cfg), "test", receptive_field=R,
                           id_to_idx=ck["id_to_idx"], clip_samples=clip,
                           pairs_per_epoch=n_pairs, seed=cfg.seed + 7)
     from torch.utils.data import DataLoader
-    loader = DataLoader(ds, batch_size=ecfg.batch_size, shuffle=False,
-                        num_workers=ecfg.num_workers, pin_memory=True)
+    loader = DataLoader(ds, batch_size=spec.training.batch_size, shuffle=False,
+                        num_workers=spec.training.num_workers, pin_memory=True)
     mrstft = auraloss.freq.MultiResolutionSTFTLoss()
 
     floor = silence_floor(clip)
@@ -213,12 +214,12 @@ def validate_per_device(cfg: Config, run_dir: Path, *, device: str = "cpu",
     run_dir = Path(run_dir)
     dev = torch.device(resolve_device(device))
     model, ck = load_model(run_dir, str(dev))
-    ecfg = EmulateConfig(**ck["emulate_cfg"])
+    spec = spec_from_checkpoint(ck)
     R = model.receptive_field
-    clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
+    clip = int(round(spec.data.clip_seconds * cfg.sample_rate))
 
     # Checkpoints predating the saved map imply it: the table is built in the
-    # device_ids order (dataset.build_device_index).
+    # device_ids order (data.build_device_index).
     id_to_idx = ck.get("id_to_idx") or {int(d): i for i, d in enumerate(ck["device_ids"])}
     ds = DeviceGridDataset(CorpusPaths.from_config(cfg), "test", receptive_field=R,
                            id_to_idx=id_to_idx,
@@ -226,8 +227,9 @@ def validate_per_device(cfg: Config, run_dir: Path, *, device: str = "cpu",
                            n_windows=n_windows,
                            seed=int(seed if seed is not None else cfg.seed + 7),
                            silence_dbfs=SILENCE_DBFS)
-    loader = DataLoader(ds, batch_size=int(batch_size or ecfg.batch_size), shuffle=False,
-                        num_workers=ecfg.num_workers, pin_memory=(dev.type == "cuda"))
+    loader = DataLoader(ds, batch_size=int(batch_size or spec.training.batch_size),
+                        shuffle=False, num_workers=spec.training.num_workers,
+                        pin_memory=(dev.type == "cuda"))
     mrstft = auraloss.freq.MultiResolutionSTFTLoss()
 
     n_dev = len(ds.device_ids)

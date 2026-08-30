@@ -25,6 +25,7 @@ from __future__ import annotations
 import csv
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -33,14 +34,15 @@ from torch import nn
 
 from openamp.core import constants as C
 from openamp.core import manifest as manifests
-from openamp.core.config import Config, EmulateConfig
+from openamp.core.config import Config
 from openamp.data import (CorpusPaths, EmulationDataset, WetDryDataset,
                           make_loader, manifest_signature)
 from openamp.emulate.train import evaluate_esr
 from openamp.evaluation import (SILENCE_DBFS, load_model, per_device_esr,
                                 resolve_device)
 from openamp.training import GRAD_CLIP_NORM
-from openamp.losses import DEFAULT_LOSS, build_loss
+from openamp.losses import build_loss
+from openamp.spec import RunSpec, spec_from_checkpoint
 from openamp.models import A2_EMBEDDING_STD
 
 ENROLL_LR = 1e-2                 # only embeddings train (the table trained at 5e-4-2e-3 with the network)
@@ -119,13 +121,8 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
     torch.manual_seed(seed)
 
     model, ck = load_model(run_dir, str(dev))
-    ecfg = EmulateConfig(**ck["emulate_cfg"])
-    if stft_weight is not None:
-        ecfg.stft_weight = float(stft_weight)
-    if batch_size is not None:
-        if int(batch_size) < 1:
-            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
-        ecfg.batch_size = int(batch_size)
+    spec = _enroll_spec(ck, stft_weight, batch_size)
+    tcfg, lossfn = spec.training, build_loss(spec.loss).to(dev)
     base_name = ck.get("name", run_dir.name)
     paths = CorpusPaths.from_config(cfg)
     manifest_sig = manifest_signature(paths)
@@ -137,27 +134,27 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
     enroll_idx = {d: i for i, d in enumerate(enroll_ids)}
     n = len(enroll_ids)
 
-    _swap_embedding(model, ecfg, n, dev, init=init)
+    _swap_embedding(model, n, dev, init=init)
 
     R = model.receptive_field
-    clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
-    print(f"[enroll] run={base_name} arch={ecfg.arch} devices={n} "
-          f"(skipped {len(skipped)}) pairs/device={pairs} batch={ecfg.batch_size} "
+    clip = int(round(spec.data.clip_seconds * cfg.sample_rate))
+    print(f"[enroll] run={base_name} arch={spec.model.arch} devices={n} "
+          f"(skipped {len(skipped)}) pairs/device={pairs} batch={tcfg.batch_size} "
           f"lr={lr:g} init={init}")
 
     train_ds = EmulationDataset(paths, "train", receptive_field=R, id_to_idx=enroll_idx,
                                 clip_samples=clip, pairs_per_epoch=pairs * n, seed=seed)
     val_ds = EmulationDataset(paths, "val", receptive_field=R, id_to_idx=enroll_idx,
-                              clip_samples=clip, pairs_per_epoch=ecfg.val_pairs,
+                              clip_samples=clip, pairs_per_epoch=tcfg.val_pairs,
                               seed=seed + 999)
-    val_loader = make_loader(val_ds, ecfg.batch_size, ecfg.num_workers,
+    val_loader = make_loader(val_ds, tcfg.batch_size, tcfg.num_workers,
                               shuffle=False, seed=seed + 999, drop_last=False)
     test_loader = None
     try:
         test_ds = EmulationDataset(paths, "test", receptive_field=R, id_to_idx=enroll_idx,
                                    clip_samples=clip, pairs_per_epoch=test_pairs * n,
                                    seed=cfg.seed + 7)
-        test_loader = make_loader(test_ds, ecfg.batch_size, ecfg.num_workers,
+        test_loader = make_loader(test_ds, tcfg.batch_size, tcfg.num_workers,
                                    shuffle=False, seed=cfg.seed + 7, drop_last=False)
     except RuntimeError:
         print("[enroll] no test renders for any enrolled device — test ESR will be NaN")
@@ -173,14 +170,14 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
     t0 = time.time()
     baseline_test = np.full(n, np.nan) if test_loader is None else per_device_esr(
         model, test_loader, dev, n, silence_dbfs=SILENCE_DBFS, clip=clip)
-    init_val = evaluate_esr(model, val_loader, dev, ecfg.preemph)
+    init_val = evaluate_esr(model, val_loader, dev, lossfn.coeff)
     print(f"[enroll] baseline val_esr={init_val:.5f}")
     with log_path.open("a", newline="", encoding="utf-8") as fh:
         csv.writer(fh).writerow([-1, 0, "", "", "", f"{init_val:.6f}",
                                  f"{lr:.2e}", f"{time.time() - t0:.1f}"])
 
     best_emb, best_val, best_epoch, epochs_run = _fit_embedding(
-        model, ecfg, train_ds, val_loader, dev, epochs=epochs, lr=lr,
+        model, spec, lossfn, train_ds, val_loader, dev, epochs=epochs, lr=lr,
         weight_decay=weight_decay, seed=seed,
         log_path=log_path, init_val=init_val, t0=t0,
         early_stop_patience=early_stop_patience,
@@ -189,7 +186,7 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
     # --- Final per-device metrics at the best rows --------------------------------
     with torch.no_grad():
         model.embedding.weight.copy_(best_emb)
-    val_per_dev = per_device_esr(model, val_loader, dev, n, preemph=ecfg.preemph)
+    val_per_dev = per_device_esr(model, val_loader, dev, n, preemph=lossfn.coeff)
     test_per_dev = np.full(n, np.nan) if test_loader is None else per_device_esr(
         model, test_loader, dev, n, silence_dbfs=SILENCE_DBFS, clip=clip)
 
@@ -204,7 +201,7 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
         # embedding.pt schema (a future loader can concat these onto the table)
         "embedding": model.project_embedding(best_emb).cpu(),
         "device_ids": list(enroll_ids),
-        "manifest_sha256": manifest_sig, "embedding_dim": int(ecfg.embedding_dim),
+        "manifest_sha256": manifest_sig, "embedding_dim": int(model.embedding_dim),
         "name": f"{base_name}-enroll",
         # enrollment provenance
         "base_run": base_name, "base_epoch": int(ck.get("epoch", -1)),
@@ -237,7 +234,25 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
     return metrics
 
 
-def _swap_embedding(model, ecfg: EmulateConfig, n: int, dev, *,
+def _enroll_spec(ck: dict, stft_weight, batch_size) -> RunSpec:
+    """The run's own spec, with enrollment's two overrides applied.
+
+    Copies rather than mutation: the spec a run was trained under is a record,
+    and enrollment fits against a *modified* one -- ``--stft-weight`` to retune
+    the objective, ``--batch-size`` because an fp32 fit needs ~2x the memory the
+    run itself trained at.
+    """
+    spec = spec_from_checkpoint(ck)
+    if stft_weight is not None:
+        spec = spec.replace(loss=spec.loss.with_kwargs(stft_weight=float(stft_weight)))
+    if batch_size is not None:
+        if int(batch_size) < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        spec = spec.replace(training=replace(spec.training, batch_size=int(batch_size)))
+    return spec
+
+
+def _swap_embedding(model, n: int, dev, *,
                     init: str = ENROLL_INIT) -> torch.Tensor:
     """Freeze the network and swap in a fresh trainable n-row table.
 
@@ -252,7 +267,7 @@ def _swap_embedding(model, ecfg: EmulateConfig, n: int, dev, *,
     if init not in ENROLL_INITS:
         raise ValueError(f"init must be one of {ENROLL_INITS}, got {init!r}")
     model.requires_grad_(False)
-    emb = nn.Embedding(n, ecfg.embedding_dim).to(dev)
+    emb = nn.Embedding(n, model.embedding_dim).to(dev)
     with torch.no_grad():
         if init == "uniform":
             emb.weight.uniform_(-ENROLL_INIT_A, ENROLL_INIT_A)
@@ -269,7 +284,7 @@ def _swap_embedding(model, ecfg: EmulateConfig, n: int, dev, *,
     return emb.weight.detach().clone()
 
 
-def _fit_embedding(model, ecfg: EmulateConfig, train_ds, val_loader, dev, *,
+def _fit_embedding(model, spec: RunSpec, lossfn, train_ds, val_loader, dev, *,
                    epochs: int, lr: float, seed: int, log_path: Path,
                    weight_decay: float = 0.0,
                    init_val: float, t0: float,
@@ -285,8 +300,7 @@ def _fit_embedding(model, ecfg: EmulateConfig, train_ds, val_loader, dev, *,
     Returns (best_emb, best_val, best_epoch, epochs_run).
     """
     R = model.receptive_field
-    lossfn = build_loss(DEFAULT_LOSS, preemph_coeff=ecfg.preemph,
-                        stft_weight=ecfg.stft_weight).to(dev)
+    tcfg = spec.training
     opt = torch.optim.Adam(model.embedding.parameters(), lr=lr,
                            weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -296,7 +310,7 @@ def _fit_embedding(model, ecfg: EmulateConfig, train_ds, val_loader, dev, *,
     best_epoch, since_improved, step, epoch = -1, 0, 0, -1
     for epoch in range(int(epochs)):
         train_ds.seed = seed + epoch         # fresh window positions each epoch
-        loader = make_loader(train_ds, ecfg.batch_size, ecfg.num_workers,
+        loader = make_loader(train_ds, tcfg.batch_size, tcfg.num_workers,
                               shuffle=True, seed=seed + epoch, drop_last=False)
         ep_loss = ep_esr = ep_stft = 0.0
         n_steps = 0
@@ -316,13 +330,13 @@ def _fit_embedding(model, ecfg: EmulateConfig, train_ds, val_loader, dev, *,
             ep_loss += loss.item(); ep_esr += parts["esr"]; ep_stft += parts["stft"]
             n_steps += 1
             step += 1
-            if step % ecfg.log_every == 0:
-                sps = n_steps * ecfg.batch_size / (time.time() - ep_t0 + 1e-9)
+            if step % tcfg.log_every == 0:
+                sps = n_steps * tcfg.batch_size / (time.time() - ep_t0 + 1e-9)
                 print(f"  e{epoch:02d} step {step:>7d} loss {loss.item():.5f} "
                       f"esr {parts['esr']:.5f} stft {parts['stft']:.4f} {sps:5.0f} smp/s",
                       flush=True)
 
-        val_esr = evaluate_esr(model, val_loader, dev, ecfg.preemph)
+        val_esr = evaluate_esr(model, val_loader, dev, lossfn.coeff)
         sched.step(val_esr)
         cur_lr = opt.param_groups[0]["lr"]
         improved = val_esr < best_val
@@ -517,18 +531,14 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
                          "use estimate_lag + trim first")
 
     model, ck = load_model(run_dir, str(dev))
-    ecfg = EmulateConfig(**ck["emulate_cfg"])
-    if stft_weight is not None:
-        ecfg.stft_weight = float(stft_weight)
-    if batch_size is not None:
-        if int(batch_size) < 1:
-            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
-        ecfg.batch_size = int(batch_size)
+    spec = _enroll_spec(ck, stft_weight, batch_size)
+    tcfg, lossfn = spec.training, build_loss(spec.loss).to(dev)
+    stft_w = float(spec.loss.kwargs.get("stft_weight", 1.0))
     base_name = ck.get("name", run_dir.name)
-    _swap_embedding(model, ecfg, 1, dev, init=init)
+    _swap_embedding(model, 1, dev, init=init)
 
     R = model.receptive_field
-    clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
+    clip = int(round(spec.data.clip_seconds * cfg.sample_rate))
     sr = cfg.sample_rate
     n_total = len(dry)
     if train_region is not None or val_region is not None:
@@ -539,28 +549,28 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
         for tag, reg in (("train", train_region), ("val", val_region)):
             if reg[1] - reg[0] < clip:
                 raise RuntimeError(f"{tag} region {reg} is shorter than one "
-                                   f"{clip}-sample clip ({ecfg.clip_seconds:.0f} s)")
+                                   f"{clip}-sample clip ({spec.data.clip_seconds:.0f} s)")
     else:
         val_len = max(clip, int(round(val_frac * n_total)))
         if n_total - val_len < clip:
             raise RuntimeError(f"pair too short: need >= {2 * clip} samples "
-                               f"({2 * ecfg.clip_seconds:.0f} s) for a train+val split, "
+                               f"({2 * spec.data.clip_seconds:.0f} s) for a train+val split, "
                                f"got {n_total}")
         train_region, val_region = (0, n_total - val_len), (n_total - val_len, n_total)
     val_len = val_region[1] - val_region[0]
-    print(f"[enroll-pair] run={base_name} arch={ecfg.arch} name={name} "
+    print(f"[enroll-pair] run={base_name} arch={spec.model.arch} name={name} "
           f"pair={n_total / sr:.1f}s "
           f"train {train_region[0] / sr:.1f}-{train_region[1] / sr:.1f}s "
           f"val {val_region[0] / sr:.1f}-{val_region[1] / sr:.1f}s ({val_len / sr:.1f}s) "
-          f"pairs/epoch={pairs} batch={ecfg.batch_size} lr={lr:g} "
-          f"stft_weight={ecfg.stft_weight:g}")
+          f"pairs/epoch={pairs} batch={tcfg.batch_size} lr={lr:g} "
+          f"stft_weight={stft_w:g}")
 
     train_ds = WetDryDataset(dry, wet, receptive_field=R, clip_samples=clip,
                              region=train_region, pairs_per_epoch=pairs, seed=seed)
     val_ds = WetDryDataset(dry, wet, receptive_field=R, clip_samples=clip,
                            region=val_region, pairs_per_epoch=val_pairs,
                            seed=seed + 999)
-    val_loader = make_loader(val_ds, ecfg.batch_size, ecfg.num_workers,
+    val_loader = make_loader(val_ds, tcfg.batch_size, tcfg.num_workers,
                               shuffle=False, seed=seed + 999, drop_last=False)
 
     out_dir = run_dir / "enroll" / "pairs" / name
@@ -571,14 +581,14 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
                                  "train_stft", "val_esr", "lr", "elapsed_s"])
 
     t0 = time.time()
-    init_val = evaluate_esr(model, val_loader, dev, ecfg.preemph)
+    init_val = evaluate_esr(model, val_loader, dev, lossfn.coeff)
     print(f"[enroll-pair] baseline val_esr={init_val:.5f} (init={init})")
     with log_path.open("a", newline="", encoding="utf-8") as fh:
         csv.writer(fh).writerow([-1, 0, "", "", "", f"{init_val:.6f}",
                                  f"{lr:.2e}", f"{time.time() - t0:.1f}"])
 
     best_emb, best_val, best_epoch, epochs_run = _fit_embedding(
-        model, ecfg, train_ds, val_loader, dev, epochs=epochs, lr=lr, seed=seed,
+        model, spec, lossfn, train_ds, val_loader, dev, epochs=epochs, lr=lr, seed=seed,
         log_path=log_path, init_val=init_val, t0=t0,
         early_stop_patience=early_stop_patience,
         plateau_patience=plateau_patience, plateau_factor=plateau_factor)
@@ -592,19 +602,19 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
     pred = render_dry(model, dry[lo - ctx:hi], row=0, device=str(dev))[ctx:]
     target = wet[lo:hi]
     val_raw = _np_esr(pred, target)
-    val_pe = _np_esr(pred, target, coeff=ecfg.preemph)
+    val_pe = _np_esr(pred, target, coeff=lossfn.coeff)
 
     torch.save({
         # Effective rows (scale * normalized direction) -- the same space every
         # trained-table artifact is in, so export/load treat them alike. Reloading
         # into the raw slot round-trips exactly: normalize() is scale-invariant.
         "embedding": model.project_embedding(best_emb).cpu(),   # [1, dim]: concat-compatible
-        "name": name, "embedding_dim": int(ecfg.embedding_dim),
+        "name": name, "embedding_dim": int(model.embedding_dim),
         "base_run": base_name, "base_epoch": int(ck.get("epoch", -1)),
         "base_manifest_sha256": ck.get("manifest_sha256", ""),
         "init": init, "pairs": int(pairs), "epochs_run": epochs_run,
         "lr": float(lr), "seed": seed, "sample_rate": cfg.sample_rate,
-        "stft_weight": float(ecfg.stft_weight),
+        "stft_weight": stft_w,
         "sources": dict(sources or {}),
         "val_esr_preemph_pooled": _json_num(best_val),
         "val_esr_render_raw": _json_num(val_raw),
@@ -613,9 +623,9 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
 
     metrics = {
         "run": base_name, "name": name, "pairs": int(pairs), "epochs": int(epochs),
-        "batch_size": int(ecfg.batch_size),
+        "batch_size": int(tcfg.batch_size),
         "epochs_run": epochs_run, "best_epoch": best_epoch, "lr": float(lr),
-        "seed": seed, "init": init, "stft_weight": float(ecfg.stft_weight),
+        "seed": seed, "init": init, "stft_weight": stft_w,
         "pair_seconds": round(n_total / cfg.sample_rate, 2),
         "val_seconds": round(val_len / cfg.sample_rate, 2),
         "train_region": [int(train_region[0]), int(train_region[1])],
@@ -645,8 +655,7 @@ def load_pair_model(run_dir: Path, name: str, device: str = "cpu"):
                       map_location="cpu", weights_only=False)
     dev = torch.device(resolve_device(device))
     model, ck = load_model(run_dir, str(dev))
-    ecfg = EmulateConfig(**ck["emulate_cfg"])
-    _swap_embedding(model, ecfg, 1, dev)
+    _swap_embedding(model, 1, dev)
     with torch.no_grad():
         model.embedding.weight.copy_(blob["embedding"].reshape(1, -1).to(dev))
     return model, blob

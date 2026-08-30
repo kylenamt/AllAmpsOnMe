@@ -6,35 +6,6 @@
       1,
       2
     ],
-    "emulate_cfg": {
-      "amp": false,
-      "amp_dtype": "fp16",
-      "arch": "film_wavenet",
-      "batch_size": 4,
-      "clip_seconds": 0.08533333333333333,
-      "cond_activation": "leakyrelu",
-      "cond_hidden": 32,
-      "delta_rank": 8,
-      "device_loss_weighting": 0.0,
-      "early_stop_patience": 8,
-      "embed_noise_frac": 0.0,
-      "embed_normalize": false,
-      "embedding_dim": 8,
-      "epochs": 2,
-      "holdout_frac": 0.25,
-      "log_every": 1000000000,
-      "lr": 0.0005,
-      "num_workers": 0,
-      "pairs_per_epoch": 16,
-      "plateau_factor": 0.5,
-      "plateau_patience": 3,
-      "preemph": 0.85,
-      "stft_weight": 1.0,
-      "val_pairs": 8,
-      "weight_decay": 0.0,
-      "wn_activation": "leakyrelu",
-      "wn_channels": 4
-    },
     "epoch": 0,
     "holdout_ids": [
       3
@@ -95,6 +66,45 @@
     "receptive_field_samples": 6347,
     "val_esr": 1.0094285216019345,
     "val_esr_shuffled": 1.009435680869252
+  },
+  "spec": {
+    "data": {
+      "clip_seconds": 0.08533333333333333,
+      "dataset": "emulation",
+      "holdout_frac": 0.25,
+      "pairs_per_epoch": 16,
+      "sources": []
+    },
+    "loss": {
+      "device_loss_weighting": 0.0,
+      "name": "esr_mrstft",
+      "preemph_coeff": 0.85,
+      "stft_weight": 1.0
+    },
+    "model": {
+      "arch": "film_wavenet",
+      "channels": 4,
+      "embedding_dim": 8
+    },
+    "name": "eq",
+    "output_format": "flac",
+    "sample_rate": 48000,
+    "seed": 1234,
+    "training": {
+      "amp": false,
+      "amp_dtype": "fp16",
+      "batch_size": 4,
+      "early_stop_patience": 8,
+      "embed_noise_frac": 0.0,
+      "epochs": 2,
+      "log_every": 1000000000,
+      "lr": 0.0005,
+      "num_workers": 0,
+      "plateau_factor": 0.5,
+      "plateau_patience": 3,
+      "val_pairs": 8,
+      "weight_decay": 0.0
+    }
   },
   "weights/model/embedding.weight": "84319bf19f85e53f",
   "weights/model/head_rechannel.bias": "1dc3feb1547a6bf7",

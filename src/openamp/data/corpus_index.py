@@ -1,9 +1,10 @@
 """Where the corpus lives, and which devices are in the embedding table.
 
 :class:`CorpusPaths` is the one thing a dataset needs to know about the layout on
-disk. It is built from a ``Config`` at the boundary (:meth:`CorpusPaths.from_config`)
-so ``Config`` stays the single place paths are *derived*, and nothing below this
-line reaches for a global.
+disk. It is built once at the boundary -- from a ``RunSpec``'s ``data_dir``
+(:meth:`CorpusPaths.from_data_dir`) or from a pipeline ``Config``
+(:meth:`CorpusPaths.from_config`) -- and nothing below this line reaches for a
+global.
 """
 
 from __future__ import annotations
@@ -35,14 +36,21 @@ class CorpusPaths:
     output_format: str = "flac"
 
     @classmethod
+    def from_data_dir(cls, data_dir, output_format: str = "flac") -> "CorpusPaths":
+        """Derive the whole layout from a corpus root -- what a ``RunSpec`` holds."""
+        root = Path(data_dir)
+        m = root / "manifests"
+        return cls(clean_dir=root / "clean", renders_dir=root / "renders",
+                   corpus_manifest=m / C.CORPUS_MANIFEST,
+                   renders_manifest=m / C.RENDERS_MANIFEST,
+                   device_manifest=m / C.ACQUISITION_MANIFEST,
+                   devices_final=m / C.DEVICES_FINAL_MANIFEST,
+                   holdout=m / C.EMULATE_HOLDOUT,
+                   output_format=str(output_format))
+
+    @classmethod
     def from_config(cls, config) -> "CorpusPaths":
-        return cls(clean_dir=config.clean_dir, renders_dir=config.renders_dir,
-                   corpus_manifest=config.corpus_manifest_path,
-                   renders_manifest=config.renders_manifest_path,
-                   device_manifest=config.manifest_path,
-                   devices_final=config.devices_final_path,
-                   holdout=config.emulate_holdout_path,
-                   output_format=config.output_format)
+        return cls.from_data_dir(config.data_dir, config.output_format)
 
     def clean_file(self, split: str, file_id) -> Path:
         return self.clean_dir / split / f"{file_id}.{self.output_format}"

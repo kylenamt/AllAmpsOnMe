@@ -37,6 +37,7 @@ from openamp.core.config import Config
 from openamp.data import CorpusPaths, JointDataset, device_names, make_loader
 from openamp.encoders import ref_mode_for
 from openamp.joint_model.model import load_joint
+from openamp.spec import spec_from_checkpoint
 from openamp.joint_model.train import EVAL_MODES, evaluate_esr
 
 __all__ = ["diagnose", "conditioning_check", "leakage_check", "capture_embeddings"]
@@ -47,19 +48,18 @@ DEFAULT_WINDOWS = 8          # reference segments per device for the geometry pa
 
 def _dataset(cfg: Config, ck: dict, device_ids, *, split: str, pairs: int, seed: int):
     """A :class:`JointDataset` over an explicit device set, sized like the run's."""
-    jcfg_ref = int(ck["ref_samples"])
+    spec = spec_from_checkpoint(ck)
+    ref = spec.joint.ref
     return JointDataset(CorpusPaths.from_config(cfg), split,
                         receptive_field=int(ck["receptive_field"]),
                         id_to_idx={int(d): i for i, d in enumerate(device_ids)},
-                        ref_samples=jcfg_ref, clip_samples=int(ck["clip_samples"]),
-                        ref_different_file=bool(ck["joint_cfg"]["ref_different_file"]),
-                        ref_min_gap=int(round(ck["joint_cfg"]["ref_min_gap_seconds"]
-                                              * ck["sample_rate"])),
+                        ref_samples=int(ck["ref_samples"]),
+                        clip_samples=int(ck["clip_samples"]),
+                        ref_different_file=ref.different_file,
+                        ref_min_gap=int(round(ref.min_gap_seconds * ck["sample_rate"])),
                         pairs_per_epoch=pairs, seed=seed,
-                        sources=tuple(ck["joint_cfg"]["sources"]),
-                        # .get keeps checkpoints written before the fingerprint arm
-                        # existed loading exactly as they did.
-                        ref_mode=ref_mode_for(ck["joint_cfg"].get("enc_kind", "")))
+                        sources=spec.data.sources,
+                        ref_mode=ref_mode_for(spec.joint.encoder.kind))
 
 
 # --- 1. Does the generator use e? ------------------------------------------------
@@ -184,8 +184,9 @@ def diagnose(cfg: Config, run_dir: Path, *, device: str = "cuda",
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
     model, ck = load_joint(run_dir, str(dev))
     seed = int(cfg.seed if seed is None else seed)
-    coeff = float(ck["emulate_cfg"]["preemph"])
-    batch = int(ck["emulate_cfg"]["batch_size"])
+    spec = spec_from_checkpoint(ck)
+    coeff = float(spec.loss.kwargs.get("preemph_coeff", 0.85))
+    batch = int(spec.training.batch_size)
     seen = [int(d) for d in ck["device_ids"]]
     holdout = [int(d) for d in ck.get("holdout_ids", [])]
     print(f"[diag]  run={run_dir.name} seen={len(seen)} holdout={len(holdout)} "

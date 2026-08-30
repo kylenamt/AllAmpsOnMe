@@ -14,11 +14,12 @@ silent in the training loss.
 
 import numpy as np
 import pytest
-from dataclasses import asdict
 
 torch = pytest.importorskip("torch")
 
-from openamp.core.config import JointConfig, load_config  # noqa: E402
+from openamp.core.config import load_config  # noqa: E402
+from openamp.spec import (DataSpec, EncoderSpec, JointSpec,  # noqa: E402
+                          LossSpec, ModelSpec, RefSpec, RunSpec, TrainingSpec)
 from openamp.models import FiLMWaveNet  # noqa: E402
 from openamp.joint_model.model import JointModel, build_joint  # noqa: E402
 from openamp.encoders import AttentiveStatsPool, WaveNetEncoder  # noqa: E402
@@ -26,6 +27,21 @@ from openamp.encoders import AttentiveStatsPool, WaveNetEncoder  # noqa: E402
 # A shrunken encoder schedule: same structure, tiny receptive field, fast.
 SMALL = dict(kernel_sizes=(3, 3, 3), dilations=(1, 2, 4), channels=4,
              attn_hidden=8, proj_hidden=8)
+
+
+def _jspec(tmp_path, *, model=None, encoder=None, ref=None, **training):
+    """A joint RunSpec for the tests that need a whole experiment."""
+    return RunSpec(
+        name="run", data_dir=tmp_path / "data", results_dir=tmp_path / "results",
+        seed=1234,
+        model=model or ModelSpec("film_wavenet", {"channels": 4, "embedding_dim": 16}),
+        data=DataSpec(dataset="joint", clip_seconds=training.pop("clip_seconds", 2.0)),
+        loss=LossSpec(kwargs={"preemph_coeff": 0.85, "stft_weight": 1.0}),
+        training=TrainingSpec(num_workers=0, **training),
+        joint=JointSpec(encoder=encoder or EncoderSpec(
+                            "wavenet", {"channels": 4, "attn_hidden": 4,
+                                        "proj_hidden": 4, "activation": "tanh"}),
+                        ref=ref or RefSpec()))
 
 
 # --- Encoder -------------------------------------------------------------------
@@ -251,7 +267,7 @@ def test_stats_head_is_still_the_default():
     m = WaveNetEncoder(embedding_dim=8, **SMALL)
     assert m.head_kind == "stats"
     assert hasattr(m, "pool") and not hasattr(m, "head")
-    assert JointConfig().enc_head == "stats"
+    assert WaveNetEncoder(embedding_dim=8).head_kind == "stats"
 
 
 # --- Generator: the new embedding-vector path ----------------------------------
@@ -311,47 +327,44 @@ def test_joint_forward_and_gradients_reach_both_halves():
     assert model.generator.embedding.weight.grad is None
 
 
-def test_build_joint_freezes_the_generator_table():
-    cfg = load_config(data_dir="/tmp")
-    cfg.emulate.arch = "film_wavenet"
-    cfg.emulate.wn_channels = 4
-    cfg.emulate.embedding_dim = 16
-    cfg.joint = JointConfig(enc_channels=4, enc_attn_hidden=4, enc_proj_hidden=4)
-    m = build_joint(cfg.emulate, cfg.joint, 5)
+def test_build_joint_freezes_the_generator_table(tmp_path):
+    m = build_joint(_jspec(tmp_path), 5)
     assert not m.generator.embedding.weight.requires_grad
     assert m.encoder.embedding_dim == m.generator.embedding_dim == 16
 
 
 # --- Config --------------------------------------------------------------------
-def test_joint_config_validates_its_numbers():
-    for kw, msg in [({"ref_seconds": 0}, "ref_seconds"),
-                    ({"ref_min_gap_seconds": -1}, "ref_min_gap_seconds"),
-                    ({"enc_channels": 0}, "enc_channels"),
-                    ({"enc_lr": 0}, "enc_lr"),
-                    ({"sources": ["nope"]}, "sources"),
-                    ({"enc_head": "nope"}, "enc_head"),
-                    ({"enc_taps": []}, "enc_taps"),
-                    ({"enc_taps": [3, 1]}, "enc_taps"),
-                    ({"enc_taps": [1, 1]}, "enc_taps"),
-                    ({"enc_tap_stride": 0}, "enc_tap_stride"),
-                    ({"enc_expand_dim": 0}, "enc_expand_dim"),
-                    ({"enc_n_heads": 0}, "enc_n_heads"),
-                    ({"enc_expand_norm": "layer"}, "enc_expand_norm"),
-                    ({"enc_proj_hidden": -1}, "enc_proj_hidden")]:
-        with pytest.raises(Exception, match=msg):
-            JointConfig(**kw)
+def test_encoder_validates_its_numbers():
+    """Under v2 the encoder section is the constructor's own arguments, so these
+    are the constructor's checks rather than a separate config-layer copy."""
+    small_taps = {"head": "multitap", "taps": (0, 1)}
+    for kw, msg in [({"head": "nope"}, "enc_head"),
+                    ({**small_taps, "taps": ()}, "enc_taps"),
+                    ({**small_taps, "taps": (99,)}, "enc_taps"),
+                    ({**small_taps, "expand_norm": "layer"}, "enc_expand_norm"),
+                    ({"activation": "relu"}, "enc_activation")]:
+        with pytest.raises(ValueError, match=msg):
+            WaveNetEncoder(embedding_dim=8, **{**SMALL, **kw})
     # 0 is legal for proj_hidden — it is the "derive it" sentinel, not a mistake.
-    assert JointConfig(enc_proj_hidden=0).enc_proj_hidden == 0
+    enc = WaveNetEncoder(embedding_dim=8, **{**SMALL, "proj_hidden": 0})
+    assert enc.proj[0].out_features == max(1, SMALL["channels"] // 2)
 
 
 def test_joint_section_round_trips_through_yaml(tmp_path):
     import yaml
 
+    from openamp.spec import load_run_spec
+
     p = tmp_path / "j.yaml"
-    p.write_text(yaml.safe_dump({"joint": {"enc_channels": 24, "ref_seconds": 3.0}}))
-    cfg = load_config(p, data_dir=tmp_path)
-    assert cfg.joint.enc_channels == 24 and cfg.joint.ref_seconds == 3.0
-    assert cfg.joint.enc_lr == JointConfig().enc_lr      # omitted keys keep defaults
+    p.write_text(yaml.safe_dump(
+        {"model": {"arch": "film_wavenet"},
+         "joint": {"encoder": {"kind": "wavenet", "channels": 24},
+                   "ref": {"seconds": 3.0}}}))
+    spec = load_run_spec(p)
+    assert spec.joint.encoder.kwargs["channels"] == 24
+    assert spec.joint.ref.seconds == 3.0
+    assert spec.joint.enc_lr == JointSpec().enc_lr      # omitted keys keep defaults
+    assert spec.name == "j"                             # still the file stem
 
 
 # --- Dataset -------------------------------------------------------------------
@@ -533,21 +546,19 @@ def test_train_writes_a_run_and_logs_the_tripwire(tmp_path):
     from openamp.joint_model import train as joint_train
     from openamp.joint_model.train import LOG_COLUMNS
 
-    cfg = load_config(data_dir=tmp_path)
-    cfg.results_dir = tmp_path / "results"
-    _build_corpus(cfg, devices=list(range(4)), n_files=3, splits=("train", "val"))
-    e = cfg.emulate
-    e.arch, e.wn_channels, e.embedding_dim = "film_wavenet", 4, 16
-    e.clip_seconds, e.batch_size, e.pairs_per_epoch = 0.1, 4, 16
-    e.epochs, e.val_pairs, e.num_workers, e.amp = 2, 8, 0, False
-    e.holdout_frac, e.log_every = 0.25, 1
-    cfg.joint = JointConfig(ref_seconds=0.1, enc_channels=4, enc_attn_hidden=4,
-                            enc_proj_hidden=4)
+    spec = _jspec(tmp_path, clip_seconds=0.1, batch_size=4, epochs=2, val_pairs=8,
+                  amp=False, log_every=1,
+                  ref=RefSpec(seconds=0.1)).replace(name="t")
+    spec = spec.replace(data=DataSpec(dataset="joint", clip_seconds=0.1,
+                                      pairs_per_epoch=16, holdout_frac=0.25))
+    _build_corpus(load_config(data_dir=spec.data_dir), devices=list(range(4)),
+                  n_files=3, splits=("train", "val"))
 
-    m = joint_train.train(cfg, name="t", device="cpu")
-    run = cfg.joint_run_dir("t")
+    m = joint_train.train(spec, device="cpu")
+    run = spec.run_dir
     assert (run / "checkpoint.pt").is_file() and (run / "last.pt").is_file()
-    assert (run / "config.yaml").is_file() and (run / "config_history.jsonl").is_file()
+    assert (run / "resolved_config.yaml").is_file()
+    assert (run / "config_history.jsonl").is_file()
     assert json.loads((run / "metrics.json").read_text())["embedding_dim"] == 16
     assert m["epochs_run"] == 2 and m["n_devices"] == 3 and m["n_holdout"] == 1
 
@@ -564,16 +575,17 @@ def test_train_writes_a_run_and_logs_the_tripwire(tmp_path):
 def test_resume_is_refused_when_the_encoder_shape_changed(tmp_path):
     from openamp.joint_model.train import _check_resume_compatible
 
-    ecfg = load_config(data_dir=tmp_path).emulate
-    ck = {"emulate_cfg": {"arch": "film_wavenet", "embedding_dim": 256},
-          "joint_cfg": {"enc_channels": 16, "enc_normalize": False}}
-    ecfg.arch, ecfg.embedding_dim = "film_wavenet", 256
-    _check_resume_compatible(ck, ecfg, JointConfig(enc_channels=16), None, None)
-    with pytest.raises(RuntimeError, match="enc_channels"):
-        _check_resume_compatible(ck, ecfg, JointConfig(enc_channels=32), None, None)
+    def spec(**enc):
+        return _jspec(tmp_path, encoder=EncoderSpec("wavenet", enc))
+
+    base = {"channels": 16, "normalize": False}
+    ck = {"spec": spec(**base).to_dict()}
+    _check_resume_compatible(ck, spec(**base), None, None)
+    with pytest.raises(RuntimeError, match="channels"):
+        _check_resume_compatible(ck, spec(**{**base, "channels": 32}), None, None)
     # Parameter-free but semantics-changing: must be refused too.
-    with pytest.raises(RuntimeError, match="enc_normalize"):
-        _check_resume_compatible(ck, ecfg, JointConfig(enc_normalize=True), None, None)
+    with pytest.raises(RuntimeError, match="normalize"):
+        _check_resume_compatible(ck, spec(**{**base, "normalize": True}), None, None)
 
 
 def test_resume_is_refused_when_the_head_changed(tmp_path):
@@ -583,30 +595,30 @@ def test_resume_is_refused_when_the_head_changed(tmp_path):
     """
     from openamp.joint_model.train import _check_resume_compatible
 
-    ecfg = load_config(data_dir=tmp_path).emulate
-    ecfg.arch, ecfg.embedding_dim = "film_wavenet", 256
-    ck = {"emulate_cfg": {"arch": "film_wavenet", "embedding_dim": 256},
-          "joint_cfg": {"enc_channels": 16}}          # pre-multitap checkpoint
-    _check_resume_compatible(ck, ecfg, JointConfig(), None, None)
-    for kw, msg in [({"enc_head": "multitap"}, "enc_head"),
-                    ({"enc_taps": [1, 2]}, "enc_taps"),
-                    ({"enc_expand_dim": 128}, "enc_expand_dim"),
-                    ({"enc_n_heads": 4}, "enc_n_heads"),
-                    ({"enc_expand_norm": "group"}, "enc_expand_norm")]:
+    def spec(**enc):
+        return _jspec(tmp_path, encoder=EncoderSpec("wavenet", {"channels": 16, **enc}))
+
+    ck = {"spec": spec().to_dict()}                   # pre-multitap checkpoint
+    _check_resume_compatible(ck, spec(), None, None)
+    for kw, msg in [({"head": "multitap"}, "head"),
+                    ({"taps": [1, 2]}, "taps"),
+                    ({"expand_dim": 128}, "expand_dim"),
+                    ({"n_heads": 4}, "n_heads"),
+                    ({"expand_norm": "group"}, "expand_norm")]:
         with pytest.raises(RuntimeError, match=msg):
-            _check_resume_compatible(ck, ecfg, JointConfig(**kw), None, None)
+            _check_resume_compatible(ck, spec(**kw), None, None)
 
 
-def test_resume_tolerates_a_yaml_list_tuple_round_trip():
+def test_resume_tolerates_a_yaml_list_tuple_round_trip(tmp_path):
     """enc_taps survives torch.save/yaml as either list or tuple; the guard must
     not read that as a structural change and refuse a legitimate resume."""
     from openamp.joint_model.train import _check_resume_compatible
 
-    ecfg = load_config(data_dir="/tmp").emulate
-    ecfg.arch, ecfg.embedding_dim = "film_wavenet", 256
-    ck = {"emulate_cfg": {"arch": "film_wavenet", "embedding_dim": 256},
-          "joint_cfg": {"enc_channels": 16, "enc_taps": (6, 13, 22)}}
-    _check_resume_compatible(ck, ecfg, JointConfig(enc_taps=[6, 13, 22]), None, None)
+    saved = _jspec(tmp_path, encoder=EncoderSpec(
+        "wavenet", {"channels": 16, "taps": (6, 13, 22)}))
+    ck = {"spec": saved.to_dict()}
+    _check_resume_compatible(ck, _jspec(tmp_path, encoder=EncoderSpec(
+        "wavenet", {"channels": 16, "taps": [6, 13, 22]})), None, None)
 
 
 # --- Fingerprint conditioning ---------------------------------------------------
@@ -733,61 +745,68 @@ def test_build_joint_selects_the_fingerprint_encoder(tmp_path):
     from openamp.joint_model.model import build_joint
 
     run, _, _ = _write_fingerprints(tmp_path, list(range(4)), dim=32)
-    cfg = load_config(data_dir=tmp_path)
-    e = cfg.emulate
-    e.arch, e.wn_channels, e.embedding_dim = "film_wavenet", 4, 16
-    j = JointConfig(enc_kind="fingerprint", fp_path=str(run), enc_proj_hidden=4)
+    spec = _jspec(tmp_path, encoder=EncoderSpec(
+        "fingerprint", {"path": str(run), "proj_hidden": 4, "normalize": False}))
 
-    model = build_joint(e, j, 4)
+    model = build_joint(spec, 4)
     assert isinstance(model.encoder, FingerprintEncoder)
     assert model.encoder.embedding_dim == 16
     assert not model.generator.embedding.weight.requires_grad
     assert model.encoder.capacity_report()["head"] == "fingerprint"
 
 
-def test_joint_config_validates_the_fingerprint_fields(tmp_path):
+def test_encoder_kind_and_its_path_are_validated(tmp_path):
+    """Both checks moved to where the value is used: the registry rejects an
+    unknown kind, and the arm that opens a file rejects an empty path."""
     from openamp.core.config import ConfigError
+    from openamp.encoders import FingerprintEncoder, build_encoder
 
-    with pytest.raises(ConfigError, match="enc_kind"):
-        JointConfig(enc_kind="codec")
-    with pytest.raises(ConfigError, match="fp_preprocess"):
-        JointConfig(fp_preprocess="zscore")
-    with pytest.raises(ConfigError, match="fp_path"):
-        JointConfig(enc_kind="fingerprint", fp_path="")
+    with pytest.raises(ValueError, match="kind"):
+        build_encoder(EncoderSpec("codec"), 8)
+    with pytest.raises(ValueError, match="preprocess"):
+        FingerprintEncoder(embedding_dim=8, fingerprints=np.zeros((2, 4), np.float32),
+                           device_ids=np.asarray([1, 2]), dry=np.zeros(4, np.float32),
+                           preprocess="zscore")
+    with pytest.raises(ConfigError, match="path"):
+        FingerprintEncoder.from_spec(EncoderSpec("fingerprint", {"path": ""}), 8)
 
 
 def test_resume_is_refused_when_the_fingerprint_knobs_change(tmp_path):
-    """Including fp_path/fp_preprocess, which change no shape at all."""
+    """Including path/preprocess, which change no shape at all."""
     from openamp.joint_model.train import _check_resume_compatible
 
-    ecfg = load_config(data_dir=tmp_path).emulate
-    base = dict(enc_kind="fingerprint", fp_path="/a", fp_preprocess="dry_l2",
-                fp_layernorm=False)
-    ck = {"emulate_cfg": asdict(ecfg), "joint_cfg": asdict(JointConfig(**base))}
-    _check_resume_compatible(ck, ecfg, JointConfig(**base), None, None)   # identical: fine
+    base = {"path": "/a", "preprocess": "dry_l2", "layernorm": False}
+    spec = _jspec(tmp_path, encoder=EncoderSpec("fingerprint", base))
+    ck = {"spec": spec.to_dict()}
+    _check_resume_compatible(ck, spec, None, None)              # identical: fine
 
-    for field, value in (("fp_path", "/b"), ("fp_preprocess", "raw"),
-                         ("enc_kind", "wavenet"), ("fp_layernorm", True)):
+    for kind, field, value in (("fingerprint", "path", "/b"),
+                               ("fingerprint", "preprocess", "raw"),
+                               ("wavenet", None, None),
+                               ("fingerprint", "layernorm", True)):
         changed = dict(base)
-        changed[field] = value
-        if field == "enc_kind":
-            changed["fp_path"] = ""
+        if field:
+            changed[field] = value
+        else:
+            changed = {}
         with pytest.raises(Exception):
-            _check_resume_compatible(ck, ecfg, JointConfig(**changed), None, None)
+            _check_resume_compatible(
+                ck, _jspec(tmp_path, encoder=EncoderSpec(kind, changed)), None, None)
 
 
-def test_pre_fingerprint_checkpoints_still_resume(tmp_path):
-    """A checkpoint written before these knobs existed must load under the defaults."""
+def test_a_key_absent_on_one_side_is_a_change(tmp_path):
+    """The v1 guard needed a table of legacy defaults so a knob added after a
+    checkpoint was written could not be waved through. Comparing the whole
+    encoder section gets that for free: absent on one side and set on the other
+    is a difference, and absent on both means both build the same default."""
     from openamp.joint_model.train import _check_resume_compatible
 
-    cfg = load_config(data_dir=tmp_path)
-    jcfg = JointConfig()
-    saved = asdict(jcfg)
-    for k in ("enc_kind", "fp_path", "fp_preprocess", "fp_layernorm",
-              "enc_weight_decay"):
-        saved.pop(k, None)                       # as an older run's config.yaml would be
-    ck = {"emulate_cfg": asdict(cfg.emulate), "joint_cfg": saved}
-    _check_resume_compatible(ck, cfg.emulate, jcfg, None, None)
+    bare = _jspec(tmp_path, encoder=EncoderSpec("wavenet", {"channels": 4}))
+    ck = {"spec": bare.to_dict()}
+    _check_resume_compatible(ck, bare, None, None)              # both omit head: fine
+    with pytest.raises(RuntimeError, match="head"):
+        _check_resume_compatible(ck, _jspec(tmp_path, encoder=EncoderSpec(
+            "wavenet", {"channels": 4, "head": "multitap"})), None, None)
 
 
 # --- Frame windowing (joint.enc_frame_window) -----------------------------------
@@ -882,13 +901,13 @@ def test_frame_window_is_structural_on_resume(tmp_path):
     """Changing what the encoder reads mid-run would silently change the method."""
     from openamp.joint_model.train import _check_resume_compatible
 
-    ecfg = load_config(data_dir=tmp_path).emulate
-    base = dict(enc_kind="dac_frames", fp_frames_path="/a", enc_frame_window=1700)
-    ck = {"emulate_cfg": asdict(ecfg), "joint_cfg": asdict(JointConfig(**base))}
-    _check_resume_compatible(ck, ecfg, JointConfig(**base), None, None)
-    with pytest.raises(Exception, match="enc_frame_window"):
-        _check_resume_compatible(ck, ecfg, JointConfig(**{**base, "enc_frame_window": 800}),
-                                 None, None)
+    base = {"frames_path": "/a", "frame_window": 1700}
+    spec = _jspec(tmp_path, encoder=EncoderSpec("dac_frames", base))
+    ck = {"spec": spec.to_dict()}
+    _check_resume_compatible(ck, spec, None, None)
+    with pytest.raises(Exception, match="frame_window"):
+        _check_resume_compatible(ck, _jspec(tmp_path, encoder=EncoderSpec(
+            "dac_frames", {**base, "frame_window": 800})), None, None)
 
 
 # --- Embedding jitter (emulate.embed_noise_frac) ---------------------------------

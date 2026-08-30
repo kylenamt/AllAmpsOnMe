@@ -8,10 +8,19 @@
 #   openamp emulate --config configs/emulate/wavenet_a2_1024.yaml                     # full run
 #
 # Training knobs inherit the paper defaults; only arch selection lives here.
-emulate:
+
+model:
   arch: film_wavenet
-  wn_channels: 8           # A2 full-width; width sweeps = copy file, change number
+  channels: 8  # A2 full-width; width sweeps = copy file, change number
   embedding_dim: 1024
+
+data:
+  dataset: emulation
+
+loss:
+  name: esr_mrstft
+
+training:
   # Extended past the default 60 to give the annealed run more room; early-stop
   # (patience 8) still ends it once val ESR plateaus.
   epochs: 100
