@@ -16,7 +16,7 @@ Not a FiLMWaveNet subclass (would inherit the embedding table and causal
 padding, the two things it exists not to have); shares its schedule constants
 and activation factory.
 
-Two pooling heads:
+Two pooling heads, both from :mod:`openamp.encoders.pooling`:
 - head="stats": AttentiveStatsPool over the final trunk -> MLP to
   embedding_dim. Pooled width is 2*C_enc, tying readout width to backbone width.
 - head="multitap" (MultiTapStatsHead): taps from several depths + a 1x1
@@ -34,35 +34,23 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from openamp.encoders.pooling import (ENC_ATTN_HIDDEN, ENC_EXPAND_DIM, ENC_EXPAND_NORM,
+                                      ENC_N_HEADS, ENC_NORM_GROUPS, ENC_TAP_STRIDE,
+                                      AttentiveStatsPool, MultiTapStatsHead)
 from openamp.models import (A2_ACTIVATION, A2_DILATIONS, A2_KERNEL_SIZES,
                             make_activation, normalize_activation)
 
-__all__ = ["WaveNetEncoder", "WaveNetEncoderLayer", "AttentiveStatsPool",
-           "MultiHeadAttentiveStatsPool", "MultiTapStatsHead",
-           "ENC_CHANNELS", "ENC_ATTN_HIDDEN", "ENC_PROJ_HIDDEN", "ENC_HEADS",
-           "ENC_TAPS", "ENC_TAP_STRIDE", "ENC_EXPAND_DIM", "ENC_N_HEADS",
-           "ENC_EXPAND_NORM", "ENC_EXPAND_NORMS", "ENC_NORM_GROUPS"]
+__all__ = ["WaveNetEncoder", "WaveNetEncoderLayer",
+           "ENC_CHANNELS", "ENC_PROJ_HIDDEN", "ENC_HEADS", "ENC_TAPS"]
 
 ENC_CHANNELS = 32          # guidelines §7 puts C_enc at 16-32
-ENC_ATTN_HIDDEN = 64       # attention bottleneck, independent of C_enc
 ENC_PROJ_HIDDEN = 128      # hidden width of the pooled -> De projection
 
-# --- multitap head ---------------------------------------------------------------
 ENC_HEADS = ("stats", "multitap")
 # End of each of the A2 schedule's three dilation runs (7+7+2+7 layers) -- early
 # taps see ~ms structure, the last sees the full 132 ms (sag/compression time
 # constants), so pooling only the deepest view discards the short-scale one.
 ENC_TAPS = (6, 13, 22)
-# Average-pools the concatenated taps before the attention head -- a WaveNet
-# never downsamples, so the tap is still full sample-rate width, and the
-# attention tensor (B, K*E, T) is a memory knob, not a modelling one.
-# Average-pool, not striding, to avoid aliasing.
-ENC_TAP_STRIDE = 8
-ENC_EXPAND_DIM = 256       # E: pooled width is K * 2 * E, set independently of C_enc
-ENC_N_HEADS = 2            # K: each head may weight the reference differently
-ENC_EXPAND_NORMS = ("batch", "group", "none")
-ENC_EXPAND_NORM = "batch"
-ENC_NORM_GROUPS = 32       # "group" only; clamped to divide expand_dim
 
 
 class WaveNetEncoderLayer(nn.Module):
@@ -93,176 +81,6 @@ class WaveNetEncoderLayer(nn.Module):
         return x + self.layer1x1(z), z
 
 
-def _masked_global_stats(h: torch.Tensor, mask: torch.Tensor | None, eps: float):
-    """``(B, C, 1)`` mean and std over the valid frames only.
-
-    Divides by the **valid-frame count**, not ``T``: dividing by ``T`` would pull
-    every statistic toward zero in proportion to how much padding an item carries,
-    which is a per-item bias disguised as a feature.
-    """
-    if mask is None:
-        mean = h.mean(dim=-1, keepdim=True)
-        var = h.var(dim=-1, unbiased=False, keepdim=True)
-    else:
-        m = mask.bool().unsqueeze(1).to(h.dtype)             # [B, 1, T]
-        n = m.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        mean = (h * m).sum(dim=-1, keepdim=True) / n
-        var = (((h - mean) ** 2) * m).sum(dim=-1, keepdim=True) / n
-    return mean, var.clamp_min(eps).sqrt()
-
-
-def _weighted_moments(alpha: torch.Tensor, h: torch.Tensor, eps: float):
-    """Attention-weighted mean and std; ``alpha`` broadcasts against ``h``."""
-    mean = (alpha * h).sum(dim=-1)
-    # E[x^2] - E[x]^2, clamped: the two terms are close for a near-constant
-    # channel and float error can put the difference below zero.
-    var = (alpha * h * h).sum(dim=-1) - mean * mean
-    return mean, var.clamp_min(eps).sqrt()
-
-
-class AttentiveStatsPool(nn.Module):
-    """(B, C, L) -> (B, 2C): attention-weighted mean and standard deviation.
-
-    Per-channel attention (Okabe et al.), so different channels can read
-    different parts of the reference. Masking is applied to the logits before
-    softmax, so an invalid frame gets exactly zero weight in both statistics.
-    """
-
-    def __init__(self, channels: int, hidden: int = ENC_ATTN_HIDDEN,
-                 eps: float = 1e-5):
-        super().__init__()
-        self.eps = float(eps)
-        self.score = nn.Sequential(nn.Conv1d(channels, hidden, 1), nn.Tanh(),
-                                   nn.Conv1d(hidden, channels, 1))
-
-    def forward(self, h: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        logits = self.score(h)                               # [B, C, L]
-        if mask is not None:
-            if mask.shape[-1] != h.shape[-1]:
-                raise ValueError(f"mask length {mask.shape[-1]} does not match feature "
-                                 f"length {h.shape[-1]}")
-            logits = logits.masked_fill(~mask.bool().unsqueeze(1), float("-inf"))
-        alpha = torch.softmax(logits.float(), dim=-1).to(h.dtype)
-        mean, std = _weighted_moments(alpha, h, self.eps)
-        return torch.cat([mean, std], dim=-1)                # [B, 2C]
-
-
-class MultiHeadAttentiveStatsPool(nn.Module):
-    """(B, E, T) -> (B, K * 2E): K independent attention-weighted (mean, std).
-
-    K heads let the same channel be read under several different weightings
-    (e.g. loud vs quiet passages) instead of one. Each frame is scored from
-    [h; global_mean; global_std] rather than h alone, so "is this frame loud"
-    is judged against its own reference. Masking is again applied to the logits.
-    """
-
-    def __init__(self, channels: int, n_heads: int, hidden: int = ENC_ATTN_HIDDEN,
-                 eps: float = 1e-5):
-        super().__init__()
-        self.channels = int(channels)
-        self.n_heads = int(n_heads)
-        self.eps = float(eps)
-        self.score = nn.Sequential(nn.Conv1d(3 * self.channels, hidden, 1), nn.Tanh(),
-                                   nn.Conv1d(hidden, self.n_heads * self.channels, 1))
-
-    @property
-    def pooled_dim(self) -> int:
-        return self.n_heads * 2 * self.channels
-
-    def forward(self, h: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        B, E, T = h.shape
-        if mask is not None and mask.shape[-1] != T:
-            raise ValueError(f"mask length {mask.shape[-1]} does not match feature "
-                             f"length {T}")
-        gmean, gstd = _masked_global_stats(h, mask, self.eps)
-        ctx = torch.cat([h, gmean.expand(-1, -1, T), gstd.expand(-1, -1, T)], dim=1)
-        logits = self.score(ctx).view(B, self.n_heads, E, T)
-        if mask is not None:
-            logits = logits.masked_fill(~mask.bool()[:, None, None, :], float("-inf"))
-        alpha = torch.softmax(logits.float(), dim=-1).to(h.dtype)
-        mean, std = _weighted_moments(alpha, h.unsqueeze(1), self.eps)   # [B, K, E]
-        return torch.cat([mean, std], dim=-1).flatten(1)                 # [B, K*2E]
-
-
-class MultiTapStatsHead(nn.Module):
-    """list[(B, C, L)] -> (B, De): taps -> decimate -> expand -> K-head pooling.
-
-    Three independent capacity levers: taps widen *what* is summarized, the 1x1
-    expansion widens *how many* statistics are taken (decoupled from C_enc),
-    the K heads multiply that again. Pooled width is K*2*expand_dim; keep it
-    well above De or the projection becomes a decorative bottleneck.
-
-    Expansion norm defaults to BatchNorm: it subtracts a dataset-level mean, so
-    per-amp deviation survives into the pool, unlike GroupNorm/LayerNorm which
-    subtract a per-sample mean and delete exactly the statistic being pooled.
-    "group" is offered for batch-independence; "none" matches the A2 schedule's
-    no-normalization rule.
-
-    tap_stride average-pools the concatenated taps before the expansion (a
-    memory knob, not a modelling one -- decimating without a filter would alias).
-
-    Masking is exact through the pool (padded frames get zero attention
-    weight), but only exact through BatchNorm/GroupNorm in eval() mode, where
-    each frame normalizes independently; in train() mode invalid frames still
-    shift the batch statistics. Moot today since no caller passes a mask, but
-    relevant to a future ragged-batch path.
-    """
-
-    def __init__(self, *, in_channels: int, embedding_dim: int,
-                 expand_dim: int = ENC_EXPAND_DIM, n_heads: int = ENC_N_HEADS,
-                 attn_hidden: int = ENC_ATTN_HIDDEN, proj_hidden: int = 0,
-                 tap_stride: int = ENC_TAP_STRIDE, norm: str = ENC_EXPAND_NORM,
-                 norm_groups: int = ENC_NORM_GROUPS, normalize: bool = True,
-                 eps: float = 1e-5):
-        super().__init__()
-        self.tap_stride = int(tap_stride)
-        self.normalize = bool(normalize)
-        self.expand = nn.Conv1d(in_channels, expand_dim, 1)
-        self.norm = _make_expand_norm(norm, expand_dim, norm_groups)
-        self.act = nn.GELU()
-        self.pool = MultiHeadAttentiveStatsPool(expand_dim, n_heads, attn_hidden, eps)
-        # proj_hidden 0 = derive as pooled // 4, the spec's rule.
-        hidden = int(proj_hidden) if int(proj_hidden) > 0 else max(1, self.pooled_dim // 4)
-        self.proj = nn.Sequential(nn.Linear(self.pooled_dim, hidden), nn.GELU(),
-                                  nn.Linear(hidden, embedding_dim))
-
-    @property
-    def pooled_dim(self) -> int:
-        return self.pool.pooled_dim
-
-    def forward(self, taps: "list[torch.Tensor]",
-                mask: torch.Tensor | None = None) -> torch.Tensor:
-        h = torch.cat(taps, dim=1)
-        if mask is not None and mask.shape[-1] != h.shape[-1]:
-            raise ValueError(f"mask length {mask.shape[-1]} does not match feature "
-                             f"length {h.shape[-1]}")
-        if self.tap_stride > 1:
-            h = F.avg_pool1d(h, self.tap_stride, self.tap_stride, ceil_mode=True,
-                             count_include_pad=False)
-            if mask is not None:
-                # A pooled frame is valid if *any* of its inputs were, matching how
-                # avg_pool1d forms it. max_pool over the float mask says exactly that.
-                mask = F.max_pool1d(mask.float().unsqueeze(1), self.tap_stride,
-                                    self.tap_stride, ceil_mode=True).squeeze(1) > 0
-        h = self.act(self.norm(self.expand(h)))
-        e = self.proj(self.pool(h, mask))
-        return F.normalize(e, dim=-1) if self.normalize else e
-
-
-def _make_expand_norm(norm: str, channels: int, groups: int) -> nn.Module:
-    key = str(norm).strip().lower()
-    if key not in ENC_EXPAND_NORMS:
-        raise ValueError(f"enc_expand_norm must be one of {ENC_EXPAND_NORMS}, got {norm!r}")
-    if key == "none":
-        return nn.Identity()
-    if key == "batch":
-        return nn.BatchNorm1d(channels)
-    g = min(int(groups), channels)
-    while g > 1 and channels % g:                            # must divide evenly
-        g -= 1
-    return nn.GroupNorm(g, channels)
-
-
 class WaveNetEncoder(nn.Module):
     """(B, 2, L_ref) -> (B, embedding_dim).
 
@@ -282,6 +100,8 @@ class WaveNetEncoder(nn.Module):
     disjoint parameters, so a checkpoint from one cannot load under the other
     -- enc_head is structural, and train.py treats it that way.
     """
+
+    ref_mode = "audio"                                   # a real (dry, wet) window
 
     def __init__(self, *, embedding_dim: int, in_channels: int = 2,
                  channels: int = ENC_CHANNELS, activation: str = A2_ACTIVATION,

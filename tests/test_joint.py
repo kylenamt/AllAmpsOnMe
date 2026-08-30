@@ -21,8 +21,7 @@ torch = pytest.importorskip("torch")
 from openamp.core.config import JointConfig, load_config  # noqa: E402
 from openamp.models import FiLMWaveNet  # noqa: E402
 from openamp.joint_model.model import JointModel, build_joint  # noqa: E402
-from openamp.joint_model.wavenet_encoder import (AttentiveStatsPool,  # noqa: E402
-                                                 WaveNetEncoder)
+from openamp.encoders import AttentiveStatsPool, WaveNetEncoder  # noqa: E402
 
 # A shrunken encoder schedule: same structure, tiny receptive field, fast.
 SMALL = dict(kernel_sizes=(3, 3, 3), dilations=(1, 2, 4), channels=4,
@@ -626,7 +625,7 @@ def _write_fingerprints(tmp_path, device_ids, *, dim=32, seed=0):
 
 
 def _fp_encoder(tmp_path, device_ids, *, embedding_dim=16, dim=32, **kw):
-    from openamp.joint_model.fingerprint_encoder import FingerprintEncoder
+    from openamp.encoders import FingerprintEncoder
 
     run, _, _ = _write_fingerprints(tmp_path, device_ids, dim=dim)
     ids, pooled, dry, _ = FingerprintEncoder.load_pooled(run)
@@ -672,7 +671,7 @@ def test_holdout_ids_resolve_to_their_own_fingerprints(tmp_path):
     This is what makes zero-shot evaluation possible: an amp absent from the run's
     id_to_idx must still return *its own* vector.
     """
-    from openamp.joint_model.fingerprint_encoder import FingerprintEncoder
+    from openamp.encoders import FingerprintEncoder
 
     run, ids, pooled = _write_fingerprints(tmp_path, [0, 1, 2, 3], dim=8)
     fids, fp, dry, _ = FingerprintEncoder.load_pooled(run)
@@ -686,7 +685,7 @@ def test_holdout_ids_resolve_to_their_own_fingerprints(tmp_path):
 
 
 def test_preprocess_modes_do_what_they_say(tmp_path):
-    from openamp.joint_model.fingerprint_encoder import FingerprintEncoder
+    from openamp.encoders import FingerprintEncoder
 
     run, _, _ = _write_fingerprints(tmp_path, [0, 1], dim=8)
     ids, fp, dry, _ = FingerprintEncoder.load_pooled(run)
@@ -730,7 +729,7 @@ def test_device_mode_yields_ids_reads_no_reference_and_keeps_window_a(tmp_path):
 
 
 def test_build_joint_selects_the_fingerprint_encoder(tmp_path):
-    from openamp.joint_model.fingerprint_encoder import FingerprintEncoder
+    from openamp.encoders import FingerprintEncoder
     from openamp.joint_model.model import build_joint
 
     run, _, _ = _write_fingerprints(tmp_path, list(range(4)), dim=32)
@@ -810,8 +809,8 @@ def _write_frames(tmp_path, device_ids, *, n_frames=200, dim=16):
 
 
 def _frame_encoder(tmp_path, device_ids, **kw):
-    from openamp.encoder.probe import FrameStore
-    from openamp.joint_model.frame_encoder import FrameAttentionEncoder
+    from openamp.encoders import FrameStore
+    from openamp.encoders import FrameAttentionEncoder
 
     store = FrameStore(_write_frames(tmp_path, device_ids))
     kw.setdefault("embedding_dim", 16)
@@ -822,7 +821,7 @@ def _frame_encoder(tmp_path, device_ids, **kw):
 
 
 def test_frame_store_window_reads_the_requested_slice(tmp_path):
-    from openamp.encoder.probe import FrameStore
+    from openamp.encoders import FrameStore
 
     store = FrameStore(_write_frames(tmp_path, [3, 7, 11]))
     assert store.batch([3, 7, 11], "cpu").shape == (3, 200, 16)   # window off: all frames
@@ -834,7 +833,7 @@ def test_frame_store_window_reads_the_requested_slice(tmp_path):
 
 def test_frame_store_names_the_start_that_overruns(tmp_path):
     """np.stack would report only 'arrays must have the same shape'."""
-    from openamp.encoder.probe import FrameStore
+    from openamp.encoders import FrameStore
 
     store = FrameStore(_write_frames(tmp_path, [3, 7]))
     with pytest.raises(ValueError, match="overruns"):

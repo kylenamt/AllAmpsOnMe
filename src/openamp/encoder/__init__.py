@@ -14,7 +14,7 @@ pooler is trained. The generator never appears in the loop -- it is loaded once,
 frozen, to turn a predicted embedding into a held-out ESR.
 
 **Why cross-attention rather than the mean+std of**
-:mod:`openamp.joint_model.fingerprint_encoder`. Measured over the 405 devices
+:mod:`openamp.encoders.fingerprint`. Measured over the 405 devices
 those two artifacts share: the trained table's cloud has a participation ratio
 of 52.5, the mean+std fingerprint cloud 2.84. A 52-dimensional target cannot be
 predicted from a 2.8-dimensional input, and that 2.84 is a property of the

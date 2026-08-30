@@ -21,10 +21,8 @@ import torch
 from torch import nn
 
 from openamp.core.config import EmulateConfig, JointConfig
+from openamp.encoders import build_encoder
 from openamp.models import build_model
-from openamp.joint_model.fingerprint_encoder import FingerprintEncoder
-from openamp.joint_model.frame_encoder import FrameAttentionEncoder
-from openamp.joint_model.wavenet_encoder import WaveNetEncoder
 
 __all__ = ["JointModel", "build_joint", "load_joint"]
 
@@ -32,7 +30,7 @@ __all__ = ["JointModel", "build_joint", "load_joint"]
 class JointModel(nn.Module):
     """``(dry window A, (dry, wet) reference B) -> emulated wet A``."""
 
-    def __init__(self, encoder: WaveNetEncoder, generator: nn.Module):
+    def __init__(self, encoder: nn.Module, generator: nn.Module):
         super().__init__()
         if encoder.embedding_dim != generator.embedding_dim:
             raise ValueError(
@@ -83,13 +81,7 @@ def build_joint(ecfg: EmulateConfig, jcfg: JointConfig, n_devices: int) -> Joint
         # The encoder produces the effective embedding itself (jcfg.enc_normalize),
         # so the table's radius must not train here either.
         generator.embed_scale.requires_grad_(False)
-    if jcfg.enc_kind == "fingerprint":
-        encoder = FingerprintEncoder.from_config(jcfg, generator.embedding_dim)
-    elif jcfg.enc_kind == "dac_frames":
-        encoder = FrameAttentionEncoder.from_config(jcfg, generator.embedding_dim)
-    else:
-        encoder = WaveNetEncoder.from_config(jcfg, generator.embedding_dim)
-    return JointModel(encoder, generator)
+    return JointModel(build_encoder(jcfg, generator.embedding_dim), generator)
 
 
 def load_joint(run_dir: Path, device: str = "cpu", *, which: str = "checkpoint"):

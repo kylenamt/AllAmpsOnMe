@@ -165,10 +165,8 @@ def test_model_init_and_forward_are_unchanged():
 
 @torch.no_grad()
 def test_encoder_init_and_forward_are_unchanged(tmp_path):
-    from openamp.encoder.probe import FrameStore
-    from openamp.joint_model.fingerprint_encoder import FingerprintEncoder
-    from openamp.joint_model.frame_encoder import FrameAttentionEncoder
-    from openamp.joint_model.wavenet_encoder import WaveNetEncoder
+    from openamp.encoders import (FingerprintEncoder, FrameAttentionEncoder,
+                                  FrameStore, WaveNetEncoder)
 
     out: dict = {}
 

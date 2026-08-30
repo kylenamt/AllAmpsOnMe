@@ -4,7 +4,7 @@ Same interface contract as FingerprintEncoder/WaveNetEncoder (.embedding_dim,
 __call__(ref, mask), .pooled_dim, .capacity_report()), so JointModel drives it
 unchanged. The one thing this changes relative to FingerprintEncoder: the
 pooled vector's source is a *trained* CrossAttentionPool
-(openamp.encoder.probe) over the codec's raw per-frame latents, instead of a
+(openamp.encoders.pooling) over the codec's raw per-frame latents, instead of a
 fixed mean+std reduction computed once, offline, with no gradient.
 
 Everything else about FingerprintEncoder's design carries over unchanged:
@@ -19,9 +19,9 @@ No dry-vector subtraction. openamp.encoder.extract keeps wet frames only (see
 its docstring): a device's dry frames were never extracted, so there is
 nothing to subtract, and fp_preprocess is not offered here.
 
-Frames are a buffer, not on this module directly -- FrameStore memmaps them
-lazily from disk per openamp.encoder.probe's own reasoning (12.64 GiB across
-450 devices, page-cached after the first epoch rather than GPU- or
+Frames are not a buffer on this module -- openamp.encoders.pooling.FrameStore
+memmaps them lazily from disk for its own reasons (12.64 GiB across 450
+devices, page-cached after the first epoch rather than GPU- or
 process-resident). Only the pool and the projection below are parameters, so
 the joint trainer's "encoder" optimizer group means exactly "pool + adapter",
 the frame-pooling analogue of "the adapter" under enc_kind="fingerprint".
@@ -71,8 +71,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from openamp.encoders.pooling import CrossAttentionPool, FrameStore
 from openamp.models import make_activation, normalize_activation
-from openamp.encoder.probe import CrossAttentionPool, FrameStore
 
 __all__ = ["FrameAttentionEncoder"]
 
@@ -86,6 +86,13 @@ class FrameAttentionEncoder(nn.Module):
     exactly one place: a trained ``CrossAttentionPool`` over raw frames stands
     where a frozen mean+std vector was looked up.
     """
+
+    # "device", not "frames": moving the ~30 MiB/item frame read into the loader
+    # workers was measured *slower* (~40 smp/s against 68), because every item
+    # then crosses worker-to-parent shared memory and pin_memory as a ~966
+    # MiB/batch payload -- more copies than the single-threaded gather it was
+    # meant to hide. See the module docstring and JointDataset's REF_MODES note.
+    ref_mode = "device"
 
     def __init__(self, *, embedding_dim: int, frames: FrameStore,
                  n_queries: int = 4, d_model: int = 64, proj_hidden: int = 128,

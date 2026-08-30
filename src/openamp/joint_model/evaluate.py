@@ -35,6 +35,7 @@ import torch
 
 from openamp.core.config import Config
 from openamp.data import CorpusPaths, JointDataset, device_names, make_loader
+from openamp.encoders import ref_mode_for
 from openamp.joint_model.model import load_joint
 from openamp.joint_model.train import EVAL_MODES, evaluate_esr
 
@@ -42,17 +43,6 @@ __all__ = ["diagnose", "conditioning_check", "leakage_check", "capture_embedding
 
 DEFAULT_PAIRS = 2000
 DEFAULT_WINDOWS = 8          # reference segments per device for the geometry pass
-
-
-def ref_mode_for_ck(ck: dict) -> str:
-    """Reference kind a checkpoint's conditioning source needs.
-
-    Mirrors :func:`openamp.joint_model.train.ref_mode_for`, off the checkpoint's
-    stored config rather than a live one.
-    """
-    return ("device"
-           if ck.get("joint_cfg", {}).get("enc_kind", "wavenet") in ("fingerprint", "dac_frames")
-           else "audio")
 
 
 def _dataset(cfg: Config, ck: dict, device_ids, *, split: str, pairs: int, seed: int):
@@ -69,7 +59,7 @@ def _dataset(cfg: Config, ck: dict, device_ids, *, split: str, pairs: int, seed:
                         sources=tuple(ck["joint_cfg"]["sources"]),
                         # .get keeps checkpoints written before the fingerprint arm
                         # existed loading exactly as they did.
-                        ref_mode=ref_mode_for_ck(ck))
+                        ref_mode=ref_mode_for(ck["joint_cfg"].get("enc_kind", "")))
 
 
 # --- 1. Does the generator use e? ------------------------------------------------

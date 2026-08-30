@@ -11,7 +11,7 @@ different segment of the recording — in practice a different corpus file — t
 the one the generator has to reconstruct. Only what is shared across segments
 survives that gap, and what is shared is the amp.
 
-- :mod:`~openamp.joint_model.wavenet_encoder` — the new half; the generator is
+- :mod:`~openamp.encoders` — the new half; the generator is
   :class:`~openamp.models.FiLMWaveNet` unchanged, driven through its
   ``forward_emb`` vector path instead of its embedding table.
 - :mod:`~openamp.data.joint` — pairs a generator window with a disjoint
@@ -26,4 +26,4 @@ survives that gap, and what is shared is the amp.
 
 from __future__ import annotations
 
-__all__ = ["wavenet_encoder", "dataset", "train", "evaluate"]
+__all__ = ["model", "train", "evaluate", "geometry"]

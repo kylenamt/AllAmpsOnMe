@@ -104,7 +104,7 @@ class JointConfig:
     # "wavenet": encode a (dry, wet) clip | "fingerprint": lookup a precomputed
     # mean+std pooled vector by device id | "dac_frames": lookup precomputed
     # per-frame DAC latents by device id and pool them with a trained
-    # cross-attention head (openamp.encoder.probe.CrossAttentionPool) instead of
+    # cross-attention head (openamp.encoders.pooling.CrossAttentionPool) instead of
     # a fixed mean+std reduction.
     enc_kind: str = "wavenet"
     fp_path: str = ""                # fingerprint run dir (pooled.npz); required if enc_kind="fingerprint"

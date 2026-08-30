@@ -42,6 +42,7 @@ import torch.nn.functional as F
 
 from openamp.core.config import Config
 from openamp.data import CorpusPaths, JointDataset, make_loader, manifest_signature
+from openamp.encoders import ref_mode_for
 from openamp.models import count_parameters, model_class
 from openamp.emulate.train import GRAD_CLIP_NORM, _device_index
 from openamp.losses import (DEFAULT_LOSS, build_loss, device_loss_weights,
@@ -169,26 +170,13 @@ def _build_datasets(cfg: Config, ecfg, jcfg, id_to_idx, R: int):
     common = dict(receptive_field=R, id_to_idx=id_to_idx, clip_samples=clip,
                   ref_samples=ref, ref_different_file=jcfg.ref_different_file,
                   ref_min_gap=gap, sources=tuple(jcfg.sources),
-                  ref_mode=ref_mode_for(jcfg))
+                  ref_mode=ref_mode_for(jcfg.enc_kind))
     paths = CorpusPaths.from_config(cfg)
     train_ds = JointDataset(paths, "train", pairs_per_epoch=ecfg.pairs_per_epoch,
                             seed=cfg.seed, **common)
     val_ds = JointDataset(paths, "val", pairs_per_epoch=ecfg.val_pairs,
                           seed=cfg.seed + 999, **common)
     return train_ds, val_ds, clip, ref
-
-
-def ref_mode_for(jcfg) -> str:
-    """Which reference a conditioning source needs. One place, so train and eval agree.
-
-    "dac_frames" takes "device", not "frames": moving the ~30 MiB/item frame read
-    into the loader workers was measured *slower* (~40 smp/s against 68), because
-    every item then crosses worker-to-parent shared memory and pin_memory as a
-    ~966 MiB/batch payload -- more copies than the single-threaded gather it was
-    meant to hide. See JointDataset's REF_MODES note.
-    """
-    return ("device" if getattr(jcfg, "enc_kind", "wavenet") in ("fingerprint", "dac_frames")
-           else "audio")
 
 
 def _optimizer(model, ecfg, jcfg):
@@ -310,11 +298,11 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
     # a finished run, and nothing about the checkpoint's shape would notice.
     fp_sha, fp_meta = "", {}
     if jcfg.enc_kind == "fingerprint":
-        from openamp.joint_model.fingerprint_encoder import FingerprintEncoder
+        from openamp.encoders import FingerprintEncoder
         fp_sha = FingerprintEncoder.fingerprint_sha256(jcfg.fp_path)
         fp_meta = FingerprintEncoder.load_pooled(jcfg.fp_path)[3]
     elif jcfg.enc_kind == "dac_frames":
-        from openamp.joint_model.frame_encoder import FrameAttentionEncoder
+        from openamp.encoders import FrameAttentionEncoder
         fp_sha = FrameAttentionEncoder.frames_sha256(jcfg.fp_frames_path)
         fp_meta = json.loads((Path(jcfg.fp_frames_path) / "meta.json").read_text())
     model = build_joint(ecfg, jcfg, len(ids)).to(dev)
@@ -382,7 +370,7 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
             clip_samples=clip,
             ref_samples=ref_n, ref_different_file=jcfg.ref_different_file,
             ref_min_gap=int(round(jcfg.ref_min_gap_seconds * cfg.sample_rate)),
-            sources=tuple(jcfg.sources), ref_mode=ref_mode_for(jcfg),
+            sources=tuple(jcfg.sources), ref_mode=ref_mode_for(jcfg.enc_kind),
             pairs_per_epoch=ecfg.val_pairs, seed=cfg.seed + 4242)
         holdout_loader = make_loader(holdout_ds, ecfg.batch_size, ecfg.num_workers,
                                       shuffle=False, seed=cfg.seed + 4242,

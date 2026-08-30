@@ -47,6 +47,7 @@ from torch import nn
 
 from openamp.core.config import Config, EmulateConfig, load_config
 from openamp.data import CorpusPaths, EmulationDataset, make_loader
+from openamp.encoders import CrossAttentionPool, FrameStore
 from openamp.emulate.enroll import _per_device_esr
 from openamp.emulate.evaluate import _SILENCE_DBFS, _resolve_device, load_model
 
@@ -64,44 +65,6 @@ NO_FIT_BASELINE = 1.512
 
 
 # --- Model ----------------------------------------------------------------------
-class CrossAttentionPool(nn.Module):
-    """``[B, T, D] -> [B, n_q * d]``: learned queries attend over the frames.
-
-    The queries are ``nn.Parameter`` and amp-independent -- they encode *what to
-    look for* in a capture, and the amp enters only through the keys and values.
-    That is the whole difference from mean+std, which weights every one of the
-    14,728 frames identically and collapses the cloud to ~2.8 effective
-    dimensions.
-
-    Softmax in float32 then cast back, matching ``AttentiveStatsPool``'s
-    discipline: under autocast the logits are otherwise reduced in bf16 across
-    14k frames, where the running sum loses the small terms that distinguish one
-    amp's attention pattern from another's.
-    """
-
-    def __init__(self, in_dim: int, n_queries: int, d_model: int):
-        super().__init__()
-        self.d_model = int(d_model)
-        self.k = nn.Linear(in_dim, d_model)
-        self.v = nn.Linear(in_dim, d_model)
-        self.q = nn.Parameter(torch.randn(n_queries, d_model) * 0.02)
-
-    @property
-    def pooled_dim(self) -> int:
-        return self.q.shape[0] * self.d_model
-
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        K, V = self.k(x), self.v(x)                       # [B, T, d]
-        logits = (self.q @ K.transpose(1, 2)) / self.d_model ** 0.5      # [B, n_q, T]
-        if mask is not None:
-            if mask.shape[-1] != x.shape[1]:
-                raise ValueError(f"mask length {mask.shape[-1]} does not match frame "
-                                 f"count {x.shape[1]}")
-            logits = logits.masked_fill(~mask.bool()[:, None, :], float("-inf"))
-        alpha = torch.softmax(logits.float(), dim=-1).to(V.dtype)
-        return (alpha @ V).flatten(1)                     # [B, n_q * d]
-
-
 class EmbeddingRegressor(nn.Module):
     """``[B, T, D] frames -> [B, embedding_dim]``, as ``magnitude * direction``."""
 
@@ -131,72 +94,6 @@ def regression_loss(direction, magnitude, target, mag_weight: float):
     dir_loss = (1.0 - cos).mean()
     mag_loss = ((magnitude.clamp_min(1e-8).log() - tgt_mag.log()) ** 2).mean()
     return dir_loss + mag_weight * mag_loss, float(dir_loss), float(mag_loss), float(cos.mean())
-
-
-# --- Frames -----------------------------------------------------------------------
-class FrameStore:
-    """Lazily-memmapped ``{device_id: [T, D] float16}`` shards.
-
-    Memmapped rather than resident: 450 shards is 12.64 GiB against 30 GB of
-    system RAM, and the page cache holds it after the first epoch without
-    competing with torch for the same allocation. Never a registered buffer --
-    it would be checkpointed and pushed to the GPU.
-    """
-
-    def __init__(self, root: Path):
-        self.root = Path(root)
-        meta_path = self.root / "meta.json"
-        if not meta_path.is_file():
-            raise SystemExit(f"no meta.json under {self.root} — run "
-                             f"`python -m openamp.encoder.extract` first")
-        self.meta = json.loads(meta_path.read_text())
-        self.device_ids = [int(d) for d in self.meta["device_ids"]]
-        self.n_frames = int(self.meta["n_frames"])
-        self.latent_dim = int(self.meta["latent_dim"])
-        self._mm: dict[int, np.ndarray] = {}
-
-    def __contains__(self, did: int) -> bool:
-        return int(did) in set(self.device_ids)
-
-    def get(self, did: int) -> np.ndarray:
-        did = int(did)
-        if did not in self._mm:
-            path = self.root / "frames" / f"{did:04d}.npy"
-            if not path.is_file():
-                raise KeyError(f"no frames for device {did} under {self.root}")
-            self._mm[did] = np.load(path, mmap_mode="r")
-        return self._mm[did]
-
-    def batch(self, ids, device, *, window: int | None = None,
-              starts=None) -> torch.Tensor:
-        """``[B, T, D]`` fp16, optionally one contiguous ``window`` per id.
-
-        The slice is taken on the memmap, before the stack, so a windowed read
-        touches only the pages it needs -- that is the point of the option, not
-        just a smaller output tensor.
-
-        ``starts`` is one offset per id (defaults to all-zero). Callers pick
-        them: the frame store has no opinion about whether they should be
-        random or fixed.
-        """
-        if window is None:
-            arr = np.stack([np.asarray(self.get(d)) for d in ids])   # [B, T, D] fp16
-        else:
-            window = int(window)
-            offs = [0] * len(ids) if starts is None else [int(s) for s in starts]
-            if len(offs) != len(ids):
-                raise ValueError(f"starts has {len(offs)} entries for {len(ids)} ids")
-            # Checked before the slice: a short slice would otherwise surface
-            # as np.stack's "all input arrays must have the same shape", which
-            # says nothing about which start ran off the end.
-            bad = [(int(d), s) for d, s in zip(ids, offs)
-                   if s < 0 or s + window > self.n_frames]
-            if bad:
-                raise ValueError(f"window {window} overruns the {self.n_frames}-frame "
-                                 f"shards at (device, start) {bad}")
-            arr = np.stack([np.asarray(self.get(d)[s:s + window])
-                            for d, s in zip(ids, offs)])
-        return torch.from_numpy(arr).to(device, non_blocking=True)
 
 
 # --- Geometry diagnostics -----------------------------------------------------------

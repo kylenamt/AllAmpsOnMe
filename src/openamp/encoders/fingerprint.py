@@ -53,6 +53,8 @@ class FingerprintEncoder(nn.Module):
     exactly one place: the provenance of the pooled vector.
     """
 
+    ref_mode = "device"                                  # a device id to look up
+
     def __init__(self, *, embedding_dim: int, fingerprints: np.ndarray,
                  device_ids: np.ndarray, dry: np.ndarray,
                  preprocess: str = "dry_l2", proj_hidden: int = 128,
