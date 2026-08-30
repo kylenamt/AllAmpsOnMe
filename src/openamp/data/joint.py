@@ -3,7 +3,7 @@
 One item carries both halves of the joint model's input:
 
 - ``input`` / ``target`` — the generator's window A, exactly what
-  :class:`~openamp.emulate.dataset.EmulationDataset` already yields (clean with
+  :class:`~openamp.data.emulation.EmulationDataset` already yields (clean with
   real left-context, and the warmed render region the loss covers).
 - ``ref`` — window B, a ``(dry, wet)`` pair of the **same device** taken from a
   **different corpus file**, which the encoder turns into the embedding used to
@@ -33,7 +33,8 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from openamp.emulate.dataset import EmulationDataset, read_with_retry
+from openamp.data.corpus_index import CorpusPaths
+from openamp.data.emulation import EmulationDataset, read_with_retry
 
 __all__ = ["JointDataset", "REF_MODES"]
 
@@ -63,13 +64,13 @@ class JointDataset(EmulationDataset):
     least ``ref_min_gap`` samples on whichever side has room.
     """
 
-    def __init__(self, config, split: str, *, receptive_field: int,
+    def __init__(self, paths: CorpusPaths, split: str, *, receptive_field: int,
                  id_to_idx: dict[int, int], ref_samples: int,
-                 clip_samples: int | None = None, ref_different_file: bool = True,
+                 clip_samples: int, ref_different_file: bool = True,
                  ref_min_gap: int = 0, pairs_per_epoch: int = 50_000,
                  seed: int = 1234, sources: "tuple[str, ...] | list[str]" = (),
                  ref_mode: str = "audio"):
-        super().__init__(config, split, receptive_field=receptive_field,
+        super().__init__(paths, split, receptive_field=receptive_field,
                          id_to_idx=id_to_idx, clip_samples=clip_samples,
                          pairs_per_epoch=pairs_per_epoch, seed=seed, sources=sources)
         self.ref_samples = int(ref_samples)
@@ -158,9 +159,8 @@ class JointDataset(EmulationDataset):
         from openamp.dsp import audio as audio_io
 
         dry = audio_io.seek_read(self._clean_path(file), c, self.ref_samples)
-        render_path = self.config.device_render_dir(device_id) / \
-            f"{file['file_id']}.{self.config.output_format}"
-        wet = audio_io.seek_read(render_path, c, self.ref_samples)
+        wet = audio_io.seek_read(self.paths.render_file(device_id, file["file_id"]),
+                                 c, self.ref_samples)
         return np.stack([dry, wet], axis=0).astype(np.float32, copy=False)
 
     # --- Item -------------------------------------------------------------------

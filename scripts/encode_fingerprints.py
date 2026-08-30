@@ -41,7 +41,7 @@ from openamp.core import manifest as manifests
 from openamp.core.config import load_config
 from openamp.core.util import sha256_file
 from openamp.dsp import audio as audio_io
-from openamp.emulate.dataset import render_ok_devices
+from openamp.data import CorpusPaths, render_ok_devices
 
 # Pre-quantization encoder trunks. Both are reconstruction codecs, which is the point:
 # they are trained to preserve enough detail to rebuild the waveform, so they cannot
@@ -186,7 +186,7 @@ def main() -> None:
     dev = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     cfg = load_config(data_dir=args.data_dir)
-    devices = render_ok_devices(cfg)
+    devices = render_ok_devices(CorpusPaths.from_config(cfg))
     if not devices:
         raise SystemExit(f"no render_ok devices under {args.data_dir} — wrong data dir?")
     if args.limit_devices:

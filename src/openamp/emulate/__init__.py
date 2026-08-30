@@ -9,7 +9,6 @@ per-device embedding; architecture and sizes are config-driven (``emulate.arch``
   (linear FiLM generator), its MLP-generator variant, and the weight-delta variant
   that conditions the conv kernels themselves instead of FiLM.
 - :mod:`openamp.emulate.models`   — arch selection (``build_model``).
-- :mod:`openamp.emulate.dataset`  — clean-in / render-out training pairs.
 - :mod:`openamp.emulate.train`    — the one training script (+ sanity ladder).
 - :mod:`openamp.emulate.evaluate` — size-comparison harness + demo export.
 - :mod:`openamp.emulate.enroll`   — unseen-device embedding enrollment (Phase 5).
@@ -17,6 +16,6 @@ per-device embedding; architecture and sizes are config-driven (``emulate.arch``
 The amortized counterpart to enrollment — mapping an amp straight to a
 conditioning vector instead of fitting one — lives in :mod:`openamp.joint_model`.
 Nothing here consumes its output; the dependency runs the other way, since that
-package reuses this one's :class:`~openamp.emulate.dataset.EmulationDataset`
-corpus plumbing and :class:`~openamp.emulate.train.EmulationLoss`.
+package reuses the shared :mod:`openamp.data` corpus plumbing and
+:mod:`openamp.losses`.
 """

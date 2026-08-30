@@ -41,12 +41,11 @@ import torch
 import torch.nn.functional as F
 
 from openamp.core.config import Config
-from openamp.emulate.dataset import manifest_signature
+from openamp.data import CorpusPaths, JointDataset, make_loader, manifest_signature
 from openamp.emulate.wavenet import count_parameters
-from openamp.emulate.train import GRAD_CLIP_NORM, _device_index, _make_loader
+from openamp.emulate.train import GRAD_CLIP_NORM, _device_index
 from openamp.losses import (DEFAULT_LOSS, build_loss, device_loss_weights,
                             pre_emphasis)
-from openamp.joint_model.dataset import JointDataset
 from openamp.joint_model.model import build_joint, load_joint
 
 LOG_COLUMNS = ["epoch", "step", "train_loss", "train_esr", "train_stft", "val_esr",
@@ -171,9 +170,10 @@ def _build_datasets(cfg: Config, ecfg, jcfg, id_to_idx, R: int):
                   ref_samples=ref, ref_different_file=jcfg.ref_different_file,
                   ref_min_gap=gap, sources=tuple(jcfg.sources),
                   ref_mode=ref_mode_for(jcfg))
-    train_ds = JointDataset(cfg, "train", pairs_per_epoch=ecfg.pairs_per_epoch,
+    paths = CorpusPaths.from_config(cfg)
+    train_ds = JointDataset(paths, "train", pairs_per_epoch=ecfg.pairs_per_epoch,
                             seed=cfg.seed, **common)
-    val_ds = JointDataset(cfg, "val", pairs_per_epoch=ecfg.val_pairs,
+    val_ds = JointDataset(paths, "val", pairs_per_epoch=ecfg.val_pairs,
                           seed=cfg.seed + 999, **common)
     return train_ds, val_ds, clip, ref
 
@@ -232,7 +232,7 @@ def overfit_one_batch(cfg: Config, *, name: str = "overfit", device: str = "cuda
     R = model.receptive_field
     train_ds, _, clip, ref_n = _build_datasets(cfg, ecfg, jcfg, id_to_idx, R)
     train_ds.pairs_per_epoch = batch
-    loader = _make_loader(train_ds, batch, 0, shuffle=False, seed=cfg.seed, drop_last=False)
+    loader = make_loader(train_ds, batch, 0, shuffle=False, seed=cfg.seed, drop_last=False)
     b = next(iter(loader))
     inp = b["input"].to(dev)
     target = b["target"].to(dev).unsqueeze(1)
@@ -305,7 +305,7 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
                  if jcfg.enc_normalize else "the batch's own std")
         print(f"[loss]  embed_noise_frac={noise_frac:g} against {scale} "
               f"(train steps only; val, shuffled and holdout all see clean e)")
-    manifest_sig = manifest_signature(cfg)
+    manifest_sig = manifest_signature(CorpusPaths.from_config(cfg))
     # Fingerprint provenance: the underlying data can be regenerated out from under
     # a finished run, and nothing about the checkpoint's shape would notice.
     fp_sha, fp_meta = "", {}
@@ -348,7 +348,7 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
 
     # --- Data -------------------------------------------------------------------
     train_ds, val_ds, clip, ref_n = _build_datasets(cfg, ecfg, jcfg, id_to_idx, R)
-    val_loader = _make_loader(val_ds, ecfg.batch_size, ecfg.num_workers,
+    val_loader = make_loader(val_ds, ecfg.batch_size, ecfg.num_workers,
                               shuffle=False, seed=cfg.seed + 999, drop_last=False)
     if train_ds.ref_mode == "device":
         ref_desc = "device-id lookup of a precomputed fingerprint"
@@ -378,12 +378,13 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
     if holdout_ids:
         h_idx = {int(d): i for i, d in enumerate(sorted(holdout_ids))}
         holdout_ds = JointDataset(
-            cfg, "val", receptive_field=R, id_to_idx=h_idx, clip_samples=clip,
+            CorpusPaths.from_config(cfg), "val", receptive_field=R, id_to_idx=h_idx,
+            clip_samples=clip,
             ref_samples=ref_n, ref_different_file=jcfg.ref_different_file,
             ref_min_gap=int(round(jcfg.ref_min_gap_seconds * cfg.sample_rate)),
             sources=tuple(jcfg.sources), ref_mode=ref_mode_for(jcfg),
             pairs_per_epoch=ecfg.val_pairs, seed=cfg.seed + 4242)
-        holdout_loader = _make_loader(holdout_ds, ecfg.batch_size, ecfg.num_workers,
+        holdout_loader = make_loader(holdout_ds, ecfg.batch_size, ecfg.num_workers,
                                       shuffle=False, seed=cfg.seed + 4242,
                                       drop_last=False)
         print(f"[data]  holdout probe: {len(holdout_ds.device_ids)} unseen devices")
@@ -463,7 +464,7 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
     probe_batches = max(1, min(25, ecfg.val_pairs // max(ecfg.batch_size, 1)))
     for epoch in range(start_epoch, max_epochs):
         train_ds.seed = cfg.seed + epoch        # fresh window positions each epoch
-        loader = _make_loader(train_ds, ecfg.batch_size, ecfg.num_workers,
+        loader = make_loader(train_ds, ecfg.batch_size, ecfg.num_workers,
                               shuffle=True, seed=cfg.seed + epoch, drop_last=True)
         model.train()
         ep_loss = ep_esr = ep_stft = 0.0

@@ -578,43 +578,43 @@ def _build_corpus(cfg, files, devices):
 
 
 def _dataset(cfg, split, *, R, clip, **kw):
-    from openamp.emulate.dataset import EmulationDataset, build_device_index
+    from openamp.data import CorpusPaths, EmulationDataset, build_device_index
 
-    _, id_to_idx = build_device_index(cfg)
-    return EmulationDataset(cfg, split, receptive_field=R, id_to_idx=id_to_idx,
+    _, id_to_idx = build_device_index(CorpusPaths.from_config(cfg))
+    return EmulationDataset(CorpusPaths.from_config(cfg), split, receptive_field=R, id_to_idx=id_to_idx,
                             clip_samples=clip, **kw)
 
 
 def test_device_index_is_sorted_and_stable(tmp_path):
     pytest.importorskip("soundfile")
-    from openamp.emulate.dataset import build_device_index, manifest_signature
+    from openamp.data import CorpusPaths, build_device_index, manifest_signature
 
     cfg = load_config(data_dir=tmp_path)
     sig = np.linspace(-0.4, 0.4, 300, dtype=np.float32)
     _build_corpus(cfg, [("f0", "train", sig)], devices=[5, 2, 9])
-    ids, idx = build_device_index(cfg)
+    ids, idx = build_device_index(CorpusPaths.from_config(cfg))
     assert ids == [2, 5, 9] and idx == {2: 0, 5: 1, 9: 2}
-    assert len(manifest_signature(cfg)) == 64          # sha-256 hex of the manifest
+    assert len(manifest_signature(CorpusPaths.from_config(cfg))) == 64          # sha-256 hex of the manifest
 
 
 def test_holdout_excluded_persisted_and_bypassed(tmp_path):
     pytest.importorskip("soundfile")
-    from openamp.emulate.dataset import build_device_index, load_or_create_holdout
+    from openamp.data import CorpusPaths, build_device_index, load_or_create_holdout
 
     cfg = load_config(data_dir=tmp_path)
     sig = np.linspace(-0.4, 0.4, 300, dtype=np.float32)
     _build_corpus(cfg, [("f0", "train", sig)], devices=list(range(10)))
 
-    held = load_or_create_holdout(cfg, 0.2, seed=1)
+    held = load_or_create_holdout(CorpusPaths.from_config(cfg), 0.2, seed=1)
     assert len(held) == 2 and cfg.emulate_holdout_path.is_file()
     # the file, not the RNG, is the source of truth: other frac/seed reads it back
-    assert load_or_create_holdout(cfg, 0.5, seed=99) == held
+    assert load_or_create_holdout(CorpusPaths.from_config(cfg), 0.5, seed=99) == held
     # held-out devices leave the embedding table; rows stay dense over the rest
-    ids, idx = build_device_index(cfg, exclude=held)
+    ids, idx = build_device_index(CorpusPaths.from_config(cfg), exclude=held)
     assert set(ids) == set(range(10)) - set(held)
     assert sorted(idx.values()) == list(range(8))
     # frac <= 0 disables the holdout even when the file exists
-    assert load_or_create_holdout(cfg, 0.0, seed=1) == []
+    assert load_or_create_holdout(CorpusPaths.from_config(cfg), 0.0, seed=1) == []
 
 
 def test_pairs_are_aligned_and_warmed(tmp_path):
@@ -708,10 +708,10 @@ def test_retry_gives_up_after_four_consecutive_failures(tmp_path, monkeypatch):
 
 # --- Per-device validation: one shared window grid, one ESR per amp -------------
 def _grid(cfg, *, R, clip, **kw):
-    from openamp.emulate.dataset import DeviceGridDataset, build_device_index
+    from openamp.data import CorpusPaths, DeviceGridDataset, build_device_index
 
-    _, id_to_idx = build_device_index(cfg)
-    return DeviceGridDataset(cfg, "test", receptive_field=R, id_to_idx=id_to_idx,
+    _, id_to_idx = build_device_index(CorpusPaths.from_config(cfg))
+    return DeviceGridDataset(CorpusPaths.from_config(cfg), "test", receptive_field=R, id_to_idx=id_to_idx,
                              clip_samples=clip, **kw)
 
 
@@ -951,7 +951,8 @@ def test_enroll_rejects_seen_and_skips_unrenderable(tmp_path):
 
 
 def test_wet_dry_dataset_and_lag_estimation():
-    from openamp.emulate.enroll import WetDryDataset, estimate_lag
+    from openamp.data import WetDryDataset
+    from openamp.emulate.enroll import estimate_lag
 
     rng = np.random.default_rng(0)
     a = (0.3 * rng.standard_normal(20_000)).astype(np.float32)

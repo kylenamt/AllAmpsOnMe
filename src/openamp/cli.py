@@ -47,9 +47,9 @@ def _device_names() -> dict[int, str]:
     Best-effort so exports still work from a bare run dir (falling back to the
     generic ``device <id>`` label) when no config or manifest is present.
     """
-    from openamp.emulate.dataset import device_names
+    from openamp.data import CorpusPaths, device_names
     try:
-        return device_names(load_config())
+        return device_names(CorpusPaths.from_config(load_config()))
     except ConfigError:
         return {}
 

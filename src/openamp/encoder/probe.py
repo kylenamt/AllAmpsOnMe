@@ -46,10 +46,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from openamp.core.config import Config, EmulateConfig, load_config
-from openamp.emulate.dataset import EmulationDataset
+from openamp.data import CorpusPaths, EmulationDataset, make_loader
 from openamp.emulate.enroll import _per_device_esr
 from openamp.emulate.evaluate import _SILENCE_DBFS, _resolve_device, load_model
-from openamp.emulate.train import _make_loader
 
 # What mean+std pooling of the same DAC latents achieves, measured over the same
 # 405 devices. The pooler has to beat these or the input was never the problem.
@@ -253,10 +252,10 @@ def holdout_esr(cfg: Config, run_dir: Path, pred: dict[int, np.ndarray], *,
 
     R = model.receptive_field
     clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
-    ds = EmulationDataset(cfg, "test", receptive_field=R, id_to_idx=idx,
-                          clip_samples=clip, pairs_per_epoch=test_pairs * len(ids),
-                          seed=cfg.seed + 7)
-    loader = _make_loader(ds, ecfg.batch_size, ecfg.num_workers, shuffle=False,
+    ds = EmulationDataset(CorpusPaths.from_config(cfg), "test", receptive_field=R,
+                          id_to_idx=idx, clip_samples=clip,
+                          pairs_per_epoch=test_pairs * len(ids), seed=cfg.seed + 7)
+    loader = make_loader(ds, ecfg.batch_size, ecfg.num_workers, shuffle=False,
                           seed=cfg.seed + 7, drop_last=False)
     per_dev = _per_device_esr(model, loader, dev, len(ids),
                               silence_dbfs=_SILENCE_DBFS, clip=clip)

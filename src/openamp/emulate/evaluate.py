@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 from openamp.core.config import Config, EmulateConfig
-from openamp.emulate.dataset import EmulationDataset
+from openamp.data import CorpusPaths, EmulationDataset
 from openamp.emulate.models import arch_summary, build_model
 
 # One row of the comparison CSV, in order (spec §3).
@@ -80,8 +80,9 @@ def evaluate_run(cfg: Config, run_dir: Path, *, device: str = "cpu",
     clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
     n_pairs = int(n_pairs if n_pairs is not None else max(ecfg.val_pairs, 2000))
 
-    ds = EmulationDataset(cfg, "test", receptive_field=R, id_to_idx=ck["id_to_idx"],
-                          clip_samples=clip, pairs_per_epoch=n_pairs, seed=cfg.seed + 7)
+    ds = EmulationDataset(CorpusPaths.from_config(cfg), "test", receptive_field=R,
+                          id_to_idx=ck["id_to_idx"], clip_samples=clip,
+                          pairs_per_epoch=n_pairs, seed=cfg.seed + 7)
     from torch.utils.data import DataLoader
     loader = DataLoader(ds, batch_size=ecfg.batch_size, shuffle=False,
                         num_workers=ecfg.num_workers, pin_memory=True)
@@ -171,10 +172,10 @@ def _device_metadata(cfg: Config) -> dict[int, dict]:
     - Absent metadata just leaves the columns empty; must not fail a validation.
     """
     from openamp.core import manifest as manifests
-    from openamp.emulate.dataset import device_names
+    from openamp.data import device_names
 
     fields = ("make", "model", "gain_bucket", "architecture")
-    names = device_names(cfg)
+    names = device_names(CorpusPaths.from_config(cfg))
     for path, cols in ((cfg.manifest_path, manifests.ALL_COLUMNS),
                        (cfg.devices_final_path, manifests.DEVICES_FINAL_COLUMNS)):
         df = manifests.read_manifest(path, cols)
@@ -213,7 +214,7 @@ def validate_per_device(cfg: Config, run_dir: Path, *, device: str = "cpu",
     from collections import defaultdict
     from torch.utils.data import DataLoader
 
-    from openamp.emulate.dataset import DeviceGridDataset
+    from openamp.data import DeviceGridDataset
 
     run_dir = Path(run_dir)
     dev = torch.device(_resolve_device(device))
@@ -225,7 +226,8 @@ def validate_per_device(cfg: Config, run_dir: Path, *, device: str = "cpu",
     # Checkpoints predating the saved map imply it: the table is built in the
     # device_ids order (dataset.build_device_index).
     id_to_idx = ck.get("id_to_idx") or {int(d): i for i, d in enumerate(ck["device_ids"])}
-    ds = DeviceGridDataset(cfg, "test", receptive_field=R, id_to_idx=id_to_idx,
+    ds = DeviceGridDataset(CorpusPaths.from_config(cfg), "test", receptive_field=R,
+                           id_to_idx=id_to_idx,
                            device_ids=list(ck["device_ids"]), clip_samples=clip,
                            n_windows=n_windows,
                            seed=int(seed if seed is not None else cfg.seed + 7),

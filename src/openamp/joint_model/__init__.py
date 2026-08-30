@@ -14,8 +14,8 @@ survives that gap, and what is shared is the amp.
 - :mod:`~openamp.joint_model.wavenet_encoder` — the new half; the generator is
   :class:`~openamp.emulate.wavenet.FiLMWaveNet` unchanged, driven through its
   ``forward_emb`` vector path instead of its embedding table.
-- :mod:`~openamp.joint_model.dataset` — pairs a generator window with a
-  disjoint reference segment of the same device.
+- :mod:`~openamp.data.joint` — pairs a generator window with a disjoint
+  reference segment of the same device.
 - :mod:`~openamp.joint_model.train` — the joint loop; reconstruction loss only.
 - :mod:`~openamp.joint_model.evaluate` — the collapse and leakage diagnostics
   that say whether the embedding means anything, which reconstruction ESR alone

@@ -27,7 +27,6 @@ the first three measured.
 
 from __future__ import annotations
 
-import csv
 import json
 from pathlib import Path
 
@@ -35,9 +34,7 @@ import numpy as np
 import torch
 
 from openamp.core.config import Config
-from openamp.emulate.dataset import build_device_index, device_names
-from openamp.emulate.train import _make_loader
-from openamp.joint_model.dataset import JointDataset
+from openamp.data import CorpusPaths, JointDataset, device_names, make_loader
 from openamp.joint_model.model import load_joint
 from openamp.joint_model.train import EVAL_MODES, evaluate_esr
 
@@ -61,7 +58,8 @@ def ref_mode_for_ck(ck: dict) -> str:
 def _dataset(cfg: Config, ck: dict, device_ids, *, split: str, pairs: int, seed: int):
     """A :class:`JointDataset` over an explicit device set, sized like the run's."""
     jcfg_ref = int(ck["ref_samples"])
-    return JointDataset(cfg, split, receptive_field=int(ck["receptive_field"]),
+    return JointDataset(CorpusPaths.from_config(cfg), split,
+                        receptive_field=int(ck["receptive_field"]),
                         id_to_idx={int(d): i for i, d in enumerate(device_ids)},
                         ref_samples=jcfg_ref, clip_samples=int(ck["clip_samples"]),
                         ref_different_file=bool(ck["joint_cfg"]["ref_different_file"]),
@@ -124,7 +122,7 @@ def leakage_check(model, ds: JointDataset, device, *, n_devices: int = 32,
     ids = [int(d) for d in ds.device_ids[:n_devices]]
     if len(ids) < 2:
         return {"n_devices": len(ids), "note": "need >= 2 devices"}
-    loader = _make_loader(ds, len(ids), 0, shuffle=False, seed=seed, drop_last=True)
+    loader = make_loader(ds, len(ids), 0, shuffle=False, seed=seed, drop_last=True)
     batch = next(iter(loader))
     inp = batch["input"][:len(ids)].to(device)
     R = model.receptive_field
@@ -209,7 +207,7 @@ def diagnose(cfg: Config, run_dir: Path, *, device: str = "cuda",
 
     # 1. Conditioning, on the devices the run trained on.
     seen_ds = _dataset(cfg, ck, seen, split="val", pairs=pairs, seed=seed + 999)
-    seen_loader = _make_loader(seen_ds, batch, 0, shuffle=False, seed=seed, drop_last=False)
+    seen_loader = make_loader(seen_ds, batch, 0, shuffle=False, seed=seed, drop_last=False)
     out["seen"] = conditioning_check(model, seen_loader, dev, coeff, seed)
     print(f"[diag]  seen    esr={out['seen']['esr']:.5f} "
           f"shuffled x{out['seen']['shuffled_ratio']:.1f} "
@@ -227,7 +225,7 @@ def diagnose(cfg: Config, run_dir: Path, *, device: str = "cuda",
     # 3. Zero-shot: devices the run never saw. This is the headline.
     if holdout:
         hold_ds = _dataset(cfg, ck, holdout, split="val", pairs=pairs, seed=seed + 555)
-        hold_loader = _make_loader(hold_ds, batch, 0, shuffle=False, seed=seed,
+        hold_loader = make_loader(hold_ds, batch, 0, shuffle=False, seed=seed,
                                    drop_last=False)
         out["holdout"] = conditioning_check(model, hold_loader, dev, coeff, seed)
         print(f"[diag]  holdout esr={out['holdout']['esr']:.5f} "
@@ -253,7 +251,7 @@ def diagnose(cfg: Config, run_dir: Path, *, device: str = "cuda",
                  capture=cap, capture_device=cap_dev)
         coords = _tsne(cap, seed)
         if coords is not None:
-            _write_tsne(run_dir, coords, cap_dev, device_names(cfg))
+            _write_tsne(run_dir, coords, cap_dev, device_names(CorpusPaths.from_config(cfg)))
 
     verdict = _verdict(out)
     out["verdict"] = verdict

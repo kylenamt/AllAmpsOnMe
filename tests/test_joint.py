@@ -415,14 +415,14 @@ def _build_corpus(cfg, devices, *, n_files=4, seconds=3.0, sr=48_000, splits=("t
 
 
 def _joint_dataset(cfg, **kw):
-    from openamp.emulate.dataset import build_device_index
-    from openamp.joint_model.dataset import JointDataset
+    from openamp.data import CorpusPaths, build_device_index
+    from openamp.data import JointDataset
 
-    _, id_to_idx = build_device_index(cfg)
+    _, id_to_idx = build_device_index(CorpusPaths.from_config(cfg))
     kw.setdefault("receptive_field", 64)
     kw.setdefault("clip_samples", 8_000)
     kw.setdefault("ref_samples", 8_000)
-    return JointDataset(cfg, "train", id_to_idx=id_to_idx, seed=7, **kw)
+    return JointDataset(CorpusPaths.from_config(cfg), "train", id_to_idx=id_to_idx, seed=7, **kw)
 
 
 def test_reference_comes_from_a_different_file(tmp_path):
@@ -708,14 +708,15 @@ def test_preprocess_modes_do_what_they_say(tmp_path):
 def test_device_mode_yields_ids_reads_no_reference_and_keeps_window_a(tmp_path):
     """The experimental control: only the conditioning changes, never window A."""
     pytest.importorskip("soundfile")
-    from openamp.joint_model.dataset import JointDataset
+    from openamp.data import CorpusPaths, JointDataset
 
     cfg = load_config(data_dir=tmp_path)
     _build_corpus(cfg, devices=[0, 1, 2], n_files=3, splits=("train",))
+    paths = CorpusPaths.from_config(cfg)
     common = dict(receptive_field=8, id_to_idx={0: 0, 1: 1, 2: 2},
                   ref_samples=256, clip_samples=128, pairs_per_epoch=6, seed=7)
-    audio = JointDataset(cfg, "train", ref_mode="audio", **common)
-    dev = JointDataset(cfg, "train", ref_mode="device", **common)
+    audio = JointDataset(paths, "train", ref_mode="audio", **common)
+    dev = JointDataset(paths, "train", ref_mode="device", **common)
 
     assert dev.ref_files == [] and dev.same_file_mode is False
     for i in range(6):

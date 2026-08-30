@@ -23,11 +23,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 
 from openamp.core.config import Config
-from openamp.emulate.dataset import (EmulationDataset, build_device_index,
-                                     load_or_create_holdout, manifest_signature)
+from openamp.data import (CorpusPaths, EmulationDataset, build_device_index,
+                          load_or_create_holdout, make_loader, manifest_signature)
 from openamp.emulate.models import arch_summary, build_model
 from openamp.emulate.wavenet import count_parameters
 from openamp.losses import (DEFAULT_LOSS, build_loss, device_loss_weights,
@@ -45,8 +44,9 @@ def _device_index(cfg: Config, ecfg, limit_devices: int | None):
     The ``holdout_frac`` device holdout is excluded first, then
     ``--limit-devices N`` keeps the first N (the mini-run).
     """
-    holdout = load_or_create_holdout(cfg, ecfg.holdout_frac, cfg.seed)
-    ids, _ = build_device_index(cfg, exclude=holdout)
+    paths = CorpusPaths.from_config(cfg)
+    holdout = load_or_create_holdout(paths, ecfg.holdout_frac, cfg.seed)
+    ids, _ = build_device_index(paths, exclude=holdout)
     if limit_devices:
         ids = ids[:int(limit_devices)]
     return ids, {d: i for i, d in enumerate(ids)}, holdout
@@ -66,14 +66,6 @@ def _conditioning(model, device_idx: torch.Tensor, noise_frac: float) -> torch.T
         return emb
     std = noise_frac * model.embedding_table().detach().std()
     return emb + torch.randn_like(emb) * std
-
-
-def _make_loader(ds, batch_size, workers, *, shuffle, seed, drop_last):
-    gen = torch.Generator()
-    gen.manual_seed(seed)
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=workers,
-                      drop_last=drop_last, pin_memory=True, generator=gen,
-                      persistent_workers=False)
 
 
 @torch.no_grad()
@@ -132,9 +124,10 @@ def overfit_one_batch(cfg: Config, *, name: str = "overfit", device: str = "cuda
     model = build_model(ecfg, len(ids)).to(dev)
     R = model.receptive_field
     clip = int(round(ecfg.clip_seconds * cfg.sample_rate))
-    ds = EmulationDataset(cfg, "train", receptive_field=R, id_to_idx=id_to_idx,
-                          clip_samples=clip, pairs_per_epoch=ecfg.batch_size, seed=cfg.seed)
-    loader = _make_loader(ds, ecfg.batch_size, 0, shuffle=False, seed=cfg.seed, drop_last=False)
+    ds = EmulationDataset(CorpusPaths.from_config(cfg), "train", receptive_field=R,
+                          id_to_idx=id_to_idx, clip_samples=clip,
+                          pairs_per_epoch=ecfg.batch_size, seed=cfg.seed)
+    loader = make_loader(ds, ecfg.batch_size, 0, shuffle=False, seed=cfg.seed, drop_last=False)
     batch = next(iter(loader))
     inp = batch["input"].to(dev)
     target = batch["target"].to(dev).unsqueeze(1)     # [B, 1, clip]
@@ -178,7 +171,8 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
     ids, id_to_idx, holdout_ids = _device_index(cfg, ecfg, limit_devices)
     if not ids:
         raise RuntimeError("No render-ok devices. Run `openamp render` first.")
-    manifest_sig = manifest_signature(cfg)
+    paths = CorpusPaths.from_config(cfg)
+    manifest_sig = manifest_signature(paths)
     model = build_model(ecfg, len(ids)).to(dev)
     R = model.receptive_field
     n_params = count_parameters(model)
@@ -200,13 +194,13 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         print(f"[model] embed_noise_frac={noise_frac:g}")
 
     # --- Data -------------------------------------------------------------------
-    train_ds = EmulationDataset(cfg, "train", receptive_field=R, id_to_idx=id_to_idx,
+    train_ds = EmulationDataset(paths, "train", receptive_field=R, id_to_idx=id_to_idx,
                                 clip_samples=clip, pairs_per_epoch=ecfg.pairs_per_epoch,
                                 seed=cfg.seed)
-    val_ds = EmulationDataset(cfg, "val", receptive_field=R, id_to_idx=id_to_idx,
+    val_ds = EmulationDataset(paths, "val", receptive_field=R, id_to_idx=id_to_idx,
                               clip_samples=clip, pairs_per_epoch=ecfg.val_pairs,
                               seed=cfg.seed + 999)
-    val_loader = _make_loader(val_ds, ecfg.batch_size, ecfg.num_workers,
+    val_loader = make_loader(val_ds, ecfg.batch_size, ecfg.num_workers,
                               shuffle=False, seed=cfg.seed + 999, drop_last=False)
     print(f"[data]  train_devices={len(train_ds.device_ids)} "
           f"val_devices={len(val_ds.device_ids)} pairs/epoch={ecfg.pairs_per_epoch}")
@@ -286,7 +280,7 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
     epoch = start_epoch - 1                         # defined even if the loop is empty
     for epoch in range(start_epoch, max_epochs):
         train_ds.seed = cfg.seed + epoch           # fresh window positions each epoch
-        loader = _make_loader(train_ds, ecfg.batch_size, ecfg.num_workers,
+        loader = make_loader(train_ds, ecfg.batch_size, ecfg.num_workers,
                               shuffle=True, seed=cfg.seed + epoch, drop_last=True)
         model.train()
         ep_loss = ep_esr = ep_stft = 0.0

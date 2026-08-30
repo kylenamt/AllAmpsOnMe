@@ -30,14 +30,14 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import Dataset
 
 from openamp.core import constants as C
 from openamp.core import manifest as manifests
 from openamp.core.config import Config, EmulateConfig
-from openamp.emulate.dataset import EmulationDataset, manifest_signature
+from openamp.data import (CorpusPaths, EmulationDataset, WetDryDataset,
+                          make_loader, manifest_signature)
 from openamp.emulate.evaluate import _SILENCE_DBFS, _resolve_device, load_model
-from openamp.emulate.train import GRAD_CLIP_NORM, _make_loader, evaluate_esr
+from openamp.emulate.train import GRAD_CLIP_NORM, evaluate_esr
 from openamp.losses import DEFAULT_LOSS, build_loss, pre_emphasis
 from openamp.emulate.wavenet import A2_EMBEDDING_STD
 
@@ -161,7 +161,8 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         ecfg.batch_size = int(batch_size)
     base_name = ck.get("name", run_dir.name)
-    manifest_sig = manifest_signature(cfg)
+    paths = CorpusPaths.from_config(cfg)
+    manifest_sig = manifest_signature(paths)
     if ck.get("manifest_sha256") and manifest_sig != ck["manifest_sha256"]:
         print("[enroll] WARNING: manifest changed since this run was trained — "
               "renders may not match what the network saw")
@@ -178,19 +179,19 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
           f"(skipped {len(skipped)}) pairs/device={pairs} batch={ecfg.batch_size} "
           f"lr={lr:g} init={init}")
 
-    train_ds = EmulationDataset(cfg, "train", receptive_field=R, id_to_idx=enroll_idx,
+    train_ds = EmulationDataset(paths, "train", receptive_field=R, id_to_idx=enroll_idx,
                                 clip_samples=clip, pairs_per_epoch=pairs * n, seed=seed)
-    val_ds = EmulationDataset(cfg, "val", receptive_field=R, id_to_idx=enroll_idx,
+    val_ds = EmulationDataset(paths, "val", receptive_field=R, id_to_idx=enroll_idx,
                               clip_samples=clip, pairs_per_epoch=ecfg.val_pairs,
                               seed=seed + 999)
-    val_loader = _make_loader(val_ds, ecfg.batch_size, ecfg.num_workers,
+    val_loader = make_loader(val_ds, ecfg.batch_size, ecfg.num_workers,
                               shuffle=False, seed=seed + 999, drop_last=False)
     test_loader = None
     try:
-        test_ds = EmulationDataset(cfg, "test", receptive_field=R, id_to_idx=enroll_idx,
+        test_ds = EmulationDataset(paths, "test", receptive_field=R, id_to_idx=enroll_idx,
                                    clip_samples=clip, pairs_per_epoch=test_pairs * n,
                                    seed=cfg.seed + 7)
-        test_loader = _make_loader(test_ds, ecfg.batch_size, ecfg.num_workers,
+        test_loader = make_loader(test_ds, ecfg.batch_size, ecfg.num_workers,
                                    shuffle=False, seed=cfg.seed + 7, drop_last=False)
     except RuntimeError:
         print("[enroll] no test renders for any enrolled device — test ESR will be NaN")
@@ -329,7 +330,7 @@ def _fit_embedding(model, ecfg: EmulateConfig, train_ds, val_loader, dev, *,
     best_epoch, since_improved, step, epoch = -1, 0, 0, -1
     for epoch in range(int(epochs)):
         train_ds.seed = seed + epoch         # fresh window positions each epoch
-        loader = _make_loader(train_ds, ecfg.batch_size, ecfg.num_workers,
+        loader = make_loader(train_ds, ecfg.batch_size, ecfg.num_workers,
                               shuffle=True, seed=seed + epoch, drop_last=False)
         ep_loss = ep_esr = ep_stft = 0.0
         n_steps = 0
@@ -379,57 +380,6 @@ def _fit_embedding(model, ecfg: EmulateConfig, train_ds, val_loader, dev, *,
 
 
 # --- Wet/dry pair enrollment (TONE3000-style captures; see the notebook) --------
-class WetDryDataset(Dataset):
-    """Random aligned windows from ONE in-memory wet/dry pair.
-
-    Same item contract as EmulationDataset. region bounds where targets are
-    drawn (left-context may reach before it). Bump seed per epoch for fresh windows.
-    """
-
-    def __init__(self, dry: np.ndarray, wet: np.ndarray, *, receptive_field: int,
-                 clip_samples: int, region: tuple[int, int] | None = None,
-                 pairs_per_epoch: int = 500, seed: int = 1234, row: int = 0):
-        if len(dry) != len(wet):
-            raise ValueError("dry/wet must be sample-aligned (equal length); "
-                             "use estimate_lag + trim first")
-        self.dry = np.ascontiguousarray(dry, dtype=np.float32)
-        self.wet = np.ascontiguousarray(wet, dtype=np.float32)
-        self.receptive_field = int(receptive_field)
-        self.clip_samples = int(clip_samples)
-        self.region = ((0, len(dry)) if region is None
-                       else (int(region[0]), int(region[1])))
-        if self.region[1] - self.region[0] < self.clip_samples:
-            raise ValueError(f"region {self.region} is shorter than one "
-                             f"{self.clip_samples}-sample clip")
-        self.pairs_per_epoch = int(pairs_per_epoch)
-        self.seed = int(seed)
-        self.row = int(row)
-
-    def __len__(self) -> int:
-        return self.pairs_per_epoch
-
-    def item_arrays(self, i: int) -> dict:
-        rng = np.random.default_rng((self.seed, int(i)))
-        R, clip = self.receptive_field, self.clip_samples
-        lo, hi = self.region
-        c = int(rng.integers(lo, hi - clip + 1))
-        s, pad = c - R, 0
-        if s < 0:
-            pad, s = -s, 0
-        inp = self.dry[s:c + clip]
-        if pad:
-            inp = np.concatenate([np.zeros(pad, dtype=np.float32), inp])
-        return {"input": inp, "target": self.wet[c:c + clip], "device_idx": self.row}
-
-    def __getitem__(self, i: int) -> dict:
-        a = self.item_arrays(i)
-        return {
-            "input": torch.from_numpy(np.ascontiguousarray(a["input"])),
-            "target": torch.from_numpy(np.ascontiguousarray(a["target"])),
-            "device_idx": torch.tensor(a["device_idx"], dtype=torch.long),
-        }
-
-
 def estimate_lag(dry: np.ndarray, wet: np.ndarray, *, max_lag: int = 4800,
                  probe_samples: int = 48_000 * 30, preemph: float = 0.95) -> int:
     """Coarse estimate of the samples wet trails dry (negative: early).
@@ -644,7 +594,7 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
     val_ds = WetDryDataset(dry, wet, receptive_field=R, clip_samples=clip,
                            region=val_region, pairs_per_epoch=val_pairs,
                            seed=seed + 999)
-    val_loader = _make_loader(val_ds, ecfg.batch_size, ecfg.num_workers,
+    val_loader = make_loader(val_ds, ecfg.batch_size, ecfg.num_workers,
                               shuffle=False, seed=seed + 999, drop_last=False)
 
     out_dir = run_dir / "enroll" / "pairs" / name

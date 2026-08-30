@@ -64,7 +64,6 @@ and hand the generator an embedding drawn from a distribution it never saw.
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
 
 import numpy as np

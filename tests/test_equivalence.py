@@ -107,14 +107,13 @@ def _config(tmp_path, **emulate) -> Config:
 
 # --- 1. Datasets: the RNG-order guard -------------------------------------------
 def test_dataset_items_are_unchanged(tmp_path, write_corpus):
-    from openamp.emulate.dataset import (DeviceGridDataset, EmulationDataset,
-                                         build_device_index)
-    from openamp.emulate.enroll import WetDryDataset
-    from openamp.joint_model.dataset import JointDataset
+    from openamp.data import (CorpusPaths, DeviceGridDataset, EmulationDataset,
+                              JointDataset, WetDryDataset, build_device_index)
 
     cfg = _config(tmp_path)
     write_corpus(cfg, DEVICES, samples=SAMPLES, splits=("train", "val", "test"))
-    _, id_to_idx = build_device_index(cfg)
+    paths = CorpusPaths.from_config(cfg)
+    _, id_to_idx = build_device_index(paths)
     common = dict(receptive_field=64, id_to_idx=id_to_idx, clip_samples=CLIP)
     out: dict = {}
 
@@ -124,13 +123,13 @@ def test_dataset_items_are_unchanged(tmp_path, write_corpus):
             for key, v in sorted(item.items()):
                 out[f"{tag}/{i}/{key}"] = _h(v)
 
-    record("emulation", EmulationDataset(cfg, "train", pairs_per_epoch=64, seed=SEED,
-                                         **common), range(6))
-    record("grid", DeviceGridDataset(cfg, "test", n_windows=3, seed=SEED, **common),
+    record("emulation", EmulationDataset(paths, "train", pairs_per_epoch=64,
+                                         seed=SEED, **common), range(6))
+    record("grid", DeviceGridDataset(paths, "test", n_windows=3, seed=SEED, **common),
            range(6))
     for mode in ("audio", "device"):
         record(f"joint_{mode}",
-               JointDataset(cfg, "train", ref_samples=REF, pairs_per_epoch=64,
+               JointDataset(paths, "train", ref_samples=REF, pairs_per_epoch=64,
                             seed=SEED, ref_mode=mode, **common), range(6))
 
     rng = np.random.default_rng(0)
