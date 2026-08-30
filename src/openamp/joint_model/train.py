@@ -526,7 +526,7 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
             print(f"[nan-guard] epoch {epoch:02d}: non-finite val ESR — reloaded best "
                   f"(epoch {ck['epoch']}, val_esr={float(ck['val_esr']):.5f}); {note}")
             _log_row(log_path, epoch, step, tr_loss, tr_esr, tr_stft, val_esr, shuf,
-                     spread, opt, t0)
+                     hold, spread, opt, t0)
             continue
         if use_amp and not np.isfinite(tr_loss):
             use_amp, scaler = False, torch.amp.GradScaler("cuda", enabled=False)

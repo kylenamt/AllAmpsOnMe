@@ -333,7 +333,8 @@ def emulate(config_path, device, epochs, resume, overfit, limit_devices) -> None
     cfg = _config(config_path)
     name = _emulate_name(config_path)
     if overfit:
-        emu_train.overfit_one_batch(cfg, name=name, device=device)
+        emu_train.overfit_one_batch(cfg, name=name, device=device,
+                                    limit_devices=limit_devices or 8)
         return
     emu_train.train(cfg, name=name, device=device, epochs=epochs, resume=resume,
                     limit_devices=limit_devices)
