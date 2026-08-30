@@ -491,7 +491,7 @@ def test_wavenet_matches_nam_a2_reference(activation, nam_activation, cond_hidde
 
 # --- Losses --------------------------------------------------------------------
 def test_esr_zero_for_identical_and_large_for_random():
-    from openamp.emulate.train import esr, preemph_esr
+    from openamp.losses import esr, preemph_esr
 
     t = torch.randn(4, 1, 2000)
     assert esr(t, t).item() == pytest.approx(0.0, abs=1e-6)
@@ -501,7 +501,7 @@ def test_esr_zero_for_identical_and_large_for_random():
 
 def test_emulation_loss_orders_aligned_below_random():
     pytest.importorskip("auraloss")
-    from openamp.emulate.train import EmulationLoss
+    from openamp.losses import EmulationLoss
 
     L = EmulationLoss(0.85, 1.0)
     t = torch.randn(2, 1, 8192)                       # >= STFT window
@@ -509,6 +509,36 @@ def test_emulation_loss_orders_aligned_below_random():
     bad, _ = L(torch.randn(2, 1, 8192), t)
     assert good.item() < bad.item()
     assert good.item() == pytest.approx(0.0, abs=1e-5)
+
+
+def test_device_loss_weights_equalize_render_power(tmp_path):
+    """strength=1 must make w[d] * p[d] constant — that is the whole point of the
+    knob, and it reads the renders manifest by path, not through a Config."""
+    import pandas as pd
+
+    from openamp.core import constants as C
+    from openamp.core import manifest as manifests
+    from openamp.losses import device_loss_weights
+
+    path = tmp_path / "renders.parquet"
+    rows = [{"device_id": d, "file_id": "f0", "split": C.SPLIT_TRAIN,
+             "status": C.RENDER_OK, "out_rms_db": db}
+            for d, db in ((0, -10.0), (1, -20.0), (2, -30.0))]
+    manifests.write_manifest(
+        manifests.ensure_schema(pd.DataFrame(rows), manifests.RENDERS_COLUMNS), path)
+
+    assert list(device_loss_weights(path, [0, 1, 2], 0.0)) == [1.0, 1.0, 1.0]
+    w = device_loss_weights(path, [0, 1, 2], 1.0)
+    assert w.mean() == pytest.approx(1.0)                # magnitude preserved
+    power = np.asarray([10.0 ** (db / 10.0) for db in (-10.0, -20.0, -30.0)])
+    contribution = w * power
+    assert contribution.std() / contribution.mean() < 1e-9
+    # A device with no train-split row falls back to a raw weight of 1.0 — i.e.
+    # it is treated as 0 dBFS, so it ends up 1/10 of device 0's (-10 dB -> raw
+    # 10). The fallback happens before the mean-normalization, so the final
+    # number is 1/mean rather than the 1.0 the log line prints.
+    w2 = device_loss_weights(path, [0, 1, 99], 1.0)
+    assert w2[2] / w2[0] == pytest.approx(0.1)
 
 
 # --- Dataset: tiny real corpus + renders on disk -------------------------------

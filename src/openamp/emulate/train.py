@@ -1,9 +1,9 @@
 """One training script for the amp foundation models.
 
 - Trains the configured architecture (emulate.arch, built by
-  openamp.emulate.models.build_model) on EmulationDataset: pre-emphasized ESR
-  + multi-resolution STFT (auraloss), 1:1; Adam, reduce-on-plateau, early
-  stopped at the val-ESR plateau. Plain single-GPU PyTorch.
+  openamp.emulate.models.build_model) on EmulationDataset against the objective
+  from openamp.losses; Adam, reduce-on-plateau, early stopped at the val-ESR
+  plateau. Plain single-GPU PyTorch.
 - Every run writes to results/emulate/<name>/: best/last checkpoints, a copy
   of the config, metrics.json, train_log.csv (per-epoch train/val curves).
 - Sanity ladder before any long job: overfit_one_batch (one batch -> ESR ~0),
@@ -21,82 +21,21 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-import auraloss
 import numpy as np
 import torch
-from torch import nn
 from torch.utils.data import DataLoader
 
-from openamp.core import constants as C
-from openamp.core import manifest as manifests
 from openamp.core.config import Config
 from openamp.emulate.dataset import (EmulationDataset, build_device_index,
-                                     load_or_create_holdout, manifest_signature,
-                                     render_ok_devices)
+                                     load_or_create_holdout, manifest_signature)
 from openamp.emulate.models import arch_summary, build_model
 from openamp.emulate.wavenet import count_parameters
+from openamp.losses import (DEFAULT_LOSS, build_loss, device_loss_weights,
+                            pre_emphasis)
 
 # Safety net for loss spikes, not a training knob: healthy grad norms on this
 # model sit at p50~4, p90~7, so 20 leaves normal steps untouched.
 GRAD_CLIP_NORM = 20.0
-
-
-# --- Losses --------------------------------------------------------------------
-def pre_emphasis(x: torch.Tensor, coeff: float) -> torch.Tensor:
-    """1st-order pre-emphasis ``y[n] = x[n] - coeff * x[n-1]`` (last-dim FIR)."""
-    return x[..., 1:] - coeff * x[..., :-1]
-
-
-def esr(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8,
-        weights: torch.Tensor | None = None) -> torch.Tensor:
-    """Energy-weighted error-to-signal ratio ``sum||e||^2 / sum||t||^2`` over the batch.
-
-    Pooled as one ratio of sums, not a mean of per-window ratios: window target
-    energy spans ~8 orders of magnitude (near-silent passages in clean guitar),
-    so per-window ratios would let a handful of quiet windows dominate the batch.
-
-    ``weights`` [B] scales each item's numerator and denominator before the sums
-    -- identical to scaling that item's audio by ``sqrt(w)``, but confined to
-    this term. It is how :func:`device_loss_weights` offsets the corpus's output-
-    level spread without reintroducing the per-window blow-up above. ``None``
-    (the default) leaves the pooling untouched.
-    """
-    num = torch.sum((pred - target) ** 2, dim=-1)
-    den = torch.sum(target ** 2, dim=-1)
-    if weights is not None:
-        w = weights.reshape(-1, *([1] * (num.dim() - 1))).to(num.dtype)
-        num, den = num * w, den * w
-    return num.sum() / (den.sum() + eps)
-
-
-def preemph_esr(pred: torch.Tensor, target: torch.Tensor, coeff: float,
-                eps: float = 1e-8,
-                weights: torch.Tensor | None = None) -> torch.Tensor:
-    """ESR on pre-emphasized signals — weights the high end amps distort most."""
-    return esr(pre_emphasis(pred, coeff), pre_emphasis(target, coeff), eps,
-               weights=weights)
-
-
-class EmulationLoss(nn.Module):
-    """Pre-emphasized ESR + multi-resolution STFT (auraloss), summed 1:1 (spec §4.2)."""
-
-    def __init__(self, preemph_coeff: float = 0.85, stft_weight: float = 1.0):
-        super().__init__()
-        self.coeff = float(preemph_coeff)
-        self.stft_weight = float(stft_weight)
-        self.mrstft = auraloss.freq.MultiResolutionSTFTLoss()
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor,
-                weights: torch.Tensor | None = None):
-        """``pred``/``target`` are ``[B, 1, T]``; returns ``(loss, parts)``.
-
-        ``weights`` [B] reaches the ESR term only (see :func:`esr`). The MRSTFT
-        term is deliberately left unweighted -- see :func:`device_loss_weights`.
-        """
-        esr_term = preemph_esr(pred, target, self.coeff, weights=weights)
-        stft_term = self.mrstft(pred, target)
-        loss = esr_term + self.stft_weight * stft_term
-        return loss, {"esr": float(esr_term.item()), "stft": float(stft_term.item())}
 
 
 # --- Data plumbing -------------------------------------------------------------
@@ -127,60 +66,6 @@ def _conditioning(model, device_idx: torch.Tensor, noise_frac: float) -> torch.T
         return emb
     std = noise_frac * model.embedding_table().detach().std()
     return emb + torch.randn_like(emb) * std
-
-
-def device_loss_weights(cfg: Config, ids: list[int], strength: float) -> np.ndarray:
-    """Per-device ESR weights that offset the corpus's output-level spread.
-
-    The ESR term pools error and signal energy over the whole batch
-    (:func:`esr`), and devices are drawn uniformly, so a device's share of the
-    gradient tracks its own render power. Measured on data_mixed: median render
-    level spans -41.8..-4.9 dBFS (~37 dB, ~5000x in power), and the quietest
-    half of the 404 devices carry ~14% of the pooled signal between them.
-
-    ``w[d] = p[d] ** -strength``, where ``p[d]`` is the device's median render
-    power over the *train* split (the rows the loss actually sees). strength=0
-    gives every device weight 1 (the pooled loss exactly as before); strength=1
-    equalizes every device's expected contribution.
-
-    Weights are normalized to mean 1 so the loss keeps its magnitude -- and lr
-    its meaning -- as ``strength`` changes. Devices with no train-split
-    ``render_ok`` row fall back to 1.0.
-
-    The same weights are applied to val ESR (:func:`evaluate_esr`), so the
-    checkpoint/plateau/early-stop criteria score what the run optimizes. The
-    unweighted pooled metric is near-blind here: a 30% gain on the 100 quietest
-    devices moves it -1.8%, against ~0.3% epoch-to-epoch noise, and a 5% cost on
-    the loudest flips its sign. A non-zero strength therefore makes val ESR
-    incomparable with a strength-0 run -- compare per-device ESR across runs.
-
-    Only the ESR term is weighted. MRSTFT is left alone: its log-magnitude
-    sub-term is already scale-invariant, and while auraloss's spectral-
-    convergence sub-term pools batch-globally the same way ESR does, reweighting
-    inside a third-party loss is a separate change from the one this knob makes.
-    """
-    n = len(ids)
-    w = np.ones(n, dtype=np.float64)
-    if strength == 0.0:
-        return w
-
-    renders = manifests.read_manifest(cfg.renders_manifest_path, manifests.RENDERS_COLUMNS)
-    ok = renders[(renders["status"] == C.RENDER_OK) & (renders["split"] == C.SPLIT_TRAIN)]
-    rms_db = ok.groupby("device_id")["out_rms_db"].median() if not ok.empty else {}
-
-    missing = []
-    for i, d in enumerate(ids):
-        v = rms_db.get(int(d), np.nan) if len(rms_db) else np.nan
-        if not np.isfinite(v):
-            missing.append(int(d))
-            continue
-        w[i] = 10.0 ** (-strength * float(v) / 10.0)     # power**-strength
-    w /= w.mean()
-    if missing:
-        print(f"[loss]  {len(missing)} device(s) have no train-split render level "
-              f"— weight 1.0: {missing[:8]}{' ...' if len(missing) > 8 else ''}",
-              flush=True)
-    return w
 
 
 def _make_loader(ds, batch_size, workers, *, shuffle, seed, drop_last):
@@ -255,7 +140,8 @@ def overfit_one_batch(cfg: Config, *, name: str = "overfit", device: str = "cuda
     target = batch["target"].to(dev).unsqueeze(1)     # [B, 1, clip]
     di = batch["device_idx"].to(dev)
 
-    lossfn = EmulationLoss(ecfg.preemph, ecfg.stft_weight).to(dev)
+    lossfn = build_loss(DEFAULT_LOSS, preemph_coeff=ecfg.preemph,
+                        stft_weight=ecfg.stft_weight).to(dev)
     opt = torch.optim.Adam(model.parameters(), lr=ecfg.lr)
     print(f"[overfit] devices={len(ids)} params={count_parameters(model):,} "
           f"receptive_field={R} ({1000 * R / cfg.sample_rate:.1f} ms)")
@@ -326,14 +212,16 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
           f"val_devices={len(val_ds.device_ids)} pairs/epoch={ecfg.pairs_per_epoch}")
 
     # --- Optim / loss / bookkeeping --------------------------------------------
-    lossfn = EmulationLoss(ecfg.preemph, ecfg.stft_weight).to(dev)
+    lossfn = build_loss(DEFAULT_LOSS, preemph_coeff=ecfg.preemph,
+                        stft_weight=ecfg.stft_weight).to(dev)
     # Per-device ESR weighting, applied to the train loss and val ESR alike.
     if ecfg.device_loss_weighting < 0.0:
         raise ValueError("emulate.device_loss_weighting must be >= 0, got "
                          f"{ecfg.device_loss_weighting}")
     dev_w = None
     if ecfg.device_loss_weighting > 0.0:
-        _w = device_loss_weights(cfg, ids, float(ecfg.device_loss_weighting))
+        _w = device_loss_weights(cfg.renders_manifest_path, ids,
+                                 float(ecfg.device_loss_weighting))
         dev_w = torch.as_tensor(_w, dtype=torch.float32, device=dev)
         print(f"[loss]  device_loss_weighting={ecfg.device_loss_weighting:g} "
               f"weights min={_w.min():.4g} p50={np.median(_w):.4g} "

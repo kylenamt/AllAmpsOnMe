@@ -37,8 +37,8 @@ from openamp.core import manifest as manifests
 from openamp.core.config import Config, EmulateConfig
 from openamp.emulate.dataset import EmulationDataset, manifest_signature
 from openamp.emulate.evaluate import _SILENCE_DBFS, _resolve_device, load_model
-from openamp.emulate.train import (GRAD_CLIP_NORM, EmulationLoss, _make_loader,
-                                   evaluate_esr, pre_emphasis)
+from openamp.emulate.train import GRAD_CLIP_NORM, _make_loader, evaluate_esr
+from openamp.losses import DEFAULT_LOSS, build_loss, pre_emphasis
 from openamp.emulate.wavenet import A2_EMBEDDING_STD
 
 ENROLL_LR = 1e-2                 # only embeddings train (the table trained at 5e-4-2e-3 with the network)
@@ -318,7 +318,8 @@ def _fit_embedding(model, ecfg: EmulateConfig, train_ds, val_loader, dev, *,
     Returns (best_emb, best_val, best_epoch, epochs_run).
     """
     R = model.receptive_field
-    lossfn = EmulationLoss(ecfg.preemph, ecfg.stft_weight).to(dev)
+    lossfn = build_loss(DEFAULT_LOSS, preemph_coeff=ecfg.preemph,
+                        stft_weight=ecfg.stft_weight).to(dev)
     opt = torch.optim.Adam(model.embedding.parameters(), lr=lr,
                            weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(

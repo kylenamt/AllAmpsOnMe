@@ -43,8 +43,9 @@ import torch.nn.functional as F
 from openamp.core.config import Config
 from openamp.emulate.dataset import manifest_signature
 from openamp.emulate.wavenet import count_parameters
-from openamp.emulate.train import (GRAD_CLIP_NORM, EmulationLoss, _device_index,
-                                   _make_loader, device_loss_weights, pre_emphasis)
+from openamp.emulate.train import GRAD_CLIP_NORM, _device_index, _make_loader
+from openamp.losses import (DEFAULT_LOSS, build_loss, device_loss_weights,
+                            pre_emphasis)
 from openamp.joint_model.dataset import JointDataset
 from openamp.joint_model.model import build_joint, load_joint
 
@@ -237,7 +238,8 @@ def overfit_one_batch(cfg: Config, *, name: str = "overfit", device: str = "cuda
     target = b["target"].to(dev).unsqueeze(1)
     ref = b["ref"].to(dev)
 
-    lossfn = EmulationLoss(ecfg.preemph, ecfg.stft_weight).to(dev)
+    lossfn = build_loss(DEFAULT_LOSS, preemph_coeff=ecfg.preemph,
+                        stft_weight=ecfg.stft_weight).to(dev)
     opt = _optimizer(model, ecfg, jcfg)
     print(f"[overfit] devices={len(ids)} batch={batch} "
           f"encoder={count_parameters(model.encoder):,} "
@@ -286,7 +288,8 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
                          f"{ecfg.device_loss_weighting}")
     dev_w = None
     if ecfg.device_loss_weighting > 0.0:
-        _w = device_loss_weights(cfg, ids, float(ecfg.device_loss_weighting))
+        _w = device_loss_weights(cfg.renders_manifest_path, ids,
+                                 float(ecfg.device_loss_weighting))
         dev_w = torch.as_tensor(_w, dtype=torch.float32, device=dev)
         print(f"[loss]  device_loss_weighting={ecfg.device_loss_weighting:g} "
               f"weights min={_w.min():.4g} p50={np.median(_w):.4g} "
@@ -386,7 +389,8 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         print(f"[data]  holdout probe: {len(holdout_ds.device_ids)} unseen devices")
 
     # --- Optim / loss / bookkeeping --------------------------------------------
-    lossfn = EmulationLoss(ecfg.preemph, ecfg.stft_weight).to(dev)
+    lossfn = build_loss(DEFAULT_LOSS, preemph_coeff=ecfg.preemph,
+                        stft_weight=ecfg.stft_weight).to(dev)
     opt = _optimizer(model, ecfg, jcfg)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode="min", factor=ecfg.plateau_factor, patience=ecfg.plateau_patience)

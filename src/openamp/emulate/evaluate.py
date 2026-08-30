@@ -30,7 +30,6 @@ import torch
 from openamp.core.config import Config, EmulateConfig
 from openamp.emulate.dataset import EmulationDataset
 from openamp.emulate.models import arch_summary, build_model
-from openamp.emulate.train import esr, pre_emphasis
 
 # One row of the comparison CSV, in order (spec §3).
 COMPARISON_COLUMNS = [
