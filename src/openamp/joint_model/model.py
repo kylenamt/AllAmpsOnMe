@@ -23,6 +23,7 @@ from torch import nn
 from openamp.core.config import EmulateConfig, JointConfig
 from openamp.emulate.models import ENROLLABLE_ARCHS, build_model
 from openamp.joint_model.fingerprint_encoder import FingerprintEncoder
+from openamp.joint_model.frame_encoder import FrameAttentionEncoder
 from openamp.joint_model.wavenet_encoder import WaveNetEncoder
 
 __all__ = ["JointModel", "build_joint", "load_joint"]
@@ -85,8 +86,14 @@ def build_joint(ecfg: EmulateConfig, jcfg: JointConfig, n_devices: int) -> Joint
     if not hasattr(generator, "forward_emb"):
         raise ValueError(f"emulate.arch {ecfg.arch!r} has no forward_emb path")
     generator.embedding.weight.requires_grad_(False)
+    if getattr(generator, "embed_normalize", False):
+        # The encoder produces the effective embedding itself (jcfg.enc_normalize),
+        # so the table's radius must not train here either.
+        generator.embed_scale.requires_grad_(False)
     if jcfg.enc_kind == "fingerprint":
         encoder = FingerprintEncoder.from_config(jcfg, generator.embedding_dim)
+    elif jcfg.enc_kind == "dac_frames":
+        encoder = FrameAttentionEncoder.from_config(jcfg, generator.embedding_dim)
     else:
         encoder = WaveNetEncoder.from_config(jcfg, generator.embedding_dim)
     return JointModel(encoder, generator)

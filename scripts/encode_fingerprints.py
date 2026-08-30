@@ -68,7 +68,6 @@ def load_encoder(name: str, device):
     """Return ``(frozen_module, target_sample_rate, samples_per_frame)``."""
     import torch
     import transformers
-
     spec = ENCODERS[name]
     model = getattr(transformers, spec["cls"]).from_pretrained(spec["id"])
     model = model.eval().to(device)

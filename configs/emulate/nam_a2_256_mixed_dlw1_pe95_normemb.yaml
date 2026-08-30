@@ -1,0 +1,81 @@
+# nam_a2_256_mixed_dlw1_pe95 + unit-sphere embeddings.
+# Run name = file stem.
+#
+#   OPENAMP_DATA_DIR=data_mixed openamp emulate --config configs/emulate/nam_a2_256_mixed_dlw1_pe95_normemb.yaml
+#
+# THE ENV VAR IS PART OF THE RECIPE. Without OPENAMP_DATA_DIR=data_mixed this
+# trains on the sweep-free EGDB corpus over 405 devices under this name.
+#
+# IDENTICAL to nam_a2_256_mixed_dlw1_pe95 except embed_normalize: true. That
+# reads the table as e = embed_scale * normalize(row): each device's direction
+# lives on the unit sphere and the magnitude is ONE global learned scalar,
+# instead of 404 free radii. Measured on nam_a2_256_mixed's trained table the
+# per-device radius carries nothing worth keeping -- corr(||e||, loudness)
+# = -0.02, corr(||e||, test ESR) = +0.10, flat across gain buckets, and the
+# table already sits in a shell (radius 4.04-4.93 at p25-p75). embed_scale
+# inits at 0.1*sqrt(256) = 1.6, the raw table's own init magnitude, so the
+# starting point does not move.
+#
+# This is a REPARAMETERIZATION, not added capacity: {s*u} spans the same R^256
+# and FiLM is affine in e, so it cannot improve the best achievable one-to-many
+# ESR. Judge it on enrollment and zero-shot placement, plus whether embed_scale
+# lands near the ~4.49 radius the unnormalized table drifted to on its own.
+#
+# CHANGES relative to nam_a2_256_mixed (best_val_esr 0.08762):
+#   1. device_loss_weighting: 1.0 (was 0.0, the default). The ESR term pools
+#      error and signal energy over the whole batch, so a device's share of the
+#      gradient tracks its own render power -- and median render level spans
+#      -41.8..-4.9 dBFS across this corpus (~5000x in power). Measured on
+#      nam_a2_256_mixed: the quietest 202 of 404 devices carried 14.0% of the
+#      pooled signal between them, and per-device test ESR correlates with
+#      device level at r=-0.27 (p=3.5e-8). At strength 1 every device
+#      contributes exactly 1/404 -- w[d]=p[d]^-1 makes w[d]*p[d] constant, so
+#      the 42.8x max weight cancels that device being 42.8x quieter rather than
+#      letting it dominate. Full equalization is the clean endpoint; 0.5 is the
+#      fallback if this overshoots.
+#   2. preemph: 0.95 (was 0.85).
+#   3. plateau_factor: 0.75 (was 0.5) -- gentler anneal, more/smaller lr steps.
+#   4. epochs: 400 (was 100). NOTE: early_stop_patience is unchanged at 8, and
+#      with factor 0.75 each plateau event cuts lr only 25%, so early stop is
+#      likely to end this run well before epoch 400. Raise early_stop_patience
+#      if the intent is to force the full schedule.
+#   5. lr: 4.0e-3 -- the value nam_a2_256_mixed actually STARTED at (see its
+#      config_history.jsonl). That file's lr now reads 6.3e-5 because it was
+#      hand-annealed across two resumes; copying it would start this run 63x
+#      too low. Same reason nam_a2_256_mixed_n10.yaml now reads 6.25e-5.
+#
+# val ESR is weighted at the same strength, so best_val_esr here is NOT
+# comparable with nam_a2_256_mixed's 0.08762 -- at strength 1 it IS the plain
+# mean of per-device ESR, a different metric. Compare per_device_esr.csv
+# (spread + tail), which is weighting-invariant.
+#
+# Corpus/device notes are inherited from nam_a2_256_mixed.yaml: 88 EGDB files +
+# the TONE3000 v3 capture signal, 404 devices (486 held out), A1 captures.
+
+emulate:
+  # --- Model -------------------------------------------------------------------
+  arch: film_wavenet
+  wn_channels: 8           # A2 full-width submodel
+  embedding_dim: 256
+  single_device: -1        # -1 = one-to-many over all render-ok devices
+
+  # --- Training ----------------------------------------------------------------
+  holdout_frac: 0.1
+  clip_seconds: 2.0        # must match the corpus clip grid
+  batch_size: 32
+  pairs_per_epoch: 50000
+  epochs: 400              # early-stop still ends it sooner (see note 4 above)
+  lr: 4.0e-4                # keep the decimal point -- PyYAML reads bare 4e-4 as a string.
+  weight_decay: 3.17e-7
+  plateau_patience: 3
+  plateau_factor: 0.9      # very gentle anneal (0.5 in nam_a2_256_mixed)
+  early_stop_patience: 999
+  stft_weight: 0.05        # held at nam_a2_256_mixed's value
+  preemph: 0.95            # CHANGED from 0.85
+  device_loss_weighting: 1.0   # per-device ESR weighting (train loss + val ESR)
+  embed_normalize: true        # NEW: e = embed_scale * normalize(row)
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50

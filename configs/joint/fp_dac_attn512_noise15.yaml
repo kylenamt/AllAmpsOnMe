@@ -1,0 +1,123 @@
+# fp_dac_attn512 + train-time jitter on the embedding. Run name is the file
+# stem -> results/joint/fp_dac_attn512_noise15/.
+#
+#   OPENAMP_DATA_DIR=data openamp joint --config configs/joint/fp_dac_attn512_noise15.yaml
+#   OPENAMP_DATA_DIR=data openamp joint-eval results/joint/fp_dac_attn512_noise15
+#
+# The single change from fp_dac_attn512.yaml (this file is a copy of it):
+# emulate.embed_noise_frac 0.0 -> 0.15. Generator, pooling, frames, schedule and
+# device_loss_weighting are all unchanged, so any difference in outcome traces
+# to the jitter and nothing else. Sweep partners: fp_dac_attn512_noise05, fp_dac_attn512_noise30.
+#
+# What it treats. fp_dac_delta512 ran 300 epochs and ended with seen val ESR
+# 0.121 while holdout ESR *rose*, 0.98 -> 1.077, against a zero-conditioning
+# floor of 1.117; the shuffled ratio went x1.2 -> x15.4 over the same run. That
+# is a generator depending enormously on e while the encoder holds 405
+# memorized coordinates -- 405 isolated wells with nothing decodable between
+# them, so an unseen amp lands in dead space however well it is placed. Jitter
+# forces a *neighbourhood* of each embedding to decode, which is the
+# precondition for the space between amps meaning anything at all. Nothing in
+# any joint run so far has applied that pressure: joint_model/train.py did not
+# read embed_noise_frac until this sweep needed it, though the field has been
+# on EmulateConfig and reachable from every joint config the whole time.
+#
+# Why the scale is not emulate/train.py's. There the noise std is a fraction of
+# the embedding *table*'s std, and a joint run has no trainable table -- the
+# conditioning is whatever the encoder emits that step. With enc_normalize:
+# true, e is a unit vector, so joint_model.train.jitter reads the fraction
+# against 1/sqrt(512) and re-projects onto the sphere: a plain additive
+# perturbation would mostly move |e|, an axis the generator never sees vary, so
+# it would change drive level instead of teaching anything. At 0.15 that is a
+# mean ||de|| of ~0.15 on a unit vector (cos ~0.989 to the clean embedding).
+#
+# Train steps only. val, shuffled and holdout all score clean embeddings, so
+# these numbers stay comparable with fp_dac_attn512's.
+#
+# Read against fp_dac_attn512 at the same epoch, not against fp_dac_delta512 --
+# device_loss_weighting differs between those two. Success is holdout ESR below
+# 1.077 *and* the shuffled ratio coming down from x15.4; a smooth generator is
+# less brittle to a wrong e, so the two should move together.
+
+emulate:
+  # --- Model: delta_a2_tanh_r32_512, unchanged -------------------------------
+  arch: delta_wavenet
+  wn_channels: 8
+  wn_activation: tanh
+  embedding_dim: 512
+  single_device: -1
+  delta_rank: 32
+
+  # --- Training: fp_dac_delta512's original fresh-start schedule, not its
+  # later hand-annealed resume state -- this is a new run and should get a
+  # normal schedule, not one tuned to a different run's trajectory. -----------
+  holdout_frac: 0.1
+  clip_seconds: 2.0
+  batch_size: 32
+  pairs_per_epoch: 50000
+  epochs: 150
+  lr: 4.0e-3
+  weight_decay: 3.17e-7
+  plateau_patience: 3
+  plateau_factor: 0.5
+  early_stop_patience: 15
+  stft_weight: 0.05
+  preemph: 0.85
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50
+  # NEW vs fp_dac_delta512 (which ran at the 0.0 default): equalizes each
+  # device's expected share of the pooled ESR gradient instead of letting it
+  # track render power. joint_model/train.py did not read this field at all
+  # until this run needed it -- see its device_loss_weighting wiring, forked
+  # from emulate.train's. Not comparable against a strength-0 val_esr; per the
+  # holdout note there, the holdout probe stays unweighted regardless.
+  device_loss_weighting: 1.0
+  # NEW vs fp_dac_attn512 -- the one field this file changes. See the
+  # header for why the scale is 1/sqrt(512) on the sphere, not the
+  # table std emulate/train.py uses.
+  embed_noise_frac: 0.15
+
+joint:
+  # --- Conditioning source: the one thing this config changes -----------------
+  enc_kind: dac_frames
+  # openamp.encoder.extract's output: per-device [~14700, 1024] fp16 frame
+  # shards, memmapped and looked up by device id -- same lookup design as
+  # enc_kind: fingerprint, for the same reason (a codec fingerprint needs long
+  # audio to be reliable; a joint reference window is 2 s).
+  fp_frames_path: results/dac_frames/sweep_train
+
+  # --- Adapter: pool + projection, both trained ------------------------------
+  # CrossAttentionPool(latent_dim=1024, n_queries, d_model) -> pooled
+  # n_queries*d_model -> proj (Linear -> tanh -> Linear) -> 512. Same
+  # projection shape FingerprintEncoder and WaveNetEncoder both use, so this
+  # arm differs from the fingerprint arm in exactly one place: a trained pool
+  # stands where a frozen mean+std vector was looked up.
+  # 8x64=512, not probe.py's own 4x64=256 default: the fingerprint arm pools to
+  # 2048-d (ceiling exactly embedding_dim=512), so leaving this at 256 would
+  # hand the comparison a capacity handicap that has nothing to do with the
+  # pooling method being tested.
+  enc_pool_queries: 8
+  enc_pool_dim: 64
+  enc_proj_hidden: 128
+  enc_activation: tanh
+  # ON, for the same reason fp_dac_delta512 turns it on: nothing else bounds
+  # |e| and the reconstruction gradient inflates it.
+  enc_normalize: true
+  enc_lr: 5.0e-4
+  enc_weight_decay: 1.0e-4
+
+  # --- Inert under enc_kind: dac_frames --------------------------------------
+  # fp_path / fp_preprocess / fp_layernorm belong to enc_kind: fingerprint and
+  # do nothing here -- dac_frames has no precomputed pooled vector to look up
+  # and no dry row to subtract (extract.py keeps wet frames only). Left at
+  # their JointConfig defaults rather than restated.
+  ref_seconds: 2.0
+  ref_different_file: true
+  ref_min_gap_seconds: 1.0
+  sources: []
+  enc_channels: 16
+  enc_attn_hidden: 64
+  enc_head: stats
+  grad_checkpoint_encoder: false

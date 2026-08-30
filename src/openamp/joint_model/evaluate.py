@@ -48,9 +48,14 @@ DEFAULT_WINDOWS = 8          # reference segments per device for the geometry pa
 
 
 def ref_mode_for_ck(ck: dict) -> str:
-    """Reference kind a checkpoint's conditioning source needs."""
-    return ("device" if ck.get("joint_cfg", {}).get("enc_kind", "wavenet") == "fingerprint"
-            else "audio")
+    """Reference kind a checkpoint's conditioning source needs.
+
+    Mirrors :func:`openamp.joint_model.train.ref_mode_for`, off the checkpoint's
+    stored config rather than a live one.
+    """
+    return ("device"
+           if ck.get("joint_cfg", {}).get("enc_kind", "wavenet") in ("fingerprint", "dac_frames")
+           else "audio")
 
 
 def _dataset(cfg: Config, ck: dict, device_ids, *, split: str, pairs: int, seed: int):

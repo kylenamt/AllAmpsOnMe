@@ -27,6 +27,8 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
+from openamp.core import constants as C
+from openamp.core import manifest as manifests
 from openamp.core.config import Config
 from openamp.emulate.dataset import (EmulationDataset, build_device_index,
                                      load_or_create_holdout, manifest_signature,
@@ -45,22 +47,34 @@ def pre_emphasis(x: torch.Tensor, coeff: float) -> torch.Tensor:
     return x[..., 1:] - coeff * x[..., :-1]
 
 
-def esr(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def esr(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8,
+        weights: torch.Tensor | None = None) -> torch.Tensor:
     """Energy-weighted error-to-signal ratio ``sum||e||^2 / sum||t||^2`` over the batch.
 
     Pooled as one ratio of sums, not a mean of per-window ratios: window target
     energy spans ~8 orders of magnitude (near-silent passages in clean guitar),
     so per-window ratios would let a handful of quiet windows dominate the batch.
+
+    ``weights`` [B] scales each item's numerator and denominator before the sums
+    -- identical to scaling that item's audio by ``sqrt(w)``, but confined to
+    this term. It is how :func:`device_loss_weights` offsets the corpus's output-
+    level spread without reintroducing the per-window blow-up above. ``None``
+    (the default) leaves the pooling untouched.
     """
     num = torch.sum((pred - target) ** 2, dim=-1)
     den = torch.sum(target ** 2, dim=-1)
+    if weights is not None:
+        w = weights.reshape(-1, *([1] * (num.dim() - 1))).to(num.dtype)
+        num, den = num * w, den * w
     return num.sum() / (den.sum() + eps)
 
 
 def preemph_esr(pred: torch.Tensor, target: torch.Tensor, coeff: float,
-                eps: float = 1e-8) -> torch.Tensor:
+                eps: float = 1e-8,
+                weights: torch.Tensor | None = None) -> torch.Tensor:
     """ESR on pre-emphasized signals — weights the high end amps distort most."""
-    return esr(pre_emphasis(pred, coeff), pre_emphasis(target, coeff), eps)
+    return esr(pre_emphasis(pred, coeff), pre_emphasis(target, coeff), eps,
+               weights=weights)
 
 
 class EmulationLoss(nn.Module):
@@ -72,9 +86,14 @@ class EmulationLoss(nn.Module):
         self.stft_weight = float(stft_weight)
         self.mrstft = auraloss.freq.MultiResolutionSTFTLoss()
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor):
-        """``pred``/``target`` are ``[B, 1, T]``; returns ``(loss, parts)``."""
-        esr_term = preemph_esr(pred, target, self.coeff)
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                weights: torch.Tensor | None = None):
+        """``pred``/``target`` are ``[B, 1, T]``; returns ``(loss, parts)``.
+
+        ``weights`` [B] reaches the ESR term only (see :func:`esr`). The MRSTFT
+        term is deliberately left unweighted -- see :func:`device_loss_weights`.
+        """
+        esr_term = preemph_esr(pred, target, self.coeff, weights=weights)
         stft_term = self.mrstft(pred, target)
         loss = esr_term + self.stft_weight * stft_term
         return loss, {"esr": float(esr_term.item()), "stft": float(stft_term.item())}
@@ -98,6 +117,76 @@ def _device_index(cfg: Config, ecfg, limit_devices: int | None):
     return ids, {d: i for i, d in enumerate(ids)}, holdout
 
 
+def _conditioning(model, device_idx: torch.Tensor, noise_frac: float) -> torch.Tensor:
+    """The batch's embedding rows, optionally jittered (train steps only).
+
+    Noise std is ``noise_frac * table.std()`` recomputed each step, not a fixed
+    number of embedding units: the table's scale drifts over a run, so a
+    relative size keeps the perturbation the same fraction of the space
+    throughout. Read off the whole table (not the batch) so a batch of similar
+    devices doesn't shrink its own noise.
+    """
+    emb = model.embed(device_idx)
+    if noise_frac <= 0.0:
+        return emb
+    std = noise_frac * model.embedding_table().detach().std()
+    return emb + torch.randn_like(emb) * std
+
+
+def device_loss_weights(cfg: Config, ids: list[int], strength: float) -> np.ndarray:
+    """Per-device ESR weights that offset the corpus's output-level spread.
+
+    The ESR term pools error and signal energy over the whole batch
+    (:func:`esr`), and devices are drawn uniformly, so a device's share of the
+    gradient tracks its own render power. Measured on data_mixed: median render
+    level spans -41.8..-4.9 dBFS (~37 dB, ~5000x in power), and the quietest
+    half of the 404 devices carry ~14% of the pooled signal between them.
+
+    ``w[d] = p[d] ** -strength``, where ``p[d]`` is the device's median render
+    power over the *train* split (the rows the loss actually sees). strength=0
+    gives every device weight 1 (the pooled loss exactly as before); strength=1
+    equalizes every device's expected contribution.
+
+    Weights are normalized to mean 1 so the loss keeps its magnitude -- and lr
+    its meaning -- as ``strength`` changes. Devices with no train-split
+    ``render_ok`` row fall back to 1.0.
+
+    The same weights are applied to val ESR (:func:`evaluate_esr`), so the
+    checkpoint/plateau/early-stop criteria score what the run optimizes. The
+    unweighted pooled metric is near-blind here: a 30% gain on the 100 quietest
+    devices moves it -1.8%, against ~0.3% epoch-to-epoch noise, and a 5% cost on
+    the loudest flips its sign. A non-zero strength therefore makes val ESR
+    incomparable with a strength-0 run -- compare per-device ESR across runs.
+
+    Only the ESR term is weighted. MRSTFT is left alone: its log-magnitude
+    sub-term is already scale-invariant, and while auraloss's spectral-
+    convergence sub-term pools batch-globally the same way ESR does, reweighting
+    inside a third-party loss is a separate change from the one this knob makes.
+    """
+    n = len(ids)
+    w = np.ones(n, dtype=np.float64)
+    if strength == 0.0:
+        return w
+
+    renders = manifests.read_manifest(cfg.renders_manifest_path, manifests.RENDERS_COLUMNS)
+    ok = renders[(renders["status"] == C.RENDER_OK) & (renders["split"] == C.SPLIT_TRAIN)]
+    rms_db = ok.groupby("device_id")["out_rms_db"].median() if not ok.empty else {}
+
+    missing = []
+    for i, d in enumerate(ids):
+        v = rms_db.get(int(d), np.nan) if len(rms_db) else np.nan
+        if not np.isfinite(v):
+            missing.append(int(d))
+            continue
+        w[i] = 10.0 ** (-strength * float(v) / 10.0)     # power**-strength
+    w /= w.mean()
+    if missing:
+        print(f"[loss]  {len(missing)} device(s) have no train-split render level "
+              f"— weight 1.0: {missing[:8]}{' ...' if len(missing) > 8 else ''}",
+              flush=True)
+    return w
+
+
 def _make_loader(ds, batch_size, workers, *, shuffle, seed, drop_last):
     gen = torch.Generator()
     gen.manual_seed(seed)
@@ -108,7 +197,8 @@ def _make_loader(ds, batch_size, workers, *, shuffle, seed, drop_last):
 
 @torch.no_grad()
 def evaluate_esr(model, loader, device, coeff: float, *, n_batches: int | None = None,
-                 shuffle_devices: bool = False) -> float:
+                 shuffle_devices: bool = False,
+                 weights: torch.Tensor | None = None) -> float:
     """Energy-weighted pre-emphasized ESR over the loader (warmed region only).
 
     - Accumulates error and signal energy across every window and divides once,
@@ -117,6 +207,11 @@ def evaluate_esr(model, loader, device, coeff: float, *, n_batches: int | None =
     - ``shuffle_devices`` permutes the conditioning within each batch — the
       control that should make ESR *worse* if the embeddings actually steer the
       model.
+    - ``weights`` [n_devices] applies the same per-device weighting the train
+      loss uses (:func:`device_loss_weights`), so val ESR scores the objective
+      the run is actually optimizing. Indexed by each item's *true* device, not
+      the shuffled conditioning — the target is the true device's render either
+      way. At strength 1 the result equals the plain mean of per-device ESR.
     """
     was_training = model.training
     model.eval()
@@ -128,12 +223,17 @@ def evaluate_esr(model, loader, device, coeff: float, *, n_batches: int | None =
         inp = batch["input"].to(device, non_blocking=True)
         target = batch["target"].to(device, non_blocking=True)
         di = batch["device_idx"].to(device, non_blocking=True)
+        w = None if weights is None else weights[di]
         if shuffle_devices and di.shape[0] > 1:
             di = di[torch.randperm(di.shape[0], device=device)]
         out = model(inp, di)[..., R:].squeeze(1)      # [B, clip]
         pe_o, pe_t = pre_emphasis(out, coeff), pre_emphasis(target, coeff)
-        num += float(torch.sum((pe_o - pe_t) ** 2).double())
-        den += float(torch.sum(pe_t ** 2).double())
+        n_i = torch.sum((pe_o - pe_t) ** 2, dim=-1)   # [B]
+        d_i = torch.sum(pe_t ** 2, dim=-1)            # [B]
+        if w is not None:
+            n_i, d_i = n_i * w, d_i * w
+        num += float(n_i.sum().double())
+        den += float(d_i.sum().double())
     if was_training:
         model.train()
     return num / (den + 1e-8) if den > 0.0 else float("nan")
@@ -211,6 +311,18 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
           f"embed={getattr(model, 'embedding_dim', ecfg.embedding_dim)}")
     print(f"[model] receptive_field={R} samples ({rf_ms:.1f} ms)  clip={clip}")
 
+    # Embedding noise: train steps only (val/eval read the table verbatim).
+    # tabledelta_wavenet's table holds per-device weight residuals, not points in
+    # a shared space, so jitter there would be noise on conv weights at an
+    # unrelated scale -- the knob is inert for that arch.
+    if ecfg.embed_noise_frac < 0.0:
+        raise ValueError("emulate.embed_noise_frac must be >= 0 (fraction of the "
+                         f"embedding table's std), got {ecfg.embed_noise_frac}")
+    noise_frac = 0.0 if ecfg.arch == "tabledelta_wavenet" else float(ecfg.embed_noise_frac)
+    if ecfg.embed_noise_frac > 0.0:
+        print(f"[model] embed_noise_frac={ecfg.embed_noise_frac:g}"
+              + ("" if noise_frac > 0.0 else "  (inert for tabledelta_wavenet)"))
+
     # --- Data -------------------------------------------------------------------
     train_ds = EmulationDataset(cfg, "train", receptive_field=R, id_to_idx=id_to_idx,
                                 clip_samples=clip, pairs_per_epoch=ecfg.pairs_per_epoch,
@@ -225,6 +337,18 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
 
     # --- Optim / loss / bookkeeping --------------------------------------------
     lossfn = EmulationLoss(ecfg.preemph, ecfg.stft_weight).to(dev)
+    # Per-device ESR weighting, applied to the train loss and val ESR alike.
+    if ecfg.device_loss_weighting < 0.0:
+        raise ValueError("emulate.device_loss_weighting must be >= 0, got "
+                         f"{ecfg.device_loss_weighting}")
+    dev_w = None
+    if ecfg.device_loss_weighting > 0.0:
+        _w = device_loss_weights(cfg, ids, float(ecfg.device_loss_weighting))
+        dev_w = torch.as_tensor(_w, dtype=torch.float32, device=dev)
+        print(f"[loss]  device_loss_weighting={ecfg.device_loss_weighting:g} "
+              f"weights min={_w.min():.4g} p50={np.median(_w):.4g} "
+              f"max={_w.max():.4g} (mean 1.0, ESR term only; val ESR weighted "
+              f"too — not comparable with a strength-0 run)")
     opt = torch.optim.Adam(model.parameters(), lr=ecfg.lr, weight_decay=ecfg.weight_decay)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode="min", factor=ecfg.plateau_factor, patience=ecfg.plateau_patience)
@@ -297,8 +421,9 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
 
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                out = model(inp, di)[..., R:]
-            loss, parts = lossfn(out.float(), target)
+                out = model.forward_emb(inp, _conditioning(model, di, noise_frac))[..., R:]
+            loss, parts = lossfn(out.float(), target,
+                                 weights=None if dev_w is None else dev_w[di])
             scaler.scale(loss).backward()
             scaler.unscale_(opt)      # GradScaler only skips non-finite grads; clip the rest
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
@@ -317,7 +442,7 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         tr_loss = ep_loss / max(n_steps, 1)
         tr_esr = ep_esr / max(n_steps, 1)
         tr_stft = ep_stft / max(n_steps, 1)
-        val_esr = evaluate_esr(model, val_loader, dev, ecfg.preemph)
+        val_esr = evaluate_esr(model, val_loader, dev, ecfg.preemph, weights=dev_w)
 
         # NaN guard: recover from an fp16 forward overflow instead of dying.
         # - Non-finite val ESR: weights are poisoned. Reload best, drop to fp32
@@ -376,8 +501,9 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
     if ckpt_path.is_file():
         model.load_state_dict(torch.load(ckpt_path, map_location=dev,
                                          weights_only=False)["model"])
-    val_true = evaluate_esr(model, val_loader, dev, ecfg.preemph)
-    val_shuf = evaluate_esr(model, val_loader, dev, ecfg.preemph, shuffle_devices=True)
+    val_true = evaluate_esr(model, val_loader, dev, ecfg.preemph, weights=dev_w)
+    val_shuf = evaluate_esr(model, val_loader, dev, ecfg.preemph, shuffle_devices=True,
+                            weights=dev_w)
     train_hours = (time.time() - t0) / 3600.0
     print(f"[cond]  val_esr={val_true:.5f}  val_esr_shuffled={val_shuf:.5f} "
           f"(shuffle should be worse){' OK' if val_shuf > val_true else ' — weak conditioning'}")
@@ -393,7 +519,9 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         "receptive_field_samples": R, "receptive_field_ms": round(rf_ms, 3),
         "embedding_dim": emb_dim, "channels": arch["channels"],
         "blocks_x_layers": arch["blocks_x_layers"], "n_devices": len(ids),
-        "single_device": ecfg.single_device, "best_val_esr": best_val,
+        "single_device": ecfg.single_device,
+        "device_loss_weighting": ecfg.device_loss_weighting,
+        "best_val_esr": best_val,
         "val_esr": val_true, "val_esr_shuffled": val_shuf,
         "epochs_run": epoch + 1, "train_hours": round(train_hours, 4),
         "manifest_sha256": manifest_sig,
@@ -407,7 +535,7 @@ def save_embedding(path: Path, model, device_ids, manifest_sig, embedding_dim, n
                    holdout_ids=()) -> None:
     """Save the embedding table + provenance separately (Phase 5 extends it, spec §5)."""
     torch.save({
-        "embedding": model.embedding.weight.detach().cpu(),
+        "embedding": model.embedding_table().detach().cpu(),
         "device_ids": list(device_ids), "holdout_ids": list(holdout_ids),
         "manifest_sha256": manifest_sig,
         "embedding_dim": int(embedding_dim), "name": name,
@@ -429,7 +557,7 @@ def _save_config_copy(run_dir: Path, ecfg) -> None:
 _STRUCTURAL_KEYS = ("arch", "blocks", "layers_per_block", "channels", "kernel_size",
                     "dilation_growth", "wn_channels", "wn_activation",
                     "cond_hidden", "cond_activation", "delta_rank",
-                    "embedding_dim", "single_device")
+                    "embedding_dim", "single_device", "embed_normalize")
 
 
 def _check_resume_compatible(ck: dict, ecfg, receptive_field: int, n_devices: int) -> None:

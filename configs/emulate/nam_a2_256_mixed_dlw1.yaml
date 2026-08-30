@@ -1,0 +1,99 @@
+# nam_a2_256_mixed retrained under the per-device-weighted ESR loss.
+# Run name = file stem.
+#
+#   OPENAMP_DATA_DIR=data_mixed openamp emulate --config configs/emulate/nam_a2_256_mixed_dlw1.yaml
+#
+# Byte-for-byte nam_a2_256_mixed.yaml with ONE line added:
+# device_loss_weighting: 1.0. Everything else -- preemph 0.85, plateau_factor
+# 0.7, early_stop_patience 999, epochs 400, lr 4.0e-3 -- is inherited verbatim.
+#
+# WHY. nam_a2_256_mixed was trained before device_loss_weighting existed, so its
+# best_val_esr (0.08762) is on the OLD, unweighted metric and cannot be compared
+# with any weighted run. This gives the same recipe a baseline on the new metric.
+#
+#   nam_a2_256_mixed        dlw 0.0, preemph 0.85   <- old metric, not comparable
+#   THIS RUN                dlw 1.0, preemph 0.85
+#   ..._dlw1_pe95           dlw 1.0, preemph 0.95, plateau_factor 0.75, esp 8
+#   ..._dlw1_pe95_normemb   + embed_normalize
+#
+# NOTE this run is NOT a single-knob control against ..._dlw1_pe95: that one also
+# carries preemph 0.95, plateau_factor 0.75 and early_stop_patience 8, all three
+# of which differ here. It IS the same-metric reference point the weighted runs
+# lacked, and a single-knob control against nam_a2_256_mixed's recipe.
+#
+# HOW TO READ IT. At strength 1 the weighted val ESR is exactly the plain mean of
+# per-device ESR. The metric that holds across every run regardless of weighting
+# is per_device_esr.csv -- specifically the tail, since the hypothesis under test
+# is that quiet devices were gradient-starved. Baseline measured on
+# nam_a2_256_mixed: mean per-device test ESR 0.0375, median 0.0233, worst 0.702,
+# corr(device level, test ESR) = -0.27 (p=3.5e-8). If the weighting works, that
+# correlation should weaken and the tail should pull in.
+#
+# ---- inherited header from nam_a2_256_mixed.yaml ----------------------------
+# nam_a2_256 trained on the EGDB+SWEEP corpus (data_mixed/) instead of data/.
+# Run name = file stem.
+#
+#   OPENAMP_DATA_DIR=data_mixed openamp emulate --config configs/emulate/nam_a2_256_mixed.yaml
+#
+# THE ENV VAR IS PART OF THE RECIPE. Without OPENAMP_DATA_DIR=data_mixed this
+# trains on the sweep-free EGDB corpus over 405 devices and silently
+# reproduces nam_a2_256's experiment under this name.
+#
+# TWO THINGS CHANGE relative to nam_a2_256 (best_val_esr 0.08762, 210,401
+# params, 405 devices, 14.8 h). Both follow from the corpus swap; no knob below
+# differs from nam_a2_256.yaml:
+#   1. Corpus is data_mixed/ (scripts/build_mixed_corpus.py): 88 EGDB files +
+#      the TONE3000 v3 capture signal in NAM's own regions (train
+#      10.0-181.0s, val/test both 181.0-190.0s). EmulationDataset draws files
+#      uniformly (not duration-weighted), so sweep gets ~1.4% of windows.
+#      sweep_val is a byte copy of the lead-in DI, not the chirp content.
+#   2. 404 devices, not 405: device 486 ("Lel 3000 1993 -- output_amp2") is
+#      appended to data_mixed/manifests/emulate_holdout.txt because its
+#      renders sit ~20 dB below the corpus (test ESR > 1.0 in every run --
+#      worse than predicting silence). It IS in the holdout file, so it's a
+#      default emulate-enroll target unless excluded via --devices.
+#
+# Capture provenance: data_mixed renders come from the A1 captures (like
+# data/), not data_sweep/ -- migrate-a2 re-pointed the manifest at A2 models
+# between the two render jobs (see scripts/stage_sweep_a1.py).
+#
+# embed_noise_frac is left at its 0.0 default: this run moves the corpus only,
+# so its val ESR stays comparable to nam_a2_256's.
+#
+# Full copy of nam_a2_256.yaml's numbers -- a per-run file replaces
+# configs/openamp.yaml entirely, so omitted keys fall back to EmulateConfig
+# defaults, not NAM's. See nam_a2.yaml for the derivation.
+
+emulate:
+  # --- Model -------------------------------------------------------------------
+  arch: film_wavenet
+  wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
+  embedding_dim: 256       # nam_a2.yaml's sweep point (128 -> 256)
+  single_device: -1        # -1 = one-to-many over all render-ok devices
+
+  # --- Training (NAM's A2 numbers where the knob exists) -----------------------
+  holdout_frac: 0.1
+  clip_seconds: 2.0        # must match the corpus clip grid
+  batch_size: 32           # NAM uses 16; doubled since this model is launch-bound, not compute-bound
+  pairs_per_epoch: 50000
+  epochs: 400              # NAM trainer.max_epochs; early-stop still ends it sooner
+  lr: 4.0e-3                # keep the decimal point -- PyYAML reads bare 2e-3 as a string.
+                          # Run STARTED at 4.0e-3 and ReduceLROnPlateau annealed to 2.0e-3
+                          # at epoch 15; the process was killed mid-epoch 24 (2026-08-23
+                          # 22:48) and --resume lets the config's lr win over the
+                          # checkpoint's, so this is set to the annealed value to continue
+                          # where it left off. Every session's applied lr is in
+                          # config_history.jsonl; nam_a2_256_mixed_n10.yaml still reads 4.0e-3.
+  weight_decay: 3.17e-7
+  plateau_patience: 3
+  plateau_factor: 0.7
+  early_stop_patience: 999
+  stft_weight: 0.05         # NAM's MRSTFT weight, rescaled from MSE to this trainer's ESR term;
+                            # held at the EGDB-derived value even with sweep now in the corpus
+  preemph: 0.85            # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
+  device_loss_weighting: 1.0   # THE ONE CHANGE vs nam_a2_256_mixed.yaml
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50

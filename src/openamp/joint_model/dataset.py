@@ -38,7 +38,16 @@ from openamp.emulate.dataset import EmulationDataset, read_with_retry
 __all__ = ["JointDataset", "REF_MODES"]
 
 # "audio" yields a (dry, wet) reference segment for a trained encoder; "device" yields
-# the device id, for an encoder that looks up a precomputed fingerprint.
+# the device id, for an encoder that looks up a precomputed fingerprint or frame set.
+#
+# There is deliberately no mode that yields per-device codec *frames* through the
+# loader. It was tried for enc_kind="dac_frames", whose encoder-side gather stalls
+# the main thread (GPU utilization drops to 0 between steps): reading the frames in
+# the workers instead made throughput worse, ~40 smp/s against 68, because a
+# ~30 MiB item has to cross worker-to-parent shared memory and then pin_memory,
+# which costs more than the single-threaded gather it was meant to overlap. The
+# real cost is moving ~966 MiB per batch to compute a [B, 512] embedding at all,
+# and no choice of *where* to gather fixes that.
 REF_MODES = ("audio", "device")
 
 

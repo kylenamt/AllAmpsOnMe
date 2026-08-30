@@ -19,6 +19,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from openamp.emulate.wavenet import NormalizedEmbedding
+
+EMBEDDING_STD = 0.1              # init std of the [N_devices x E] table
+
 __all__ = ["FiLMTCN", "count_parameters"]
 
 
@@ -52,7 +56,7 @@ class FiLMTCNLayer(nn.Module):
         return x + y                                     # identity residual
 
 
-class FiLMTCN(nn.Module):
+class FiLMTCN(NormalizedEmbedding, nn.Module):
     """Conditioned amp emulator: ``(audio, device_idx) -> emulated audio``.
 
     Input is ``[B, T]`` or ``[B, 1, T]`` mono at 48 kHz; ``device_idx`` is a
@@ -63,7 +67,7 @@ class FiLMTCN(nn.Module):
 
     def __init__(self, *, n_devices: int, blocks: int = 2, layers_per_block: int = 8,
                  channels: int = 16, kernel_size: int = 3, dilation_growth: int = 2,
-                 embedding_dim: int = 64):
+                 embedding_dim: int = 64, embed_normalize: bool = False):
         super().__init__()
         self.n_devices = int(n_devices)
         self.blocks = int(blocks)
@@ -74,7 +78,8 @@ class FiLMTCN(nn.Module):
         self.embedding_dim = int(embedding_dim)
 
         self.embedding = nn.Embedding(self.n_devices, self.embedding_dim)
-        nn.init.normal_(self.embedding.weight, std=0.1)
+        nn.init.normal_(self.embedding.weight, std=EMBEDDING_STD)
+        self._init_embed_normalize(embed_normalize, self.embedding_dim, EMBEDDING_STD)
 
         self.input = nn.Conv1d(1, self.channels, 1)      # 1x1: lift mono -> channels
         layers = []
@@ -92,7 +97,8 @@ class FiLMTCN(nn.Module):
         return cls(n_devices=n_devices, blocks=ecfg.blocks,
                    layers_per_block=ecfg.layers_per_block, channels=ecfg.channels,
                    kernel_size=ecfg.kernel_size, dilation_growth=ecfg.dilation_growth,
-                   embedding_dim=ecfg.embedding_dim)
+                   embedding_dim=ecfg.embedding_dim,
+                   embed_normalize=ecfg.embed_normalize)
 
     @staticmethod
     def compute_receptive_field(blocks: int, layers_per_block: int, kernel_size: int,
@@ -109,11 +115,18 @@ class FiLMTCN(nn.Module):
         return self.compute_receptive_field(self.blocks, self.layers_per_block,
                                             self.kernel_size, self.dilation_growth)
 
-    def forward(self, x: torch.Tensor, device_idx: torch.Tensor) -> torch.Tensor:
+    def forward_emb(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        """Conditioned forward on an embedding vector ``[B, embedding_dim]``, not a table row.
+
+        Split from :meth:`forward` (as in FiLMWaveNet) so emb can come from
+        elsewhere -- the training loop's noise injection, or a morph point.
+        """
         if x.dim() == 2:
             x = x.unsqueeze(1)                           # [B, T] -> [B, 1, T]
-        emb = self.embedding(device_idx)                 # [B, embedding_dim]
         h = self.input(x)
         for layer in self.layers:
             h = layer(h, emb)
         return self.output(h)                            # [B, 1, T]
+
+    def forward(self, x: torch.Tensor, device_idx: torch.Tensor) -> torch.Tensor:
+        return self.forward_emb(x, self.embed(device_idx))

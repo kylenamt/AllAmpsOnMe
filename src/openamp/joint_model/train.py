@@ -11,6 +11,14 @@ What's different:
 - Two parameter groups: the encoder gets its own learning rate (joint.enc_lr)
   since LR imbalance is a known failure mode and a dead encoder is invisible
   in ESR alone.
+- emulate.embed_noise_frac jitters e on train steps (see `jitter`), so the
+  generator has to decode a *neighbourhood* of each embedding rather than 405
+  isolated points. Without it nothing pushes the space between amps to mean
+  anything, which is exactly what an unseen amp needs.
+- joint.enc_frame_window (dac_frames only) draws a random contiguous span of
+  frames per step instead of the amp's whole fixed tensor, so one device id
+  stops being one deterministic encoder input.
+
 - A collapse tripwire runs every epoch: val_esr_shuffled (embeddings permuted
   within the batch) and emb_spread (how much e varies across amps). With no
   contrastive term, the cheap failure is an encoder emitting a near-constant
@@ -30,12 +38,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from openamp.core.config import Config
 from openamp.emulate.dataset import manifest_signature
 from openamp.emulate.tcn import count_parameters
 from openamp.emulate.train import (GRAD_CLIP_NORM, EmulationLoss, _device_index,
-                                   _make_loader, pre_emphasis)
+                                   _make_loader, device_loss_weights, pre_emphasis)
 from openamp.joint_model.dataset import JointDataset
 from openamp.joint_model.model import build_joint, load_joint
 
@@ -62,9 +71,44 @@ def _intervene(e: torch.Tensor, mode: str, generator: torch.Generator | None):
     raise ValueError(f"mode must be one of {EVAL_MODES}, got {mode!r}")
 
 
+def jitter(e: torch.Tensor, frac: float, normalize: bool) -> torch.Tensor:
+    """Train-time Gaussian jitter on the encoder's embedding (train steps only).
+
+    Why it exists: with no jitter the generator only ever sees the finite set of
+    points the encoder emits -- 405 of them under a device-id lookup -- and is
+    free to carve 405 isolated wells with nothing decodable between them. An
+    unseen amp then lands in dead space no matter how well the encoder places
+    it. Jitter makes the neighbourhood of each embedding decode too, which is
+    the precondition for the space between amps meaning anything.
+
+    Same knob as :data:`openamp.core.config.EmulateConfig.embed_noise_frac`, but
+    it cannot share
+    :func:`openamp.emulate.train._conditioning`'s scale: that one is a fraction
+    of the embedding *table*'s std, and a joint run has no trainable table --
+    the conditioning is whatever the encoder emits this step. So the scale comes
+    from the embedding's own geometry instead:
+
+    - ``normalize`` (joint.enc_normalize, on in every dac_frames run): ``e`` is a
+      unit vector, so a coordinate's natural size is ``1/sqrt(De)`` and ``frac``
+      is read against that. The jittered point is re-projected onto the sphere,
+      because a plain additive perturbation would mostly move ``|e|`` -- an axis
+      the generator never sees vary, so noise along it teaches nothing and
+      changes the drive level instead.
+    - otherwise: the batch's own std, the closest analogue of the table std.
+      Detached, so jitter is never a gradient path back into the encoder.
+    """
+    if frac <= 0.0:
+        return e
+    if normalize:
+        return F.normalize(e + torch.randn_like(e) * (frac / math.sqrt(e.shape[-1])),
+                           dim=-1)
+    return e + torch.randn_like(e) * (frac * e.detach().std())
+
+
 @torch.no_grad()
 def evaluate_esr(model, loader, device, coeff: float, *, n_batches: int | None = None,
-                 mode: str = "true", seed: int = 0) -> dict:
+                 mode: str = "true", seed: int = 0,
+                 weights: torch.Tensor | None = None) -> dict:
     """Energy-pooled pre-emphasized ESR over the loader, plus embedding spread.
 
     Pooled as one ratio of sums exactly like
@@ -77,6 +121,14 @@ def evaluate_esr(model, loader, device, coeff: float, *, n_batches: int | None =
 
     The shuffle is drawn from a seeded generator so the number is comparable from
     epoch to epoch rather than re-rolled each time.
+
+    ``weights`` [n_devices] applies the same per-device ESR weighting the train
+    loss uses (:func:`openamp.emulate.train.device_loss_weights`), indexed by
+    each item's true device (``batch["device_idx"]``) -- so checkpoint
+    selection, ReduceLROnPlateau and early stopping score the objective the run
+    actually optimizes. Only meaningful when ``loader``'s ``device_idx`` shares
+    the training run's id_to_idx; a holdout loader uses its own, unrelated
+    indexing and must not be passed weights fit on the training device set.
     """
     was_training = model.training
     model.eval()
@@ -95,8 +147,14 @@ def evaluate_esr(model, loader, device, coeff: float, *, n_batches: int | None =
             spreads.append(float(e.std(dim=0).mean()))
         out = model.render(inp, _intervene(e, mode, gen))[..., R:].squeeze(1)
         pe_o, pe_t = pre_emphasis(out, coeff), pre_emphasis(target, coeff)
-        num += float(torch.sum((pe_o - pe_t) ** 2).double())
-        den += float(torch.sum(pe_t ** 2).double())
+        n_i = torch.sum((pe_o - pe_t) ** 2, dim=-1)     # [B]
+        d_i = torch.sum(pe_t ** 2, dim=-1)              # [B]
+        if weights is not None:
+            di = batch["device_idx"].to(device, non_blocking=True)
+            w = weights[di]
+            n_i, d_i = n_i * w, d_i * w
+        num += float(n_i.sum().double())
+        den += float(d_i.sum().double())
     if was_training:
         model.train()
     return {"esr": num / (den + 1e-8) if den > 0.0 else float("nan"),
@@ -120,8 +178,16 @@ def _build_datasets(cfg: Config, ecfg, jcfg, id_to_idx, R: int):
 
 
 def ref_mode_for(jcfg) -> str:
-    """Which reference a conditioning source needs. One place, so train and eval agree."""
-    return "device" if getattr(jcfg, "enc_kind", "wavenet") == "fingerprint" else "audio"
+    """Which reference a conditioning source needs. One place, so train and eval agree.
+
+    "dac_frames" takes "device", not "frames": moving the ~30 MiB/item frame read
+    into the loader workers was measured *slower* (~40 smp/s against 68), because
+    every item then crosses worker-to-parent shared memory and pin_memory as a
+    ~966 MiB/batch payload -- more copies than the single-threaded gather it was
+    meant to hide. See JointDataset's REF_MODES note.
+    """
+    return ("device" if getattr(jcfg, "enc_kind", "wavenet") in ("fingerprint", "dac_frames")
+           else "audio")
 
 
 def _optimizer(model, ecfg, jcfg):
@@ -129,7 +195,9 @@ def _optimizer(model, ecfg, jcfg):
 
     Under ``enc_kind: fingerprint`` the encoder's fingerprint matrix is a *buffer*,
     so ``model.encoder.parameters()`` is exactly the adapter and the codec cannot be
-    trained even by accident.
+    trained even by accident. Under ``enc_kind: dac_frames`` the frames themselves
+    aren't even a buffer -- ``FrameStore`` is a plain attribute, not registered --
+    so ``model.encoder.parameters()`` is exactly the attention pool plus the adapter.
     """
     gen_params = [p for n, p in model.generator.named_parameters()
                   if p.requires_grad and not n.startswith("embedding.")]
@@ -207,14 +275,45 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
     ids, id_to_idx, holdout_ids = _device_index(cfg, ecfg, limit_devices)
     if not ids:
         raise RuntimeError("No render-ok devices. Run `openamp render` first.")
+    # Per-device ESR weighting, applied to the train loss and to the seen-device
+    # val ESR alike -- exactly openamp.emulate.train's device_loss_weighting,
+    # forked here because the two trainers' loss/eval plumbing differs. Not
+    # applied to the holdout probe: holdout_loader indexes device_idx against
+    # its own {holdout id -> row} map, unrelated to `ids`, so weights fit here
+    # would land on the wrong devices there.
+    if ecfg.device_loss_weighting < 0.0:
+        raise ValueError("emulate.device_loss_weighting must be >= 0, got "
+                         f"{ecfg.device_loss_weighting}")
+    dev_w = None
+    if ecfg.device_loss_weighting > 0.0:
+        _w = device_loss_weights(cfg, ids, float(ecfg.device_loss_weighting))
+        dev_w = torch.as_tensor(_w, dtype=torch.float32, device=dev)
+        print(f"[loss]  device_loss_weighting={ecfg.device_loss_weighting:g} "
+              f"weights min={_w.min():.4g} p50={np.median(_w):.4g} "
+              f"max={_w.max():.4g} (mean 1.0, ESR term only; seen-device val ESR "
+              f"weighted too -- not comparable with a strength-0 run; holdout "
+              f"stays unweighted, a different device set)")
+    if ecfg.embed_noise_frac < 0.0:
+        raise ValueError("emulate.embed_noise_frac must be >= 0 (a fraction of the "
+                         f"embedding's own scale), got {ecfg.embed_noise_frac}")
+    noise_frac = float(ecfg.embed_noise_frac)
+    if noise_frac > 0.0:
+        scale = ("1/sqrt(De) on the unit sphere, re-projected after"
+                 if jcfg.enc_normalize else "the batch's own std")
+        print(f"[loss]  embed_noise_frac={noise_frac:g} against {scale} "
+              f"(train steps only; val, shuffled and holdout all see clean e)")
     manifest_sig = manifest_signature(cfg)
-    # Fingerprint provenance: the npz can be regenerated out from under a finished
-    # run, and nothing about the checkpoint's shape would notice.
+    # Fingerprint provenance: the underlying data can be regenerated out from under
+    # a finished run, and nothing about the checkpoint's shape would notice.
     fp_sha, fp_meta = "", {}
-    if ref_mode_for(jcfg) == "device":
+    if jcfg.enc_kind == "fingerprint":
         from openamp.joint_model.fingerprint_encoder import FingerprintEncoder
         fp_sha = FingerprintEncoder.fingerprint_sha256(jcfg.fp_path)
         fp_meta = FingerprintEncoder.load_pooled(jcfg.fp_path)[3]
+    elif jcfg.enc_kind == "dac_frames":
+        from openamp.joint_model.frame_encoder import FrameAttentionEncoder
+        fp_sha = FrameAttentionEncoder.frames_sha256(jcfg.fp_frames_path)
+        fp_meta = json.loads((Path(jcfg.fp_frames_path) / "meta.json").read_text())
     model = build_joint(ecfg, jcfg, len(ids)).to(dev)
     R = model.receptive_field
     n_enc, n_gen = count_parameters(model.encoder), count_parameters(model.generator)
@@ -223,9 +322,18 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
           f"encoder={n_enc:,} generator={n_gen:,} params "
           f"devices={len(ids)} holdout={len(holdout_ids)}")
     cap = model.encoder.capacity_report()
-    src = (f"fp={jcfg.fp_path} preprocess={cap.get('preprocess')} "
-           f"n_fingerprints={cap.get('n_fingerprints')}"
-           if cap["head"] == "fingerprint" else f"enc_channels={jcfg.enc_channels}")
+    if cap["head"] == "fingerprint":
+        src = (f"fp={jcfg.fp_path} preprocess={cap.get('preprocess')} "
+              f"n_fingerprints={cap.get('n_fingerprints')}")
+    elif cap["head"] == "dac_frames":
+        win = cap.get("frame_window", 0)
+        src = (f"fp_frames={jcfg.fp_frames_path} n_devices={cap.get('n_devices')} "
+              f"pool={cap.get('n_queries')}x{cap.get('d_model')} "
+              + (f"window={win}/{cap.get('n_frames')} frames (random in train, "
+                 f"centre in eval)" if win else
+                 f"window=all {cap.get('n_frames')} frames"))
+    else:
+        src = f"enc_channels={jcfg.enc_channels}"
     print(f"[model] head={cap['head']} {src} "
           f"pooled={cap['pooled_dim']}-d -> De={cap['embedding_dim']} "
           f"(ceiling {cap['ceiling']}) enc_rf={model.encoder.receptive_field} "
@@ -364,8 +472,11 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
 
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                out = model(inp, ref)[..., R:]
-            loss, parts = lossfn(out.float(), target)
+                e = jitter(model.embed(ref), noise_frac, jcfg.enc_normalize)
+                out = model.render(inp, e)[..., R:]
+            w = (None if dev_w is None else
+                dev_w[batch["device_idx"].to(dev, non_blocking=True)])
+            loss, parts = lossfn(out.float(), target, weights=w)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
@@ -384,10 +495,13 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         tr_loss = ep_loss / max(n_steps, 1)
         tr_esr = ep_esr / max(n_steps, 1)
         tr_stft = ep_stft / max(n_steps, 1)
-        val = evaluate_esr(model, val_loader, dev, ecfg.preemph, seed=cfg.seed)
+        val = evaluate_esr(model, val_loader, dev, ecfg.preemph, seed=cfg.seed,
+                          weights=dev_w)
         val_esr, spread = val["esr"], val["emb_spread"]
         shuf = evaluate_esr(model, val_loader, dev, ecfg.preemph, mode="shuffled",
-                            n_batches=probe_batches, seed=cfg.seed)["esr"]
+                            n_batches=probe_batches, seed=cfg.seed,
+                            weights=dev_w)["esr"]
+        # holdout stays unweighted -- see the device_loss_weighting note above.
         hold = (evaluate_esr(model, holdout_loader, dev, ecfg.preemph,
                              n_batches=probe_batches, seed=cfg.seed)["esr"]
                 if holdout_loader is not None else float("nan"))
@@ -446,7 +560,8 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         ck = torch.load(ckpt_path, map_location=dev, weights_only=False)
         model.encoder.load_state_dict(ck["encoder"])
         model.generator.load_state_dict(ck["generator"])
-    final = {m: evaluate_esr(model, val_loader, dev, ecfg.preemph, mode=m, seed=cfg.seed)
+    final = {m: evaluate_esr(model, val_loader, dev, ecfg.preemph, mode=m, seed=cfg.seed,
+                             weights=dev_w)
              for m in EVAL_MODES}
     val_true, val_shuf = final["true"]["esr"], final["shuffled"]["esr"]
     val_zero, spread = final["zero"]["esr"], final["true"]["emb_spread"]
@@ -469,6 +584,9 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         "ref_different_file": not train_ds.same_file_mode,
         "best_val_esr": best_val, "val_esr": val_true,
         "val_esr_shuffled": val_shuf, "val_esr_zero": val_zero,
+        "device_loss_weighting": ecfg.device_loss_weighting,
+        "embed_noise_frac": noise_frac,
+        "enc_frame_window": cap.get("frame_window", 0),
         "emb_spread": spread, "epochs_run": epoch + 1,
         "train_hours": round(train_hours, 4), "manifest_sha256": manifest_sig,
     }
@@ -508,7 +626,9 @@ _STRUCTURAL_JOINT = ("enc_channels", "enc_activation", "enc_attn_hidden",
                      "enc_proj_hidden", "enc_normalize", "enc_head", "enc_taps",
                      "enc_tap_stride", "enc_expand_dim", "enc_n_heads",
                      "enc_expand_norm", "enc_norm_groups",
-                     "enc_kind", "fp_path", "fp_preprocess", "fp_layernorm")
+                     "enc_kind", "fp_path", "fp_preprocess", "fp_layernorm",
+                     "fp_frames_path", "enc_pool_queries", "enc_pool_dim",
+                     "enc_frame_window")
 
 # A checkpoint from before a knob existed still ran some default behaviour --
 # record it here so the resume check below doesn't silently wave the change through.
@@ -517,7 +637,9 @@ _LEGACY_JOINT_DEFAULTS = {"enc_head": "stats", "enc_taps": [6, 13, 22],
                           "enc_n_heads": 2, "enc_expand_norm": "batch",
                           "enc_norm_groups": 32,
                           "enc_kind": "wavenet", "fp_path": "",
-                          "fp_preprocess": "dry_l2", "fp_layernorm": False}
+                          "fp_preprocess": "dry_l2", "fp_layernorm": False,
+                          "fp_frames_path": "", "enc_pool_queries": 4,
+                          "enc_pool_dim": 64, "enc_frame_window": 0}
 
 
 def _same(a, b) -> bool:
@@ -570,5 +692,5 @@ def _append_config_history(run_dir: Path, ecfg, jcfg, *, mode: str, start_epoch:
         fh.write(json.dumps(entry) + "\n")
 
 
-__all__ = ["train", "overfit_one_batch", "evaluate_esr", "load_joint", "LOG_COLUMNS",
+__all__ = ["jitter", "train", "overfit_one_batch", "evaluate_esr", "load_joint", "LOG_COLUMNS",
            "EVAL_MODES"]

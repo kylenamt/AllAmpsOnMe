@@ -199,12 +199,12 @@ def export_bundle(run_dir: Path, out_path: Path, *,
               for l in model.layers]
 
     profiles = [{"name": "Table mean",
-                 "embedding": model.embedding.weight.mean(dim=0).tolist()}]
+                 "embedding": model.embedding_table().mean(dim=0).tolist()}]
     id_to_idx = {int(k): int(v) for k, v in ck["id_to_idx"].items()}
     for did in (profile_device_ids or []):
         if int(did) not in id_to_idx:
             raise RuntimeError(f"device {did} is not in the run's trained table")
-        row = model.embedding.weight[id_to_idx[int(did)]]
+        row = model.embedding_table()[id_to_idx[int(did)]]
         profiles.append({"name": f"device {int(did)}", "embedding": row.tolist()})
     for name in (profile_pairs or []):
         blob = torch.load(run_dir / "enroll" / "pairs" / name / "enrolled_pair.pt",
@@ -296,12 +296,12 @@ def export_profile(run_dir: Path, *, device_id: int | None = None,
                           map_location="cpu", weights_only=False)
         emb, default = blob["embedding"].reshape(-1), str(blob.get("name", pair_name))
     elif mean:
-        emb, default = model.embedding.weight.mean(dim=0), "Table mean"
+        emb, default = model.embedding_table().mean(dim=0), "Table mean"
     else:
         id_to_idx = {int(k): int(v) for k, v in ck["id_to_idx"].items()}
         if int(device_id) not in id_to_idx:
             raise RuntimeError(f"device {device_id} is not in the run's trained table")
-        emb = model.embedding.weight[id_to_idx[int(device_id)]]
+        emb = model.embedding_table()[id_to_idx[int(device_id)]]
         default = (names or {}).get(int(device_id)) or f"device {int(device_id)}"
     return _profile(emb, name or default, dim=model.embedding_dim,
                     run_sha=run_sha8(run_dir))
@@ -330,10 +330,10 @@ def export_profiles(run_dir: Path, *, mean: bool = False, pairs: bool = False,
     id_to_idx = {int(k): int(v) for k, v in ck["id_to_idx"].items()}
     profiles = []
     if mean:
-        profiles.append(_profile(model.embedding.weight.mean(dim=0), "Table mean",
+        profiles.append(_profile(model.embedding_table().mean(dim=0), "Table mean",
                                  dim=dim, run_sha=run_sha))
     for did in sorted(id_to_idx, key=id_to_idx.get):        # table-index order
-        profiles.append(_profile(model.embedding.weight[id_to_idx[did]],
+        profiles.append(_profile(model.embedding_table()[id_to_idx[did]],
                                  names.get(did) or f"device {did}",
                                  dim=dim, run_sha=run_sha))
     if pairs:

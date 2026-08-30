@@ -1,0 +1,65 @@
+# nam_a2_256_mixed with train-time embedding noise (embed_noise_frac 0.1).
+# Run name = file stem.
+#
+#   OPENAMP_DATA_DIR=data_mixed openamp emulate --config configs/emulate/nam_a2_256_mixed_n10.yaml
+#
+# THE ENV VAR IS PART OF THE RECIPE. Without OPENAMP_DATA_DIR=data_mixed this
+# trains on the sweep-free EGDB corpus over 405 devices and silently
+# reproduces a different experiment under this name.
+#
+# ONE KNOB differs from nam_a2_256_mixed.yaml: embed_noise_frac 0.0 -> 0.1.
+# That run is the control -- same corpus, same everything else -- so the pair
+# isolates the embedding noise. Do NOT read this run against nam_a2_256
+# (best_val_esr 0.08762) directly: the corpus differs there too.
+#
+# The corpus itself, as in nam_a2_256_mixed.yaml:
+#   1. Corpus is data_mixed/ (scripts/build_mixed_corpus.py): 88 EGDB files +
+#      the TONE3000 v3 capture signal in NAM's own regions (train
+#      10.0-181.0s, val/test both 181.0-190.0s). EmulationDataset draws files
+#      uniformly (not duration-weighted), so sweep gets ~1.4% of windows.
+#      sweep_val is a byte copy of the lead-in DI, not the chirp content.
+#   2. 404 devices, not 405: device 486 ("Lel 3000 1993 -- output_amp2") is
+#      appended to data_mixed/manifests/emulate_holdout.txt because its
+#      renders sit ~20 dB below the corpus (test ESR > 1.0 in every run --
+#      worse than predicting silence). It IS in the holdout file, so it's a
+#      default emulate-enroll target unless excluded via --devices.
+#
+# Capture provenance: data_mixed renders come from the A1 captures (like
+# data/), not data_sweep/ -- migrate-a2 re-pointed the manifest at A2 models
+# between the two render jobs (see scripts/stage_sweep_a1.py).
+#
+# embed_noise_frac 0.1: at each train step the batch's embedding rows get
+# Gaussian jitter of std 0.1 * the table's current std (train steps only --
+# val/eval and the [cond] shuffle check read the table verbatim).
+#
+# Full copy of nam_a2_256.yaml's numbers -- a per-run file replaces
+# configs/openamp.yaml entirely, so omitted keys fall back to EmulateConfig
+# defaults, not NAM's. See nam_a2.yaml for the derivation.
+
+emulate:
+  # --- Model -------------------------------------------------------------------
+  arch: film_wavenet
+  wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
+  embedding_dim: 256       # nam_a2.yaml's sweep point (128 -> 256)
+  single_device: -1        # -1 = one-to-many over all render-ok devices
+
+  # --- Training (NAM's A2 numbers where the knob exists) -----------------------
+  holdout_frac: 0.1
+  clip_seconds: 2.0        # must match the corpus clip grid
+  batch_size: 32           # NAM uses 16; doubled since this model is launch-bound, not compute-bound
+  pairs_per_epoch: 50000
+  epochs: 100              # NAM trainer.max_epochs; early-stop still ends it sooner
+  lr: 6.25e-05                # keep the decimal point -- PyYAML reads bare 4e-3 as a string
+  weight_decay: 3.17e-7
+  plateau_patience: 3
+  plateau_factor: 0.5
+  early_stop_patience: 8
+  stft_weight: 0.05         # NAM's MRSTFT weight, rescaled from MSE to this trainer's ESR term;
+                            # held at the EGDB-derived value even with sweep now in the corpus
+  preemph: 0.85            # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
+  embed_noise_frac: 0.1     # the one knob changed from nam_a2_256_mixed.yaml (0.0)
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50

@@ -1,0 +1,123 @@
+# fp_dac_attn512 + a random contiguous frame window per step. Run name is the
+# file stem -> results/joint/fp_dac_attn512_win20/.
+#
+#   OPENAMP_DATA_DIR=data openamp joint --config configs/joint/fp_dac_attn512_win20.yaml
+#   OPENAMP_DATA_DIR=data openamp joint-eval results/joint/fp_dac_attn512_win20
+#
+# The single change from fp_dac_attn512.yaml (this file is a copy of it):
+# joint.enc_frame_window 0 -> 1723. Generator, pooling, frames, schedule and
+# device_loss_weighting are all unchanged.
+#
+# What it treats. Under enc_kind: dac_frames one device id resolves to one
+# fixed [14728, 1024] tensor, so the whole training set holds 405 distinct
+# encoder inputs and memorizing them is simply available to a 263k-parameter
+# encoder as a strategy. joint_model/evaluate.py already concedes the point: it
+# disables both its leakage and its retrieval check under ref_mode "device"
+# because the input is a lookup key. Drawing a random contiguous window each
+# step makes one amp many inputs instead of exactly one.
+#
+# Why 1723 frames = 20.0 s. The frame rate is 86.1328125 Hz (44.1 kHz over
+# DAC's hop of 512). Contiguous rather than scattered: DAC's encoder receptive
+# field measures 181 ms by gradient probe, so consecutive frames overlap ~94%
+# and the 14,728 frames hold only ~920 independent views -- a scattered draw
+# would re-sample the same stationary average, whereas a 20 s span is a
+# genuinely different look at the amp, still carries ~108 independent views,
+# and gives ~8 non-overlapping windows per device.
+#
+# At eval the window is the centre one: deterministic, so a val/holdout number
+# is comparable epoch to epoch, and the *same length* as training. Scoring on
+# all 14,728 frames would change the pool's softmax distribution -- it is taken
+# over the frame axis -- and hand the generator an embedding drawn from a
+# distribution it never saw.
+#
+# Throughput is a side effect, not the reason: the per-batch frame tensor drops
+# from ~966 MiB to ~113 MiB. fp_dac_attn512 measured 67 smp/s against the
+# fingerprint arm's 134 on the same generator, the gather stalling the main
+# thread, so expect roughly the fingerprint arm's wall time here.
+#
+# Read against fp_dac_attn512 at the same epoch. Success is holdout ESR below
+# 1.077; watch that seen val ESR does not degrade much, which would mean the
+# window is too short to identify an amp.
+
+emulate:
+  # --- Model: delta_a2_tanh_r32_512, unchanged -------------------------------
+  arch: delta_wavenet
+  wn_channels: 8
+  wn_activation: tanh
+  embedding_dim: 512
+  single_device: -1
+  delta_rank: 32
+
+  # --- Training: fp_dac_delta512's original fresh-start schedule, not its
+  # later hand-annealed resume state -- this is a new run and should get a
+  # normal schedule, not one tuned to a different run's trajectory. -----------
+  holdout_frac: 0.1
+  clip_seconds: 2.0
+  batch_size: 32
+  pairs_per_epoch: 50000
+  epochs: 150
+  lr: 4.0e-3
+  weight_decay: 3.17e-7
+  plateau_patience: 3
+  plateau_factor: 0.5
+  early_stop_patience: 15
+  stft_weight: 0.05
+  preemph: 0.85
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50
+  # NEW vs fp_dac_delta512 (which ran at the 0.0 default): equalizes each
+  # device's expected share of the pooled ESR gradient instead of letting it
+  # track render power. joint_model/train.py did not read this field at all
+  # until this run needed it -- see its device_loss_weighting wiring, forked
+  # from emulate.train's. Not comparable against a strength-0 val_esr; per the
+  # holdout note there, the holdout probe stays unweighted regardless.
+  device_loss_weighting: 1.0
+
+joint:
+  # --- Conditioning source: the one thing this config changes -----------------
+  enc_kind: dac_frames
+  # openamp.encoder.extract's output: per-device [~14700, 1024] fp16 frame
+  # shards, memmapped and looked up by device id -- same lookup design as
+  # enc_kind: fingerprint, for the same reason (a codec fingerprint needs long
+  # audio to be reliable; a joint reference window is 2 s).
+  fp_frames_path: results/dac_frames/sweep_train
+
+  # --- Adapter: pool + projection, both trained ------------------------------
+  # CrossAttentionPool(latent_dim=1024, n_queries, d_model) -> pooled
+  # n_queries*d_model -> proj (Linear -> tanh -> Linear) -> 512. Same
+  # projection shape FingerprintEncoder and WaveNetEncoder both use, so this
+  # arm differs from the fingerprint arm in exactly one place: a trained pool
+  # stands where a frozen mean+std vector was looked up.
+  # 8x64=512, not probe.py's own 4x64=256 default: the fingerprint arm pools to
+  # 2048-d (ceiling exactly embedding_dim=512), so leaving this at 256 would
+  # hand the comparison a capacity handicap that has nothing to do with the
+  # pooling method being tested.
+  enc_pool_queries: 8
+  enc_pool_dim: 64
+  # NEW vs fp_dac_attn512 -- the one field this file changes. 0 = all
+  # 14,728 frames (what every dac_frames run so far did).
+  enc_frame_window: 1723
+  enc_proj_hidden: 128
+  enc_activation: tanh
+  # ON, for the same reason fp_dac_delta512 turns it on: nothing else bounds
+  # |e| and the reconstruction gradient inflates it.
+  enc_normalize: true
+  enc_lr: 5.0e-4
+  enc_weight_decay: 1.0e-4
+
+  # --- Inert under enc_kind: dac_frames --------------------------------------
+  # fp_path / fp_preprocess / fp_layernorm belong to enc_kind: fingerprint and
+  # do nothing here -- dac_frames has no precomputed pooled vector to look up
+  # and no dry row to subtract (extract.py keeps wet frames only). Left at
+  # their JointConfig defaults rather than restated.
+  ref_seconds: 2.0
+  ref_different_file: true
+  ref_min_gap_seconds: 1.0
+  sources: []
+  enc_channels: 16
+  enc_attn_hidden: 64
+  enc_head: stats
+  grad_checkpoint_encoder: false

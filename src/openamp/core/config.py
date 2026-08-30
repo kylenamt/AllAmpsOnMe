@@ -62,6 +62,12 @@ class EmulateConfig:
     # --- Shared model knobs ----------------------------------------------------------
     embedding_dim: int = 64          # per-device embedding, fed to every layer
     single_device: int = -1          # >=0: one-to-one baseline trained on that device_id
+    # Read the table as e = embed_scale * normalize(row): direction on the unit
+    # sphere, magnitude one global learned scalar. Structural (adds embed_scale
+    # to the state_dict), so it cannot change on --resume. Rejected for
+    # tabledelta_wavenet, whose table is weight residuals. See
+    # wavenet.NormalizedEmbedding.
+    embed_normalize: bool = False
 
     # --- Training (Adam + reduce-on-plateau) ------------------------------------------
     holdout_frac: float = 0.1        # fraction of devices excluded from training (enrolled later, Phase 5)
@@ -76,6 +82,20 @@ class EmulateConfig:
     early_stop_patience: int = 8     # stop after N epochs with no val-ESR improvement
     stft_weight: float = 1.0         # multi-resolution STFT term weight (ESR term = 1.0)
     preemph: float = 0.85            # 1st-order pre-emphasis coefficient for ESR
+    # Offsets the corpus's ~37 dB output-level spread in the pooled ESR term.
+    # The ESR term pools error and signal energy over the whole batch, so a
+    # device's share of the gradient tracks its own output power -- quiet
+    # devices are starved. Weight each item by (device power)**-strength:
+    # 0.0 = off (pooling exactly as before), 1.0 = every device weighted equally.
+    # Applies to the train loss and to val ESR alike, so checkpoint selection,
+    # ReduceLROnPlateau and early stopping all score the objective being
+    # optimized. Non-zero values are NOT comparable with a strength-0 run's
+    # val ESR; compare per-device ESR instead. See train.device_loss_weights.
+    device_loss_weighting: float = 0.0
+    # Train-time Gaussian jitter on the device embedding, as a fraction of the
+    # table's *current* std (0 = off; train steps only, never val/eval). Inert
+    # for tabledelta_wavenet, whose table is weight deltas, not a shared space.
+    embed_noise_frac: float = 0.0
     num_workers: int = 6
     amp: bool = True                 # CUDA mixed precision (STFT loss forced fp32)
     amp_dtype: str = "fp16"          # "fp16" | "bf16"
@@ -92,10 +112,26 @@ class JointConfig:
     """
 
     # --- Conditioning source ---------------------------------------------------------
-    enc_kind: str = "wavenet"        # "wavenet": encode a (dry, wet) clip | "fingerprint": lookup by device id
+    # "wavenet": encode a (dry, wet) clip | "fingerprint": lookup a precomputed
+    # mean+std pooled vector by device id | "dac_frames": lookup precomputed
+    # per-frame DAC latents by device id and pool them with a trained
+    # cross-attention head (openamp.encoder.probe.CrossAttentionPool) instead of
+    # a fixed mean+std reduction.
+    enc_kind: str = "wavenet"
     fp_path: str = ""                # fingerprint run dir (pooled.npz); required if enc_kind="fingerprint"
     fp_preprocess: str = "dry_l2"    # "dry_l2" (subtract dry null, L2) | "dry" | "l2" | "raw"
     fp_layernorm: bool = False       # LayerNorm as the adapter's first layer
+    fp_frames_path: str = ""         # frame-shard run dir (meta.json + frames/); required if enc_kind="dac_frames"
+    enc_pool_queries: int = 4        # "dac_frames" only: learned attention queries
+    enc_pool_dim: int = 64           # "dac_frames" only: K/V projection width the queries attend in
+    # "dac_frames" only: attend over a random contiguous window of this many
+    # frames per training step instead of all of them (0 = all frames, the
+    # original behaviour). One device id then maps to many possible encoder
+    # inputs instead of exactly one, which is what removes the encoder's option
+    # to memorize a fixed tensor per amp. Contiguous rather than scattered:
+    # DAC's encoder receptive field is 181 ms, so adjacent frames overlap ~94%
+    # and a scattered draw only re-samples the same average.
+    enc_frame_window: int = 0
 
     # --- Reference segment (window B) --------------------------------------------------
     ref_seconds: float = 2.0
@@ -130,15 +166,27 @@ class JointConfig:
         if self.ref_min_gap_seconds < 0:
             raise ConfigError("joint.ref_min_gap_seconds must be >= 0, got "
                               f"{self.ref_min_gap_seconds}")
-        if self.enc_kind not in ("wavenet", "fingerprint"):
-            raise ConfigError("joint.enc_kind must be 'wavenet' or 'fingerprint', got "
-                              f"{self.enc_kind!r}")
+        if self.enc_kind not in ("wavenet", "fingerprint", "dac_frames"):
+            raise ConfigError("joint.enc_kind must be 'wavenet', 'fingerprint' or "
+                              f"'dac_frames', got {self.enc_kind!r}")
         if self.fp_preprocess not in ("dry_l2", "dry", "l2", "raw"):
             raise ConfigError("joint.fp_preprocess must be one of ('dry_l2', 'dry', "
                               f"'l2', 'raw'), got {self.fp_preprocess!r}")
         if self.enc_kind == "fingerprint" and not str(self.fp_path).strip():
             raise ConfigError("joint.enc_kind 'fingerprint' needs joint.fp_path, the "
                               "directory holding pooled.npz")
+        if self.enc_kind == "dac_frames" and not str(self.fp_frames_path).strip():
+            raise ConfigError("joint.enc_kind 'dac_frames' needs joint.fp_frames_path, "
+                              "the directory holding meta.json + frames/ "
+                              "(openamp.encoder.extract's output)")
+        if self.enc_pool_queries < 1:
+            raise ConfigError(
+                f"joint.enc_pool_queries must be >= 1, got {self.enc_pool_queries}")
+        if self.enc_pool_dim < 1:
+            raise ConfigError(f"joint.enc_pool_dim must be >= 1, got {self.enc_pool_dim}")
+        if self.enc_frame_window < 0:
+            raise ConfigError("joint.enc_frame_window must be >= 0 (0 = all frames), "
+                              f"got {self.enc_frame_window}")
         if self.enc_channels < 1:
             raise ConfigError(f"joint.enc_channels must be >= 1, got {self.enc_channels}")
         if self.enc_attn_hidden < 1:
@@ -184,6 +232,7 @@ class EnrollConfig:
     pairs: int = 1000                 # training pairs per device per epoch (optimization budget)
     epochs: int = 30                  # max epochs; early-stopped on val ESR
     lr: float = 1e-2
+    weight_decay: float = 0.0         # Adam weight decay on the embedding rows
     early_stop_patience: int = 5
     plateau_patience: int = 2         # ReduceLROnPlateau patience (epochs)
     plateau_factor: float = 0.5

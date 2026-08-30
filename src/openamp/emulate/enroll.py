@@ -131,7 +131,8 @@ def _per_device_esr(model, loader, dev, n_rows: int, *, preemph: float | None = 
 
 def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
            pairs: int = ENROLL_PAIRS, epochs: int = ENROLL_EPOCHS,
-           lr: float = ENROLL_LR, device: str = "cuda", seed: int | None = None,
+           lr: float = ENROLL_LR, weight_decay: float = 0.0,
+           device: str = "cuda", seed: int | None = None,
            test_pairs: int = TEST_PAIRS_PER_DEVICE,
            early_stop_patience: int = EARLY_STOP_PATIENCE,
            stft_weight: float | None = None,
@@ -212,7 +213,8 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
                                  f"{lr:.2e}", f"{time.time() - t0:.1f}"])
 
     best_emb, best_val, best_epoch, epochs_run = _fit_embedding(
-        model, ecfg, train_ds, val_loader, dev, epochs=epochs, lr=lr, seed=seed,
+        model, ecfg, train_ds, val_loader, dev, epochs=epochs, lr=lr,
+        weight_decay=weight_decay, seed=seed,
         log_path=log_path, init_val=init_val, t0=t0,
         early_stop_patience=early_stop_patience,
         plateau_patience=plateau_patience, plateau_factor=plateau_factor)
@@ -233,7 +235,8 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
 
     torch.save({
         # embedding.pt schema (a future loader can concat these onto the table)
-        "embedding": best_emb.cpu(), "device_ids": list(enroll_ids),
+        "embedding": model.project_embedding(best_emb).cpu(),
+        "device_ids": list(enroll_ids),
         "manifest_sha256": manifest_sig, "embedding_dim": int(ecfg.embedding_dim),
         "name": f"{base_name}-enroll",
         # enrollment provenance
@@ -305,10 +308,13 @@ def _swap_embedding(model, ecfg: EmulateConfig, n: int, dev, *,
         if init == "uniform":
             emb.weight.uniform_(-ENROLL_INIT_A, ENROLL_INIT_A)
         else:
-            table_mean = model.embedding.weight.detach().mean(dim=0)
+            table_mean = model.embedding_table().detach().mean(dim=0)
             emb.weight.copy_(table_mean.expand_as(emb.weight))
     model.embedding = emb
     model.eval()
+    # embed_scale (when embed_normalize is on) stays frozen by the requires_grad_(False)
+    # above: the sphere's radius was set during training and an enrolled device
+    # belongs on that same sphere, so only its direction is fitted.
     assert {id(p) for p in model.parameters() if p.requires_grad} == \
         {id(model.embedding.weight)}, "only the enrollment embedding may train"
     return emb.weight.detach().clone()
@@ -316,6 +322,7 @@ def _swap_embedding(model, ecfg: EmulateConfig, n: int, dev, *,
 
 def _fit_embedding(model, ecfg: EmulateConfig, train_ds, val_loader, dev, *,
                    epochs: int, lr: float, seed: int, log_path: Path,
+                   weight_decay: float = 0.0,
                    init_val: float, t0: float,
                    early_stop_patience: int = EARLY_STOP_PATIENCE,
                    plateau_patience: int = PLATEAU_PATIENCE,
@@ -330,7 +337,8 @@ def _fit_embedding(model, ecfg: EmulateConfig, train_ds, val_loader, dev, *,
     """
     R = model.receptive_field
     lossfn = EmulationLoss(ecfg.preemph, ecfg.stft_weight).to(dev)
-    opt = torch.optim.Adam(model.embedding.parameters(), lr=lr)
+    opt = torch.optim.Adam(model.embedding.parameters(), lr=lr,
+                           weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode="min", factor=plateau_factor, patience=plateau_patience)
     best_val = init_val                      # never keep rows worse than the init
@@ -688,7 +696,10 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
     val_pe = _np_esr(pred, target, coeff=ecfg.preemph)
 
     torch.save({
-        "embedding": best_emb.cpu(),                  # [1, dim]: concat-compatible
+        # Effective rows (scale * normalized direction) -- the same space every
+        # trained-table artifact is in, so export/load treat them alike. Reloading
+        # into the raw slot round-trips exactly: normalize() is scale-invariant.
+        "embedding": model.project_embedding(best_emb).cpu(),   # [1, dim]: concat-compatible
         "name": name, "embedding_dim": int(ecfg.embedding_dim),
         "base_run": base_name, "base_epoch": int(ck.get("epoch", -1)),
         "base_manifest_sha256": ck.get("manifest_sha256", ""),

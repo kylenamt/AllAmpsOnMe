@@ -1,0 +1,123 @@
+# Frozen DAC frames -> trained cross-attention pool -> small adapter -> the
+# delta_a2_tanh_r32_512 generator. Run name is the file stem -> results/joint/fp_dac_attn512/.
+#
+#   OPENAMP_DATA_DIR=data openamp joint --config configs/joint/fp_dac_attn512.yaml --overfit --limit-devices 8
+#   OPENAMP_DATA_DIR=data openamp joint --config configs/joint/fp_dac_attn512.yaml --limit-devices 16 --epochs 3
+#   OPENAMP_DATA_DIR=data openamp joint --config configs/joint/fp_dac_attn512.yaml
+#   OPENAMP_DATA_DIR=data openamp joint-eval results/joint/fp_dac_attn512
+#
+# The single change from fp_dac_delta512.yaml (this file is a copy of it): the
+# fixed mean+std pooling in results/fingerprint/dac/sweep_train is replaced by a
+# *trained* cross-attention pool (openamp.encoder.probe.CrossAttentionPool) over
+# results/dac_frames/sweep_train's raw per-frame DAC latents. Everything else --
+# generator, adapter shape, training schedule -- is unchanged, so any difference
+# in outcome traces to the pooling method and nothing else.
+#
+# Why this is worth running despite a discouraging prior result: probe.py
+# already trained this exact pooler to regress a frozen embedding table
+# directly, and it moved the pooled cloud's participation ratio only
+# 2.84 -> ~3.00 against mean+std -- evidence that DAC's own per-frame latents
+# cap out near 3 effective dimensions of amp identity, not that the reduction
+# was the bottleneck. This run asks the version of that question probe.py
+# didn't ask: whether training the pool against the reconstruction/ESR
+# gradient -- the signal that actually matters, not a proxy regression target --
+# shapes it differently. Measured cost: the same overfit_one_batch harness at
+# batch 32 runs this arm at roughly half the fingerprint arm's steps/sec (each
+# step moves a [B, 14728, 1024] frame tensor instead of a [B, 2048] vector), so
+# expect close to double fp_dac_delta512's original fresh-start wall time for
+# the same epoch count.
+#
+# One preprocessing difference this run does NOT control for: extract.py
+# loudness-normalizes to -16 LUFS (DAC's own training target) and keeps no dry
+# row, where encode_fingerprints.py undoes only the render's peak normalization
+# and subtracts a dry null (fp_preprocess: dry_l2). Re-extracting frames under
+# the fingerprint arm's exact preprocessing was not done here -- these are the
+# frames openamp.encoder.extract already produced for this purpose -- so a
+# result here reflects "attention pooling + LUFS-normalized, no-dry frames"
+# against "mean+std + scale-undone, dry-subtracted frames", not pooling alone.
+#
+# Baselines to read the result against, all on this generator:
+#   trained table, seen devices      best_val_esr 0.0334   (results/emulate/delta_a2_tanh_r32_512)
+#   fitted vector, unseen devices    <- results/emulate/delta_a2_tanh_r32_512/enroll
+#   mean+std fingerprint (this generator, resumed to convergence)  results/joint/fp_dac_delta512
+#     best_val_esr 0.12109 seen, holdout 1.07654 (≈ zero-conditioning baseline 1.11689)
+
+emulate:
+  # --- Model: delta_a2_tanh_r32_512, unchanged -------------------------------
+  arch: delta_wavenet
+  wn_channels: 8
+  wn_activation: tanh
+  embedding_dim: 512
+  single_device: -1
+  delta_rank: 32
+
+  # --- Training: fp_dac_delta512's original fresh-start schedule, not its
+  # later hand-annealed resume state -- this is a new run and should get a
+  # normal schedule, not one tuned to a different run's trajectory. -----------
+  holdout_frac: 0.1
+  clip_seconds: 2.0
+  batch_size: 32
+  pairs_per_epoch: 50000
+  epochs: 150
+  lr: 4.0e-3
+  weight_decay: 3.17e-7
+  plateau_patience: 3
+  plateau_factor: 0.5
+  early_stop_patience: 15
+  stft_weight: 0.05
+  preemph: 0.85
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50
+  # NEW vs fp_dac_delta512 (which ran at the 0.0 default): equalizes each
+  # device's expected share of the pooled ESR gradient instead of letting it
+  # track render power. joint_model/train.py did not read this field at all
+  # until this run needed it -- see its device_loss_weighting wiring, forked
+  # from emulate.train's. Not comparable against a strength-0 val_esr; per the
+  # holdout note there, the holdout probe stays unweighted regardless.
+  device_loss_weighting: 1.0
+
+joint:
+  # --- Conditioning source: the one thing this config changes -----------------
+  enc_kind: dac_frames
+  # openamp.encoder.extract's output: per-device [~14700, 1024] fp16 frame
+  # shards, memmapped and looked up by device id -- same lookup design as
+  # enc_kind: fingerprint, for the same reason (a codec fingerprint needs long
+  # audio to be reliable; a joint reference window is 2 s).
+  fp_frames_path: results/dac_frames/sweep_train
+
+  # --- Adapter: pool + projection, both trained ------------------------------
+  # CrossAttentionPool(latent_dim=1024, n_queries, d_model) -> pooled
+  # n_queries*d_model -> proj (Linear -> tanh -> Linear) -> 512. Same
+  # projection shape FingerprintEncoder and WaveNetEncoder both use, so this
+  # arm differs from the fingerprint arm in exactly one place: a trained pool
+  # stands where a frozen mean+std vector was looked up.
+  # 8x64=512, not probe.py's own 4x64=256 default: the fingerprint arm pools to
+  # 2048-d (ceiling exactly embedding_dim=512), so leaving this at 256 would
+  # hand the comparison a capacity handicap that has nothing to do with the
+  # pooling method being tested.
+  enc_pool_queries: 8
+  enc_pool_dim: 64
+  enc_proj_hidden: 128
+  enc_activation: tanh
+  # ON, for the same reason fp_dac_delta512 turns it on: nothing else bounds
+  # |e| and the reconstruction gradient inflates it.
+  enc_normalize: true
+  enc_lr: 5.0e-4
+  enc_weight_decay: 1.0e-4
+
+  # --- Inert under enc_kind: dac_frames --------------------------------------
+  # fp_path / fp_preprocess / fp_layernorm belong to enc_kind: fingerprint and
+  # do nothing here -- dac_frames has no precomputed pooled vector to look up
+  # and no dry row to subtract (extract.py keeps wet frames only). Left at
+  # their JointConfig defaults rather than restated.
+  ref_seconds: 2.0
+  ref_different_file: true
+  ref_min_gap_seconds: 1.0
+  sources: []
+  enc_channels: 16
+  enc_attn_hidden: 64
+  enc_head: stats
+  grad_checkpoint_encoder: false

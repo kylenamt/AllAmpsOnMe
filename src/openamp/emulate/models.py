@@ -3,9 +3,10 @@
 One dispatch point: everything downstream (dataset, losses, training loop,
 checkpointing, comparison CSV, demos) is architecture-agnostic as long as the
 model satisfies the shared contract — ``forward(x, device_idx) -> [B, 1, T]``
-same-length causal, an integer ``receptive_field`` property, an ``embedding``
-table, and construction from ``(EmulateConfig, n_devices)``. Adding an
-architecture = one class honoring that contract + one branch here.
+same-length causal, the same forward on a given vector as
+``forward_emb(x, emb)``, an integer ``receptive_field`` property, an
+``embedding`` table, and construction from ``(EmulateConfig, n_devices)``.
+Adding an architecture = one class honoring that contract + one branch here.
 """
 
 from __future__ import annotations

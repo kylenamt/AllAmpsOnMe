@@ -23,7 +23,7 @@ from torch import nn
 __all__ = ["FiLMWaveNet", "MLPFiLMWaveNet", "DeltaWaveNet", "TableDeltaWaveNet",
            "MLPFiLM", "DeltaWeightGen", "film_output_linear", "init_film_identity",
            "init_delta_zero", "per_sample_conv1d", "make_activation",
-           "normalize_activation",
+           "normalize_activation", "NormalizedEmbedding",
            "ACTIVATIONS", "NAM_ACTIVATION_NAMES", "A2_KERNEL_SIZES", "A2_DILATIONS",
            "A2_HEAD_KERNEL", "A2_ACTIVATION", "A2_COND_HIDDEN", "A2_COND_ACTIVATION",
            "A2_DELTA_RANK", "A2_DELTA_SCALE_INIT", "DELTA_PARTS_ALL",
@@ -134,6 +134,58 @@ def init_film_identity(film: nn.Module, channels: int, std: float = 0.0) -> None
     out.bias[channels:] = 0.0
 
 
+class NormalizedEmbedding:
+    """Mixin: read the table as ``e = scale * normalize(row)`` instead of raw rows.
+
+    - Direction lives on the unit sphere; magnitude is ONE global learned scalar
+      shared by every device. Measured on nam_a2_256_mixed's trained table, the
+      per-device radius carries nothing worth keeping -- corr(||e||, loudness)
+      = -0.02, corr(||e||, test ESR) = +0.10, flat across gain buckets, and the
+      whole table already sits in a shell (radius 4.04-4.93 at p25-p75). So this
+      makes explicit what training converged to anyway, at one parameter rather
+      than n_devices.
+    - A global scale, not a fixed radius of 1: FiLM is affine with gamma's bias
+      at 1, so e=0 is the *neutral* amp and ||e|| is distance from neutral.
+      Pinning it at 1 would shrink every embedding to ~22% of the radius the
+      table actually learns and systematically under-drive the conditioning
+      (openamp.encoder.probe's objection to L2-normalizing against a frozen
+      generator). The scale lets the sphere find its own radius instead.
+    - NOT LayerNorm: nn.LayerNorm's default elementwise_affine breaks the
+      constant norm outright, and even without it LN removes the per-vector mean
+      -- forcing every embedding orthogonal to the all-ones direction, which is
+      an arbitrary constraint on an embedding table (it rotates real rows by up
+      to cos 0.969 here). F.normalize is the operation that means "unit sphere".
+    - Gradients flow through the normalize, so updates are projected tangent to
+      the sphere and the radius moves only via ``embed_scale`` -- the same
+      direction/magnitude split DeltaWeightGen uses for its basis.
+
+    ``forward_emb`` is deliberately NOT covered: it takes an already-effective
+    embedding, so an encoder or morph point stays in charge of its own vector.
+    """
+
+    def _init_embed_normalize(self, enabled: bool, dim: int, std: float) -> None:
+        """Register ``embed_scale`` when enabled. Init matches the raw table's own
+        init magnitude (std*sqrt(dim)), so turning this on does not move the
+        starting point."""
+        self.embed_normalize = bool(enabled)
+        if self.embed_normalize:
+            self.embed_scale = nn.Parameter(torch.tensor(float(std) * dim ** 0.5))
+
+    def project_embedding(self, emb: torch.Tensor) -> torch.Tensor:
+        """Raw row(s) -> effective embedding. Identity when the knob is off."""
+        if not getattr(self, "embed_normalize", False):
+            return emb
+        return self.embed_scale * F.normalize(emb, dim=-1)
+
+    def embed(self, device_idx: torch.Tensor) -> torch.Tensor:
+        """Effective embedding rows for a ``[B]`` tensor of table indices."""
+        return self.project_embedding(self.embedding(device_idx))
+
+    def embedding_table(self) -> torch.Tensor:
+        """The full effective ``[n_devices, dim]`` table (what export/enroll read)."""
+        return self.project_embedding(self.embedding.weight)
+
+
 class MLPFiLM(nn.Module):
     """Nonlinear embedding -> (gamma, beta) generator: Linear -> act -> Linear.
 
@@ -187,7 +239,7 @@ class FiLMWaveNetLayer(nn.Module):
         return x + self.layer1x1(z), z                   # (residual, head term)
 
 
-class FiLMWaveNet(nn.Module):
+class FiLMWaveNet(NormalizedEmbedding, nn.Module):
     """Conditioned A2-WaveNet emulator: (audio, device_idx) -> emulated audio.
 
     Same contract as FiLMTCN: input [B,T] or [B,1,T] mono @ 48kHz, device_idx a
@@ -202,7 +254,8 @@ class FiLMWaveNet(nn.Module):
                  kernel_sizes: tuple[int, ...] = A2_KERNEL_SIZES,
                  dilations: tuple[int, ...] = A2_DILATIONS,
                  head_kernel: int = A2_HEAD_KERNEL,
-                 head_scale: float = A2_HEAD_SCALE):
+                 head_scale: float = A2_HEAD_SCALE,
+                 embed_normalize: bool = False):
         super().__init__()
         if len(kernel_sizes) != len(dilations):
             raise ValueError(f"kernel_sizes ({len(kernel_sizes)}) and dilations "
@@ -221,6 +274,7 @@ class FiLMWaveNet(nn.Module):
 
         self.embedding = nn.Embedding(self.n_devices, self.embedding_dim)
         nn.init.normal_(self.embedding.weight, std=A2_EMBEDDING_STD)
+        self._init_embed_normalize(embed_normalize, self.embedding_dim, A2_EMBEDDING_STD)
 
         self.rechannel = nn.Conv1d(1, self.channels, 1, bias=False)
         self.layers = nn.ModuleList(self._make_layer(k, d)
@@ -259,7 +313,8 @@ class FiLMWaveNet(nn.Module):
         """Construct from an EmulateConfig."""
         return cls(n_devices=n_devices, channels=ecfg.wn_channels,
                    embedding_dim=ecfg.embedding_dim,
-                   activation=ecfg.wn_activation)
+                   activation=ecfg.wn_activation,
+                   embed_normalize=ecfg.embed_normalize)
 
     @staticmethod
     def compute_receptive_field(kernel_sizes=A2_KERNEL_SIZES, dilations=A2_DILATIONS,
@@ -292,7 +347,7 @@ class FiLMWaveNet(nn.Module):
         return self.head_scale * y                       # [B, 1, T]
 
     def forward(self, x: torch.Tensor, device_idx: torch.Tensor) -> torch.Tensor:
-        return self.forward_emb(x, self.embedding(device_idx))
+        return self.forward_emb(x, self.embed(device_idx))
 
 
 class MLPFiLMWaveNet(FiLMWaveNet):
@@ -317,7 +372,8 @@ class MLPFiLMWaveNet(FiLMWaveNet):
                    embedding_dim=ecfg.embedding_dim,
                    activation=ecfg.wn_activation,
                    cond_hidden=ecfg.cond_hidden,
-                   cond_activation=ecfg.cond_activation)
+                   cond_activation=ecfg.cond_activation,
+                   embed_normalize=ecfg.embed_normalize)
 
 
 # --- Delta family: delta_wavenet -------------------------------------------------
@@ -467,7 +523,8 @@ class DeltaWaveNet(FiLMWaveNet):
         return cls(n_devices=n_devices, channels=ecfg.wn_channels,
                    embedding_dim=ecfg.embedding_dim,
                    activation=ecfg.wn_activation,
-                   delta_rank=ecfg.delta_rank)
+                   delta_rank=ecfg.delta_rank,
+                   embed_normalize=ecfg.embed_normalize)
 
 
 # --- TableDelta family: tabledelta_wavenet ---------------------------------------
@@ -596,6 +653,12 @@ class TableDeltaWaveNet(FiLMWaveNet):
     @classmethod
     def from_config(cls, ecfg, n_devices: int) -> "TableDeltaWaveNet":
         """Construct from an EmulateConfig."""
+        if ecfg.embed_normalize:
+            raise ValueError(
+                "emulate.embed_normalize is meaningless for tabledelta_wavenet: its "
+                "table holds per-device conv-weight residuals, not points in a shared "
+                "embedding space, so projecting rows onto a sphere would rescale weight "
+                "deltas at an unrelated magnitude. Set embed_normalize: false.")
         return cls(n_devices=n_devices, channels=ecfg.wn_channels,
                    activation=ecfg.wn_activation)
 

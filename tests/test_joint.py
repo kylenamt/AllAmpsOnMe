@@ -805,3 +805,146 @@ def test_pre_fingerprint_checkpoints_still_resume(tmp_path):
         saved.pop(k, None)                       # as an older run's config.yaml would be
     ck = {"emulate_cfg": asdict(cfg.emulate), "joint_cfg": saved}
     _check_resume_compatible(ck, cfg.emulate, jcfg, None, None)
+
+
+# --- Frame windowing (joint.enc_frame_window) -----------------------------------
+def _write_frames(tmp_path, device_ids, *, n_frames=200, dim=16):
+    """A synthetic dac_frames run dir. Frame t holds the value t in every column,
+    so a returned window says exactly which slice was read."""
+    import json
+
+    run = tmp_path / "frames" / "sweep_train"
+    (run / "frames").mkdir(parents=True, exist_ok=True)
+    for d in device_ids:
+        np.save(run / "frames" / f"{int(d):04d}.npy",
+                np.broadcast_to(np.arange(n_frames, dtype=np.float16)[:, None],
+                                (n_frames, dim)).copy())
+    (run / "meta.json").write_text(json.dumps(
+        {"device_ids": [int(d) for d in device_ids], "n_frames": n_frames,
+         "latent_dim": dim}))
+    return run
+
+
+def _frame_encoder(tmp_path, device_ids, **kw):
+    from openamp.encoder.probe import FrameStore
+    from openamp.joint_model.frame_encoder import FrameAttentionEncoder
+
+    store = FrameStore(_write_frames(tmp_path, device_ids))
+    kw.setdefault("embedding_dim", 16)
+    kw.setdefault("n_queries", 2)
+    kw.setdefault("d_model", 8)
+    kw.setdefault("proj_hidden", 8)
+    return FrameAttentionEncoder(frames=store, **kw), store
+
+
+def test_frame_store_window_reads_the_requested_slice(tmp_path):
+    from openamp.encoder.probe import FrameStore
+
+    store = FrameStore(_write_frames(tmp_path, [3, 7, 11]))
+    assert store.batch([3, 7, 11], "cpu").shape == (3, 200, 16)   # window off: all frames
+    w = store.batch([3, 7, 11], "cpu", window=50, starts=[0, 10, 150])
+    assert w.shape == (3, 50, 16)
+    assert [float(w[i, 0, 0]) for i in range(3)] == [0.0, 10.0, 150.0]
+    assert [float(w[i, -1, 0]) for i in range(3)] == [49.0, 59.0, 199.0]
+
+
+def test_frame_store_names_the_start_that_overruns(tmp_path):
+    """np.stack would report only 'arrays must have the same shape'."""
+    from openamp.encoder.probe import FrameStore
+
+    store = FrameStore(_write_frames(tmp_path, [3, 7]))
+    with pytest.raises(ValueError, match="overruns"):
+        store.batch([3, 7], "cpu", window=50, starts=[0, 190])
+    with pytest.raises(ValueError, match="overruns"):
+        store.batch([3, 7], "cpu", window=50, starts=[-1, 0])
+    with pytest.raises(ValueError, match="starts has"):
+        store.batch([3, 7], "cpu", window=50, starts=[0])
+
+
+def test_frame_window_makes_one_device_many_inputs(tmp_path):
+    """The point of the knob: the same id must not resolve to one fixed tensor."""
+    enc, _ = _frame_encoder(tmp_path, [3, 7, 11], frame_window=50)
+    ref = torch.tensor([3, 7, 11])
+    enc.train()
+    assert not torch.allclose(enc(ref), enc(ref))
+
+
+def test_frame_window_is_deterministic_and_centred_in_eval(tmp_path):
+    """A val/holdout number has to be reproducible epoch to epoch, and drawn from
+    the same window length training used — the pool's softmax runs over frames."""
+    enc, _ = _frame_encoder(tmp_path, [3, 7, 11], frame_window=50)
+    ref = torch.tensor([3, 7, 11])
+    enc.eval()
+    assert torch.allclose(enc(ref), enc(ref))
+    assert enc.window_starts(3) == [75, 75, 75]         # (200 - 50) // 2
+
+
+def test_frame_window_off_is_the_original_path(tmp_path):
+    enc, _ = _frame_encoder(tmp_path, [3, 7, 11])
+    ref = torch.tensor([3, 7, 11])
+    assert enc.frame_window == 0 and enc.window_starts(3) is None
+    enc.train()
+    assert torch.allclose(enc(ref), enc(ref))          # no draw, so no variation
+    assert enc.capacity_report()["frame_window"] == 0
+
+
+def test_frame_window_must_fit_the_shards(tmp_path):
+    with pytest.raises(ValueError, match="exceeds"):
+        _frame_encoder(tmp_path, [3, 7], frame_window=201)
+    with pytest.raises(ValueError, match="frame_window"):
+        _frame_encoder(tmp_path, [3, 7], frame_window=-1)
+
+
+def test_frame_window_is_structural_on_resume(tmp_path):
+    """Changing what the encoder reads mid-run would silently change the method."""
+    from openamp.joint_model.train import _check_resume_compatible
+
+    ecfg = load_config(data_dir=tmp_path).emulate
+    base = dict(enc_kind="dac_frames", fp_frames_path="/a", enc_frame_window=1700)
+    ck = {"emulate_cfg": asdict(ecfg), "joint_cfg": asdict(JointConfig(**base))}
+    _check_resume_compatible(ck, ecfg, JointConfig(**base), None, None)
+    with pytest.raises(Exception, match="enc_frame_window"):
+        _check_resume_compatible(ck, ecfg, JointConfig(**{**base, "enc_frame_window": 800}),
+                                 None, None)
+
+
+# --- Embedding jitter (emulate.embed_noise_frac) ---------------------------------
+def test_jitter_is_off_at_zero():
+    from openamp.joint_model.train import jitter
+
+    e = torch.randn(4, 64)
+    assert torch.equal(jitter(e, 0.0, True), e)
+    assert torch.equal(jitter(e, 0.0, False), e)
+
+
+def test_jitter_stays_on_the_sphere_and_scales_with_frac():
+    """enc_normalize puts e on the unit sphere, so jitter must move it *along* the
+    sphere: an additive perturbation would move |e| instead, an axis the generator
+    never sees vary. frac is read against 1/sqrt(De), so ||de|| ~= frac."""
+    from openamp.joint_model.train import jitter
+
+    torch.manual_seed(0)
+    e = torch.nn.functional.normalize(torch.randn(256, 512), dim=-1)
+    for frac in (0.05, 0.15, 0.3):
+        j = jitter(e, frac, True)
+        assert torch.allclose(j.norm(dim=-1), torch.ones(256), atol=1e-5)
+        assert abs(float((j - e).norm(dim=-1).mean()) - frac) < 0.1 * frac
+
+
+def test_jitter_without_normalize_scales_with_the_batch_std():
+    from openamp.joint_model.train import jitter
+
+    torch.manual_seed(0)
+    e = torch.randn(256, 512) * 4.0
+    j = jitter(e, 0.15, False)
+    ratio = float(((j - e).std() / e.std()))
+    assert abs(ratio - 0.15) < 0.02
+
+
+def test_jitter_carries_gradient_to_the_clean_embedding():
+    """Noise must not become a gradient path of its own — e still has to train."""
+    from openamp.joint_model.train import jitter
+
+    e = torch.nn.functional.normalize(torch.randn(4, 32), dim=-1).requires_grad_(True)
+    jitter(e, 0.2, True).sum().backward()
+    assert e.grad is not None and torch.isfinite(e.grad).all() and e.grad.abs().sum() > 0
