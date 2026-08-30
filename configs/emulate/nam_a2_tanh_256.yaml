@@ -12,7 +12,6 @@ emulate:
   arch: film_wavenet
   wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
   embedding_dim: 256       # the only change from nam_a2.yaml (128)
-  single_device: -1        # -1 = one-to-many over all render-ok devices
   wn_activation: tanh      # "leakyrelu" (the capture default) | "tanh"  <- the knob
 
   # --- Training (NAM's A2 numbers where the knob exists) -----------------------

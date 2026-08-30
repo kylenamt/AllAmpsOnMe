@@ -19,7 +19,6 @@ emulate:
   arch: film_wavenet
   wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
   embedding_dim: 128       # no NAM analogue (a capture is single-device); _256/_512 sweep this
-  single_device: -1        # -1 = one-to-many over all render-ok devices
 
   # --- Training ----------------------------------------------------------------
   holdout_frac: 0.1

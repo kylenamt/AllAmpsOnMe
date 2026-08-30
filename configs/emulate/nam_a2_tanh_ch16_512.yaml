@@ -32,7 +32,6 @@ emulate:
   arch: film_wavenet
   wn_channels: 16          # off NAM's own schema; conv weights scale as channels^2
   embedding_dim: 512       # the only knob changed from nam_a2_tanh_ch16_256.yaml (256)
-  single_device: -1        # -1 = one-to-many over all render-ok devices
   wn_activation: tanh      # "leakyrelu" (the capture default) | "tanh"
 
   # --- Training (NAM's A2 numbers where the knob exists) -----------------------

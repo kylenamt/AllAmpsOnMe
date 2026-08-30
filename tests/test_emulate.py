@@ -564,8 +564,6 @@ def test_device_index_is_sorted_and_stable(tmp_path):
     _build_corpus(cfg, [("f0", "train", sig)], devices=[5, 2, 9])
     ids, idx = build_device_index(cfg)
     assert ids == [2, 5, 9] and idx == {2: 0, 5: 1, 9: 2}
-    # one-to-one baseline -> a single-row table
-    assert build_device_index(cfg, single_device=5) == ([5], {5: 0})
     assert len(manifest_signature(cfg)) == 64          # sha-256 hex of the manifest
 
 
@@ -587,9 +585,6 @@ def test_holdout_excluded_persisted_and_bypassed(tmp_path):
     assert sorted(idx.values()) == list(range(8))
     # frac <= 0 disables the holdout even when the file exists
     assert load_or_create_holdout(cfg, 0.0, seed=1) == []
-    # single-device baseline ignores exclude (Phase 5 targets held-out devices)
-    assert build_device_index(cfg, single_device=held[0], exclude=held) == \
-        ([held[0]], {held[0]: 0})
 
 
 def test_pairs_are_aligned_and_warmed(tmp_path):

@@ -18,7 +18,6 @@ emulate:
   arch: delta_wavenet      # A2 topology; embedding -> low-rank residual on each conv
   wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
   embedding_dim: 512       # widened with the rank so 23*32=736 DOF is not clipped to 256
-  single_device: -1        # -1 = one-to-many over all render-ok devices
   delta_rank: 32           # generator is the limit only above rank 22 at this E
 
   # --- Training (NAM's A2 numbers where the knob exists) -----------------------

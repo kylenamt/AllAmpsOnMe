@@ -15,7 +15,6 @@ emulate:
   arch: delta_wavenet      # A2 topology; embedding -> low-rank residual on each conv
   wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
   embedding_dim: 256
-  single_device: -1        # -1 = one-to-many over all render-ok devices
   delta_rank: 6            # parameter-matched to nam_a2_256's linear FiLM (see above)
 
   # --- Training (NAM's A2 numbers where the knob exists) -----------------------

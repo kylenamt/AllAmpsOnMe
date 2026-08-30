@@ -46,7 +46,6 @@ emulate:
   wn_channels: 8           # A2 full-width submodel
   wn_activation: tanh
   embedding_dim: 512       # widened with the rank so 23*32=736 DOF is not clipped
-  single_device: -1
   delta_rank: 32
 
   # --- Training ---------------------------------------------------------------

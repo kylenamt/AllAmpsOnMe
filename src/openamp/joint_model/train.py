@@ -621,7 +621,7 @@ def _save_config_copy(run_dir: Path, ecfg, jcfg) -> None:
 # every encoder-shape knob, plus enc_normalize/fp_path/fp_preprocess -- these
 # change no shape, but a swap would quietly feed the generator a different vector.
 _STRUCTURAL_EMULATE = ("arch", "wn_channels", "wn_activation", "cond_hidden",
-                       "cond_activation", "delta_rank", "embedding_dim", "single_device")
+                       "cond_activation", "delta_rank", "embedding_dim")
 _STRUCTURAL_JOINT = ("enc_channels", "enc_activation", "enc_attn_hidden",
                      "enc_proj_hidden", "enc_normalize", "enc_head", "enc_taps",
                      "enc_tap_stride", "enc_expand_dim", "enc_n_heads",

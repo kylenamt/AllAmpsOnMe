@@ -106,21 +106,15 @@ def load_or_create_holdout(config, frac: float, seed: int) -> list[int]:
     return ids
 
 
-def build_device_index(config, single_device: int | None = None, *,
-                       exclude: "set[int] | list[int]" = ()
+def build_device_index(config, *, exclude: "set[int] | list[int]" = ()
                        ) -> tuple[list[int], dict[int, int]]:
     """Canonical ``(device_ids, {device_id: row})`` for the embedding table.
 
-    ``single_device >= 0`` builds a one-row table for the one-to-one baseline
-    (``exclude`` is ignored there — Phase 5 trains one-to-one on held-out
-    devices); otherwise the table spans every render-ok device not in
-    ``exclude``, in a fixed sorted order.
+    The table spans every render-ok device not in ``exclude``, in a fixed sorted
+    order.
     """
-    if single_device is not None and single_device >= 0:
-        ids = [int(single_device)]
-    else:
-        drop = set(exclude)
-        ids = [d for d in render_ok_devices(config) if d not in drop]
+    drop = set(exclude)
+    ids = [d for d in render_ok_devices(config) if d not in drop]
     return ids, {d: i for i, d in enumerate(ids)}
 
 

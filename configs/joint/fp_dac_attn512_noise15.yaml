@@ -44,7 +44,6 @@ emulate:
   wn_channels: 8
   wn_activation: tanh
   embedding_dim: 512
-  single_device: -1
   delta_rank: 32
 
   # --- Training: fp_dac_delta512's original fresh-start schedule, not its

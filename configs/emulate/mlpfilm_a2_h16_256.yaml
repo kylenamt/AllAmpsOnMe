@@ -16,7 +16,6 @@ emulate:
   arch: mlpfilm_wavenet    # A2 topology; per-layer MLP maps embedding -> (gamma, beta)
   wn_channels: 8           # A2 full-width submodel (the exports' other width is 3)
   embedding_dim: 256
-  single_device: -1        # -1 = one-to-many over all render-ok devices
   cond_hidden: 16          # 4,384 params/layer vs film_wavenet's 4,112 — matched
   cond_activation: leakyrelu
 

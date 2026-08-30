@@ -53,7 +53,6 @@ class EmulateConfig:
 
     # --- Shared model knobs ----------------------------------------------------------
     embedding_dim: int = 64          # per-device embedding, fed to every layer
-    single_device: int = -1          # >=0: one-to-one baseline trained on that device_id
     # Read the table as e = embed_scale * normalize(row): direction on the unit
     # sphere, magnitude one global learned scalar. Structural (adds embed_scale
     # to the state_dict), so it cannot change on --resume. See

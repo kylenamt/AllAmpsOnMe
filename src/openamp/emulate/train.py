@@ -103,13 +103,9 @@ class EmulationLoss(nn.Module):
 def _device_index(cfg: Config, ecfg, limit_devices: int | None):
     """Resolve ``(device_ids, id_to_idx, holdout_ids)`` for a run.
 
-    One-to-one baseline picks a single device (no holdout — Phase 5 targets
-    held-out devices this way); otherwise the ``holdout_frac`` device holdout is
-    excluded first, then ``--limit-devices N`` keeps the first N (the mini-run).
+    The ``holdout_frac`` device holdout is excluded first, then
+    ``--limit-devices N`` keeps the first N (the mini-run).
     """
-    if ecfg.single_device is not None and ecfg.single_device >= 0:
-        ids, id_to_idx = build_device_index(cfg, ecfg.single_device)
-        return ids, id_to_idx, []
     holdout = load_or_create_holdout(cfg, ecfg.holdout_frac, cfg.seed)
     ids, _ = build_device_index(cfg, exclude=holdout)
     if limit_devices:
@@ -511,7 +507,6 @@ def train(cfg: Config, *, name: str = "default", device: str = "cuda",
         "receptive_field_samples": R, "receptive_field_ms": round(rf_ms, 3),
         "embedding_dim": emb_dim, "channels": arch["channels"],
         "blocks_x_layers": arch["blocks_x_layers"], "n_devices": len(ids),
-        "single_device": ecfg.single_device,
         "device_loss_weighting": ecfg.device_loss_weighting,
         "best_val_esr": best_val,
         "val_esr": val_true, "val_esr_shuffled": val_shuf,
@@ -548,7 +543,7 @@ def _save_config_copy(run_dir: Path, ecfg) -> None:
 # network than the weights were trained for.
 _STRUCTURAL_KEYS = ("arch", "wn_channels", "wn_activation",
                     "cond_hidden", "cond_activation", "delta_rank",
-                    "embedding_dim", "single_device", "embed_normalize")
+                    "embedding_dim", "embed_normalize")
 
 
 def _check_resume_compatible(ck: dict, ecfg, receptive_field: int, n_devices: int) -> None:
