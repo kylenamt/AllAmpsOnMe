@@ -42,25 +42,55 @@ src/openamp/
     render.py             #   stage: GPU-render the corpus through each device (resumable)
     verify.py             #   stage: completeness + signal sanity + QA exports -> devices_final
 
-  emulate/                # one-to-many amp foundation models (FiLM-conditioned)
-    tcn.py                #   fully-parametric FiLM-TCN + per-device embedding table
-    wavenet.py            #   the NAM A2 capture topology, FiLM-conditioned: linear or MLP generator
-    models.py             #   arch selection: `emulate.arch` -> build_model()
-    dataset.py            #   clean-in / render-out training pairs (real left-context warmup)
-    train.py              #   the one training script (pre-emph ESR + MRSTFT) + sanity ladder
-    evaluate.py           #   size-comparison harness (-> comparison.csv) + per-amp ESR + demo export
-    enroll.py             #   Phase 5: fit an embedding for an unseen device, frozen net
-    export.py             #   plugin bundle + pasteable embedding profiles (weight folding)
+  spec.py                 # the resolved experiment: RunSpec + its five sections
+  data/                   # datasets and dataloaders (registry: `data.dataset`)
+    corpus_index.py       #   CorpusPaths, the device index, the holdout file
+    emulation.py          #   clean-in / render-out pairs, real left-context warmup
+    grid.py               #   the same fixed window grid for every device
+    joint.py              #   a window plus a disjoint reference segment
+    pair.py               #   one (dry, wet) recording, for pair enrollment
+    loaders.py            #   make_loader: seeded, worker-safe DataLoader
 
-  encoder/                # tone encoder: (dry, wet) capture audio -> 512-d tone vector
-    model.py              #   the two-branch (static / dynamic) waveform encoder
-    dataset.py            #   P x K capture episodes + the train/val time-split policy
-    train.py              #   contrastive trainer (SupCon + cross-covariance + probes)
-    evaluate.py           #   the diagnostics gate (retrieval, dry ablation, redundancy, probes)
+  models/                 # conditioned architectures (registry: `model.arch`)
+    blocks.py             #   activations, per-sample conv, normalized embedding,
+                          #   the FiLM and weight-delta generators
+    a2_wavenet.py         #   the NAM A2 topology in its three conditioned variants
+    joint.py              #   JointModel: encoder -> embedding -> generator
+
+  encoders/               # conditioning encoders (registry: `joint.encoder.kind`)
+    pooling.py            #   attentive stats pooling, cross-attention, the frame store
+    wavenet.py            #   encode a (dry, wet) window with a non-causal A2 backbone
+    fingerprint.py        #   look up a frozen codec's pooled vector by device id
+    frames.py             #   pool a frozen codec's raw frames with a trained head
+
+  losses.py               # the objectives (registry: `loss.name`) + device weighting
+
+  training/               # the two loops and the bookkeeping they share
+    artifacts.py          #   RunDir: everything a run writes; the resume check
+    optim.py              #   plateau scheduler, AMP dtype/scaler, grad clip
+    emulate.py            #   the table-conditioned loop + sanity ladder
+    joint.py              #   the encoder+generator loop + collapse tripwire
+
+  evaluation/             # scoring a finished run
+    metrics.py            #   the two ESR definitions every caller shares
+    emulate.py            #   load_model, comparison.csv, per-amp ESR, demo WAVs
+    joint.py              #   collapse and leakage diagnostics
+    geometry.py           #   k-NN retrieval + t-SNE writer
+
+  enroll/                 # fit an embedding for an amp the network never saw
+    fit.py                #   the fitting loop; corpus holdout and (dry, wet) pair
+    alignment.py          #   reamp latency, capture regions, chunked rendering
+
+  export.py               # plugin weight bundle + pasteable profiles (weight folding)
+
+  probes/                 # standalone feasibility probes, wired into nothing
+    extract.py            #   frozen DAC over each render, frames kept
+    probe.py              #   cross-attention pooler regressed onto a trained table
 ```
 
-- `core` and (mostly) `acquire` load on a bare numpy/pandas stack; `dsp`, `emulate` and `encoder` pull torch / soundfile / NAM (`emulate` also uses auraloss).
-- **`encoder` is standalone**: no `emulate` module imports from it, and nothing consumes the tone vector yet. The one dependency runs the other way — `encoder/dataset.py` reuses `emulate/dataset.py`'s corpus plumbing (`EmulationDataset` for manifest resolution, source filtering and device-row mapping; `read_with_retry` for the NFS retry policy).
+- `core` and (mostly) `acquire` load on a bare numpy/pandas stack; everything from `spec.py` down pulls torch / soundfile / auraloss.
+- **The training half is five seams**, each a registry plus a contract plus a config section that names the implementation: `data`, `models`, `encoders`, `losses`, and the objective's own `training` knobs. Adding one is a new file and a config line; the loops name no implementation. See the worked example in [README.md](../README.md#adding-an-architecture).
+- **`probes/` is standalone**: nothing imports from it, and the dependency runs one way — it reuses `data`, `evaluation` and `encoders.pooling`.
 - `cli.py` imports each stage module lazily inside its command body, so `openamp --help` and metadata-only verbs stay fast without loading torch.
 
 ---
@@ -101,40 +131,98 @@ Run order (each is one `openamp` verb). "Reads" / "Writes" are files under `data
 - **render**: loads each device's `.nam` on the GPU, streams every clean file through it **whole-file, chunked with left-context** (bit-identical to a single forward pass, no clip-boundary transients), then scales/encodes/hashes the output. Resumable and idempotent per device.
 - **verify**: completeness + per-signal sanity (non-finite / silent / pass-through / misaligned), writes the final verified device list, exports a few clean/render WAV + spectrogram QA pairs.
 
-### C. Emulation foundation model — `openamp.emulate`
+### C. Training — `openamp.training`
 
 | Verb | Module | Reads | Writes |
 |---|---|---|---|
-| `emulate` | `train.py` | `renders/`, `renders.parquet`, `corpus.parquet` | `results/emulate/<name>/{checkpoint,last}.pt`, `config.yaml`, `metrics.json`, `train_log.csv`, `embedding.pt` |
-| `emulate-compare` | `evaluate.py` | run dirs + test renders | `results/emulate/comparison.csv` |
-| `emulate-validate` | `evaluate.py` | one run + test renders | `results/emulate/<name>/per_device_esr.csv` |
-| `emulate-demo` | `evaluate.py` | a run + test renders | `results/emulate/demos/*.wav` |
-| `encode` | `encoder/train.py` | `renders/` + `corpus.parquet` (sweep source) | `results/encoder/<name>/{checkpoint,last}.pt`, `config.yaml`, `metrics.json`, `encoder_log.csv` |
-| `encode-eval` | `encoder/evaluate.py` | one encoder run + renders | `results/encoder/<name>/{diagnostics.json,capture_embeddings.npz,tsne.csv,tsne.png}` |
+| `emulate` | `training/emulate.py` | `renders/`, `renders.parquet`, `corpus.parquet` | `results/emulate/<name>/{checkpoint,last}.pt`, `resolved_config.yaml`, `metrics.json`, `train_log.csv`, `embedding.pt` |
+| `joint` | `training/joint.py` | the same, plus the encoder's fingerprints/frames | `results/joint/<name>/…` (same set, no `embedding.pt`) |
+| `emulate-compare` | `evaluation/emulate.py` | run dirs + test renders | `results/emulate/comparison.csv` |
+| `emulate-validate` | `evaluation/emulate.py` | one run + test renders | `results/emulate/<name>/per_device_esr.csv` |
+| `emulate-demo` | `evaluation/emulate.py` | a run + test renders | `results/emulate/demos/*.wav` |
+| `joint-eval` | `evaluation/joint.py` | one joint run + renders | `results/joint/<name>/{diagnostics.json,tsne.csv}` |
+| `emulate-enroll` | `enroll/fit.py` | a finished run + a held-out device's renders | `<run>/enroll/{enrolled_embeddings.pt,enrollment.csv,metrics.json}` |
 
-- One conditioned model emulates **all** devices, steered by a learnable per-device embedding (conditioning at every layer). Five architectures share the same contract, selected by `emulate.arch` (`models.build_model`):
-  - **FiLM-TCN** (`tcn.py`) — fully parametric: `blocks`, `layers_per_block`, `channels`, `kernel_size`, `dilation_growth`, `embedding_dim` are all plain config knobs.
-  - **FiLM-WaveNet** (`wavenet.py`) — the exact NAM A2 topology every corpus capture uses (23 dilated layers, receptive field 6347), device FiLM at the schema's pre-activation hook. Knobs: `wn_channels`, `wn_activation` (`leakyrelu` — the captures' own — or `tanh`).
-  - **MLP-FiLM WaveNet** (`mlpfilm_wavenet`, same file/topology) — each layer's embedding → (γ, β) generator is an independent `Linear(E, cond_hidden) → cond_activation → Linear(cond_hidden, 2C)` instead of one `Linear(E, 2C)`, so a device's position in embedding space steers the network nonlinearly.
-  - **Delta WaveNet** (`delta_wavenet`, same file/topology) — no FiLM: the embedding generates a rank-`delta_rank` residual on each layer's **own weights**, `z = conv_{W + dW(e), b + db(e)}(x) + (mixin_w + dm(e))·clean`. FiLM is the special case `dW = (γ−1)·W`, `db = (γ−1)·b + β`, `dm = (γ−1)·mixin_w` — a strict superset of the FiLM hook, so a device can retime a filter rather than only re-gain it.
-    - The residual is `scale · coeff(e) @ normalize(basis)`: unit-norm directions with magnitude held in one scalar per layer. Without the split, magnitude spreads through `basis` for free and the optimizer rebuilds each device's kernel from its own residual — measured at 5.1× the base weight before the split was introduced.
-  - **Table-Delta WaveNet** (`tabledelta_wavenet`, same file/topology) — the full-rank control for the above: the same `dW`/`db`/`dm` residual, but looked up whole from a `[N_devices, 10352]` table rather than generated, so nothing is shared between devices except the base kernels. Its `embedding_dim` is **derived** from the schedule (`ecfg.embedding_dim` is ignored), it has no capacity knob, and parameters scale with the device count (4.2M at 405). `set_delta_parts(kernel=…, bias=…, mixin=…)` masks the residual at inference — an analysis knob for which slice carries the amp, honoured by the fold so a masked capture matches what you heard.
-  - All five fold into a plugin-playable A2 capture — the conditioning generator never runs in the real-time DSP loop (for the two delta archs, the fold *is* the addition the layer would have done). A sweep is copy-a-config-and-change-numbers, no code change.
-  - The first four share one `[N_devices × embedding_dim]` table that is a *map* into network behaviour, so enrollment, morphing and profile export are architecture-independent. `tabledelta_wavenet` is the exception by construction: its rows are per-device weight blobs with no shared structure, so an unseen device has nothing to be positioned within and `emulate-enroll` refuses it outright (`enroll.require_enrollable`) rather than fitting a table the network never reads.
-- `dataset.py` serves clean-in / render-out pairs, with the receptive field of **real left-context** prefixed for warmup (loss only on the warmed region).
-- `train.py` optimizes pre-emphasized ESR + multi-resolution STFT (auraloss) with Adam + reduce-on-plateau, runs the sanity ladder (`--overfit`, `--limit-devices`), and saves the embedding table + its manifest hash separately (Phase 5 extends it).
-- `evaluate.py` appends one test-split row per run to `comparison.csv` (the architecture-exploration deliverable), breaks a single run back out per amp into `per_device_esr.csv` (every device scored on the *same* window grid, so rows rank amps against each other), and exports clean/target/prediction listening demos.
+**One experiment is one `RunSpec`.** `openamp emulate --config configs/emulate/<name>.yaml`
+reads that file once, in `spec.load_run_spec`, and everything below takes the spec.
+Its five sections each name an implementation in a registry:
 
-### Tone encoder (`encoder*.py`) — the amortized counterpart to enrollment
+| Section | Registry | Contract lives in |
+|---|---|---|
+| `model:` | `models.MODELS` | `models/__init__.py` |
+| `data:` | `data.DATASETS` | `data/__init__.py` |
+| `loss:` | `losses.LOSSES` | `losses.py` |
+| `joint.encoder:` | `encoders.ENCODERS` | `encoders/__init__.py` |
+| `training:` | — (the loop's own knobs) | `spec.TrainingSpec` |
 
-Enrollment obtains a device's conditioning vector by gradient descent against a frozen network (up to 30 epochs per amp). The tone encoder is the feed-forward version of that question: a map from the capture audio itself to a tone vector.
+`model.kwargs` and `loss.kwargs` are opaque and reach the registered class
+untouched, so a config uses constructor parameter names and a new implementation
+needs no schema change. See [README.md](../README.md#adding-an-architecture).
 
-- **Input is a 2-channel `(dry, wet)` pair**, not just the wet. An amp is a transfer *relation*, so the encoder is shown "this input produced that output". Corpus renders are sample-aligned with their clean source by construction, so no alignment step is needed (`enroll.blip_lag` is only for real hardware captures).
-- **Two branches over one strided stem** (256× downsample → 187.5 Hz frames): a **static** branch (3 dilated blocks, RF 29 frames = 155 ms, mean-pooled) for spectral character, and a **dynamic** branch (8 blocks, RF 1021 frames = 5.45 s, pooled as `mean, std, |mean(Δ)|, std(Δ)`) for attack/sustain/compression. Each is L2-normalized **separately** before the concat, so neither dominates the 512-d vector by norm.
-- **Trained with SupCon on `device_id`** (= one capture = one amp at one setting), plus a Barlow-Twins style cross-covariance term that stops the dynamic branch re-deriving static character, plus two low-weight probes that give each branch a meaning: `tone_id` (the *amp*, 204 groups over 450 captures) on the static side and a measured crest-factor delta on the dynamic side.
-- **Batches are P captures × K segments**, built into the dataset index rather than a Sampler, so the SupCon positives exist by construction and items stay a pure function of `(seed, i)`.
-- **The train/val time split is interleaved, not a tail** (`time_split_regions`). The capture signal's level falls across its length, so holding out the end validates the amp at a 14.3 dB quieter operating point rather than on held-out audio. `encode` measures the realized train/val level gap at startup and warns past 3 dB.
-- **`encode-eval` is the gate**, and it is where the design is falsified rather than tuned: retrieval on unseen captures, a dry-channel ablation, branch redundancy, and the two probes. Nothing consumes the 512-d vector yet — wiring it into a generator is a separate decision that this gate exists to inform.
+#### The architectures
+
+One conditioned model emulates **all** devices, steered by a learnable per-device
+embedding fed to every layer. Three share the NAM A2 topology every corpus capture
+uses (23 dilated layers, receptive field 6347) and differ only in how the embedding
+reaches a layer:
+
+- **`film_wavenet`** — device FiLM at the schema's pre-activation hook, generated by
+  one `Linear(E, 2C)` per layer.
+- **`mlpfilm_wavenet`** — the same hook, but each layer's generator is an independent
+  `Linear(E, H) → act → Linear(H, 2C)`, so a device's position in embedding space
+  steers the network nonlinearly. A separate arch, not a knob: the two have
+  incompatible `state_dict`s.
+- **`delta_wavenet`** — no FiLM. The embedding generates a rank-`delta_rank` residual
+  on each layer's **own weights**, `z = conv_{W + dW(e), b + db(e)}(x) + (mixin_w + dm(e))·clean`.
+  FiLM is the special case `dW = (γ−1)·W`, so this is a strict superset of the hook:
+  a device can retime a filter rather than only re-gain it.
+  - The residual is `scale · coeff(e) @ normalize(basis)` — unit-norm directions with
+    magnitude in one scalar per layer. Without that split, magnitude spreads through
+    `basis` for free and the optimizer rebuilds each device's kernel from its own
+    residual, measured at 5.1× the base weight.
+
+All three fold into a plugin-playable A2 capture: the conditioning generator never
+runs in the real-time DSP loop, and for `delta_wavenet` the fold *is* the addition the
+layer would have done. All three share one `[N_devices × embedding_dim]` table that is
+a *map* into network behaviour, so enrollment, morphing and profile export are
+architecture-independent.
+
+#### The two loops
+
+- **`training/emulate.py`** conditions on a table row. Optimizes pre-emphasized ESR +
+  multi-resolution STFT with Adam + reduce-on-plateau, runs the sanity ladder
+  (`--overfit`, `--limit-devices`), saves the embedding table with its manifest hash.
+- **`training/joint.py`** conditions on an encoder's output instead, with the table
+  frozen and unused. Two parameter groups — the encoder needs its own learning rate
+  or it collapses to silence — and a per-epoch collapse tripwire
+  (`val_esr_shuffled`, `emb_spread`), because an encoder emitting a near-constant
+  vector still posts a respectable ESR.
+
+They stay two loops on purpose: they disagree about what validation *means*, and one
+loop with flags would hide that rather than remove it. What they genuinely shared —
+run-directory I/O, the resume check, the plateau/AMP setup — is `training/artifacts.py`
+and `training/optim.py`.
+
+#### Conditioning encoders (`openamp.encoders`)
+
+Enrollment obtains a device's vector by gradient descent against a frozen network. An
+encoder is the feed-forward version of the same question, trained jointly with the
+generator. Three, differing in what evidence they read:
+
+- **`wavenet`** — encodes a short `(dry, wet)` reference window with a non-causal A2
+  backbone. Two input channels because an amp is a transfer *relation*.
+- **`fingerprint`** — looks up a frozen codec's pooled latent by device id. A codec
+  fingerprint needs long audio to be a reliable statistic (DAC own-nearest accuracy
+  falls from 99.8% at 85 s to 17.8% at 12 s), well above a reference window.
+- **`dac_frames`** — looks up that codec's *raw frames* and pools them with a trained
+  cross-attention head, which is the one thing it changes relative to `fingerprint`.
+
+`ref_mode` on each class says what the dataset must yield — a real window, or a device
+id to look up — so the training and evaluation loops agree without either naming a kind.
+
+What makes an embedding carry *tone* rather than *audio*: the reference is a different
+segment of the recording, in practice a different corpus file, than the one the
+generator must reconstruct. Only what survives that gap is the amp.
 
 ---
 
@@ -142,11 +230,15 @@ Enrollment obtains a device's conditioning vector by gradient descent against a 
 
 No pipeline logic here; every stage imports these.
 
-- **core/config.py** — one `Config` dataclass for the whole run.
+- **core/config.py** — the `Config` the *pipeline* stages need. Training is not here.
   - API access (key, base URL, token path, rate limit) from environment / `.env`.
-  - Pipeline knobs (`corpus`/`render`/`emulate`/`encoder`) from `configs/openamp.yaml` (per-run files under `configs/emulate/` and `configs/encoder/` replace just their own section).
+  - Acquisition/corpus/render knobs from `configs/openamp.yaml`.
   - Every path derives from one `data_dir` + one `results_dir`; all randomness derives from one `seed`.
   - Defaults live once, on the dataclass fields — `load_config` only overrides what a source provides.
+- **spec.py** — the `RunSpec` a *training* run is. Read from its own
+  `configs/{emulate,joint}/<name>.yaml` by `load_run_spec`, and written back to
+  `<run>/resolved_config.yaml` so a finished run records the corpus, seed and name
+  it actually used rather than leaving them to a shell prefix.
 - **core/constants.py** — fixed audio facts (sample rate, clip length, normalization/verification thresholds) and shared vocabulary: split labels, **gain-bucket names** (`clean`/`crunch`/`high_gain`), render statuses, manifest filenames. Kept in one place so the clip grid, render slicing, and datasets agree by construction.
 - **core/manifest.py** — schema and atomic parquet I/O for every manifest (candidates, acquisition, corpus, clips, renders, devices_final).
 - **core/util.py** — `sha256_file`, `utc_now`.
@@ -183,12 +275,14 @@ Under `results_dir` (default `./results`):
 ```
 qa/                            clean/render WAV + spectrogram QA pairs
 render_report.md               verify-stage summary
-emulate/<name>/                one emulation run (checkpoint, config, metrics, curves, embedding)
+emulate/<name>/                one emulation run: {checkpoint,last}.pt, resolved_config.yaml,
+                               config_history.jsonl, metrics.json, train_log.csv, embedding.pt
 emulate/comparison.csv         one test-split row per emulation run (size-sweep deliverable)
 emulate/<name>/per_device_esr.csv  one test-split row per device for that run (per-amp breakdown)
+emulate/<name>/enroll/         fitted embeddings for held-out devices + enrollment.csv
 emulate/demos/*.wav            clean/target/prediction listening demos
-encoder/<name>/                one tone-encoder run (checkpoint, config, metrics, encoder_log.csv)
-encoder/<name>/diagnostics.json    the six-check gate; capture_embeddings.npz + tsne.* beside it
+joint/<name>/                  one joint run, same layout minus embedding.pt
+joint/<name>/diagnostics.json  the collapse + leakage gate; tsne.csv beside it
 ```
 
 ## Conventions

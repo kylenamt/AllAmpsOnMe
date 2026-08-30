@@ -505,7 +505,7 @@ What the gate says, on the best run:
 consumes its output. The joint model asks the same question from the other end — **train an
 encoder and a generator together, so the embedding is whatever makes reconstruction work.**
 A new amp then costs one forward pass instead of a 30-epoch enrollment fit. Spec is
-`src/openamp/joint_model/guidelines.md`; the package is `openamp.joint_model`, run with
+`src/openamp/joint_model/guidelines.md`; the module is `openamp.training.joint`, run with
 `openamp joint` / `openamp joint-eval` into `results/joint/`.
 
 Deliberately **not** the §12 `ToneEncoder`: this builds the guidelines' own WaveNet-tap

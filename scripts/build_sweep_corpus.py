@@ -37,7 +37,7 @@ from openamp.core.util import sha256_file
 
 # Sample bounds at 48 kHz — NAM's own layout (nam/train/core.py), unmodified:
 # lead-in [0:480_000] discarded, train [480_000:-432_000], validation [-432_000:].
-# See `openamp.emulate.enroll.nam_signal_regions`, which this mirrors.
+# See `openamp.enroll.fit.nam_signal_regions`, which this mirrors.
 #
 # NAM's protocol has **no test split** — it early-stops on validation and reports
 # validation ESR, full stop. Config requires three splits and the evaluation harness

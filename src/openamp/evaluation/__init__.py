@@ -8,8 +8,8 @@
 - :mod:`~openamp.evaluation.geometry` -- k-NN retrieval and the t-SNE writer.
 
 The last two are deliberately *not* re-exported here. Importing them pulls in
-the whole joint stack, and ``evaluation.joint`` imports ``joint_model.train``,
-which imports ``emulate.train``, which imports the metrics below -- so
+the whole joint stack, and ``evaluation.joint`` imports ``training.joint``,
+which imports ``training.emulate``, which imports the metrics below -- so
 re-exporting it would close an import cycle through this file. Their callers
 name the submodule directly, which is what they already did.
 """

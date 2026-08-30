@@ -5,7 +5,7 @@
   skip sum through a kernel-16 head conv. wn_activation also allows tanh.
 - FiLM conditioning (pre-activation, near-identity init) and same-length causal
   padding are the only departures from a stock capture -- both fold away for
-  export (see openamp.emulate.export).
+  export (see openamp.export).
 - Three archs, differing only in how the embedding conditions a layer:
   FiLMWaveNet / MLPFiLMWaveNet (linear vs MLP gamma/beta generator) and
   DeltaWaveNet (low-rank residual on the conv weights instead of FiLM).
@@ -208,7 +208,7 @@ class FiLMWaveNet(NormalizedEmbedding, nn.Module):
         """Conditioned forward on an embedding vector [B, embedding_dim], not a table row.
 
         Split from forward() so emb can come from elsewhere -- a jointly-trained
-        encoder (openamp.joint_model), or a morph point between two rows.
+        encoder (openamp.training.joint), or a morph point between two rows.
         """
         if x.dim() == 2:
             x = x.unsqueeze(1)                           # [B, T] -> [B, 1, T]

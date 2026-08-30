@@ -1,4 +1,4 @@
-"""One training script for the amp foundation models.
+"""The table-conditioned training loop: one embedding row per device.
 
 - Takes a :class:`~openamp.spec.RunSpec` and nothing else: the architecture
   (``model:``), the dataset (``data:``), the objective (``loss:``) and the
@@ -20,8 +20,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from openamp.data import (build_dataset, build_device_index,
-                          load_or_create_holdout, make_loader, manifest_signature)
+from openamp.data import (build_dataset, make_loader, manifest_signature,
+                          training_device_index)
 from openamp.evaluation.metrics import pooled_esr_terms
 from openamp.models import build_model, count_parameters
 from openamp.losses import build_loss, device_loss_weights
@@ -31,21 +31,6 @@ from openamp.training import (GRAD_CLIP_NORM, RunDir, amp_setup, build_scheduler
 
 LOG_COLUMNS = ["epoch", "step", "train_loss", "train_esr", "train_stft", "val_esr",
                "lr", "elapsed_s"]
-
-
-# --- Data plumbing -------------------------------------------------------------
-def _device_index(spec: RunSpec, limit_devices: int | None):
-    """Resolve ``(device_ids, id_to_idx, holdout_ids)`` for a run.
-
-    The ``data.holdout_frac`` device holdout is excluded first, then
-    ``--limit-devices N`` keeps the first N (the mini-run).
-    """
-    paths = spec.paths
-    holdout = load_or_create_holdout(paths, spec.data.holdout_frac, spec.seed)
-    ids, _ = build_device_index(paths, exclude=holdout)
-    if limit_devices:
-        ids = ids[:int(limit_devices)]
-    return ids, {d: i for i, d in enumerate(ids)}, holdout
 
 
 def _conditioning(model, device_idx: torch.Tensor, noise_frac: float) -> torch.Tensor:
@@ -112,7 +97,7 @@ def overfit_one_batch(spec: RunSpec, *, device: str = "cuda",
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
     torch.manual_seed(spec.seed)
 
-    ids, id_to_idx, _ = _device_index(spec, limit_devices)
+    ids, id_to_idx, _ = training_device_index(spec, limit_devices)
     model = build_model(spec.model, len(ids)).to(dev)
     R = model.receptive_field
     ds = build_dataset(spec.data.dataset, paths=spec.paths, split="train",
@@ -160,7 +145,7 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
     torch.backends.cudnn.benchmark = True
 
     # --- Table + model ----------------------------------------------------------
-    ids, id_to_idx, holdout_ids = _device_index(spec, limit_devices)
+    ids, id_to_idx, holdout_ids = training_device_index(spec, limit_devices)
     if not ids:
         raise RuntimeError("No render-ok devices. Run `openamp render` first.")
     paths = spec.paths

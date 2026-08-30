@@ -257,7 +257,7 @@ def _run_payload(run_dir: Path, weight_keys: tuple[str, ...]) -> dict:
 
 
 def test_emulate_training_is_unchanged(tmp_path, write_corpus):
-    from openamp.emulate import train as emu_train
+    from openamp.training import emulate as emu_train
 
     spec = _spec(tmp_path)
     write_corpus(spec, DEVICES, samples=SAMPLES)
@@ -266,7 +266,7 @@ def test_emulate_training_is_unchanged(tmp_path, write_corpus):
 
 
 def test_joint_training_is_unchanged(tmp_path, write_corpus):
-    from openamp.joint_model import train as joint_train
+    from openamp.training import joint as joint_train
 
     spec = _spec(tmp_path, data=DataSpec(dataset="joint",
                                          clip_seconds=CLIP / SAMPLE_RATE,

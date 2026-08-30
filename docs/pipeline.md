@@ -2,7 +2,7 @@
 
 - One package (`openamp`), one CLI (`openamp`). Stages run in order; every stage reads/writes the parquet manifests under `data/manifests/`, is **idempotent/resumable**, and is **deterministic given the `seed`**.
 - This guide covers prerequisites, what each stage does, resume semantics, and troubleshooting.
-- Design rationale per stage: [`history/`](history/). Quick tour: the [README](../README.md).
+- Design rationale per stage: [`decisions.md`](decisions.md). Quick tour: the [README](../README.md).
 
 ```
 acquire :  auth · discover · select · download · validate · dedup · finalize · status
@@ -24,9 +24,9 @@ cp .env.example .env               # add OPENAMP_API_KEY
 
 ### Configuration
 
-- All pipeline tunables: [`configs/openamp.yaml`](../configs/openamp.yaml) — top-level `seed` / `sample_rate`, then `corpus:` / `render:` sections.
-- Emulator knobs: per-run files under [`configs/emulate/`](../configs/emulate/).
-- Pass a different file with `--config path.yaml` to the corpus/render/emulate commands.
+- Pipeline tunables: [`configs/openamp.yaml`](../configs/openamp.yaml) — top-level `seed` / `sample_rate`, then `acquire:` / `corpus:` / `render:` sections. Acquisition and rendering only.
+- **A training run is its own file**: one under [`configs/emulate/`](../configs/emulate/) or [`configs/joint/`](../configs/joint/), read whole by `openamp.spec.load_run_spec`. Five sections — `model:` / `data:` / `loss:` / `training:` / `joint:` — plus `name:` and `data_dir:`, so the file names its own corpus and the run records what it actually used. See the [README](../README.md#how-the-training-code-fits-together).
+- Pass a different file with `--config path.yaml`.
 - API access and data root come from the environment / `.env`:
 
 | Variable | Default | Purpose |
@@ -104,22 +104,22 @@ openamp render --devices @data/manifests/render_subset.txt   # full job (resumab
 ## 3 — Emulate (amp foundation model)
 
 - One FiLM-conditioned model emulates **all** rendered devices at once, steered by a learnable per-device embedding.
-- Architecture (`emulate.arch`: FiLM-TCN or the A2 FiLM-WaveNet) and every size are config knobs — exploring variants is copy-a-config-and-change-numbers.
+- Architecture (`model.arch`) and every size are config knobs — exploring variants is copy-a-config-and-change-numbers, and adding one is a new file plus a registry line ([README](../README.md#adding-an-architecture)).
 - Runs consume the renders (`renders.parquet` + `corpus.parquet`).
 
 ```bash
 # Sanity ladder first (cheap): overfit one batch, then a ~1 h mini-run.
-openamp emulate --config configs/emulate/paper.yaml --overfit
-openamp emulate --config configs/emulate/paper.yaml --limit-devices 10
+openamp emulate --config configs/emulate/nam_a2_256.yaml --overfit
+openamp emulate --config configs/emulate/nam_a2_256.yaml --limit-devices 10
 
-openamp emulate --config configs/emulate/paper.yaml       # full run -> results/emulate/paper/
-openamp emulate --config configs/emulate/embed16.yaml     # a size-sweep variant
+openamp emulate --config configs/emulate/nam_a2_256.yaml  # full run -> results/emulate/nam_a2_256/
+openamp emulate --config configs/emulate/nam_a2_512.yaml  # a size-sweep variant
 openamp emulate-compare results/emulate/*                 # test-split rows -> comparison.csv
 openamp emulate-validate nam_a2_256                            # per-amp test ESR -> <run>/per_device_esr.csv
 openamp emulate-demo results/emulate/nam_a2_256                # clean/target/pred WAVs (listening check)
 ```
 
-- **Config** — all knobs live in the `emulate:` section; a per-run file under `configs/emulate/<name>.yaml` overrides just that section, and the **run name is the file stem**.
+- **Config** — one file per run under `configs/emulate/<name>.yaml`; the **run name is the file stem** unless the file sets `name:`. The corpus comes from the file's `data_dir:` (an `OPENAMP_DATA_DIR` env var still overrides it).
   - Shipped configs: `nam_a2` (default base), `wavenet_a2` (capture-native architecture), `wavenet_a2_tanh` (same run, `wn_activation: tanh`), `mlpfilm_a2_256` / `mlpfilm_a2_h16_256` (MLP FiLM generator — `h16` is parameter-matched to `nam_a2_256`, so its delta isolates nonlinearity from capacity), `delta_a2_256` / `delta_a2_r6_256` / `delta_a2_r16_256` (conditioning moved into the conv weights — `r6` is the parameter-matched half of that pair, `r16` the capacity end).
   - The base to copy from is `nam_a2` (same A2 topology as `wavenet_a2`, but with NAM's own training numbers — lr 4e-3, weight decay 3.17e-7, 100 epochs, MRSTFT as a light regularizer rather than a 1:1 term). Copy one, change numbers, rerun — no code changes.
 - **Model** — all three archs are causal and conditioned on the device embedding at every layer (FiLM's per-channel scale+shift in two of them, a conv-weight residual in the third).
@@ -133,7 +133,7 @@ openamp emulate-demo results/emulate/nam_a2_256                # clean/target/pr
   - Drawn once and persisted to `data/manifests/emulate_holdout.txt` — the file is the source of truth, so the holdout stays fixed even if more devices are rendered later.
   - The held-out ids travel in every `checkpoint.pt` and `embedding.pt`.
 - **Training** — pre-emphasized ESR + multi-resolution STFT (auraloss), 1:1; Adam lr 5e-4, reduce-on-plateau, early-stopped at the val-ESR plateau; single GPU, AMP.
-  - Each run writes `results/emulate/<name>/`: `checkpoint.pt` (best) + `last.pt`, `config.yaml`, `metrics.json`, `train_log.csv`, `embedding.pt` (the table + its manifest hash, saved separately for Phase 5).
+  - Each run writes `results/emulate/<name>/`: `checkpoint.pt` (best) + `last.pt`, `resolved_config.yaml` (the whole spec — corpus, seed and name included), `config_history.jsonl`, `metrics.json`, `train_log.csv`, `embedding.pt` (the table + its manifest hash, saved separately for Phase 5).
   - Every run reports `val_esr_shuffled` (val ESR with the embeddings permuted across devices) — it must be **worse** than `val_esr`, proving the conditioning is doing real work.
   - Console output belongs in the run dir too — launch a long run as `nohup openamp emulate --config configs/emulate/<name>.yaml > results/emulate/<name>/train_stdout.log 2>&1 &` so the log lands beside the checkpoints instead of as a loose `nohup.out` (a resumed leg goes to `train_stdout_resume.log`).
 - **Compare** — `emulate-compare` evaluates each run on the held-out **test** split and appends one row per run to `results/emulate/comparison.csv` (`run_name, params, receptive_field_ms, embedding_dim, channels, blocks_x_layers, test_ESR_mean, test_ESR_median, test_MRSL_mean, train_hours`). That CSV is the architecture-exploration deliverable; re-evaluating a run replaces its row.
@@ -144,34 +144,31 @@ openamp emulate-demo results/emulate/nam_a2_256                # clean/target/pr
 
 > `auraloss` (multi-resolution STFT loss) is a dependency; `pip install -e .` pulls it in. GPU strongly recommended — the paper-default run is ~187 K steps; use `--limit-devices` / `--epochs` for quick passes.
 
-## 4 — Encode (tone encoder)
+## 4 — Joint (encoder + generator, trained together)
 
-A standalone experiment, not a step the emulators depend on: it asks whether a device's conditioning vector can be *read off* the capture audio instead of fitted by gradient descent the way `emulate-enroll` does. Nothing consumes its output yet.
+A standalone experiment, not a step the emulators depend on: it asks whether a device's
+conditioning vector can be *read off* evidence about the amp instead of fitted by
+gradient descent the way `emulate-enroll` does.
 
 ```bash
-# THE ENV VAR IS PART OF THE RECIPE — see the config header for why.
-export OPENAMP_DATA_DIR=data_mixed
-
-# Sanity ladder first (both cheap).
-openamp encode --config configs/encoder/smoke.yaml --overfit
-openamp encode --config configs/encoder/smoke.yaml --limit-devices 12
-
-# The real run, log beside the checkpoints. `>>` not `>` on a resume.
-nohup openamp encode --config configs/encoder/sweep_base.yaml \
-      >> results/encoder/sweep_base/train_stdout.log 2>&1 &
-
-# The gate. This, not the training loss, is what decides whether to continue.
-openamp encode-eval sweep_base
+openamp joint --config configs/joint/fp_dac_attn512.yaml --overfit       # sanity #1
+openamp joint --config configs/joint/fp_dac_attn512.yaml --limit-devices 8
+openamp joint --config configs/joint/fp_dac_attn512.yaml                 # the run
+openamp joint-eval fp_dac_attn512                                        # the gate
 ```
 
-- **Corpus** — `data_mixed` with `sources: [sweep]`: the 171 s NAM capture signal per device, which is the content you actually hold at inference time. `data_mixed` is A1-consistent; do **not** point this at `data_sweep/`, whose renders are A2 for 408/450 devices (§8.5 of `decisions.md`).
-- **Two orthogonal splits.** Devices: the same `emulate_holdout.txt` 46 are held back, and they are the *retrieval* test set (unseen amps). Time: a fraction of `sweep_train` is the val region for the same devices (unseen audio). Neither substitutes for the other, and `sweep_val` (9 s) is too short to give ≥4 segments per capture, which is why the time split is taken inside `sweep_train`.
-- **Where the time split falls is not cosmetic.** `sweep_train`'s level drops across its length, so holding out the *tail* (`time_split_mode: tail`) validates 14.3 dB below the training level — a quieter operating point of the amp, not held-out audio, and one where every amp is closer to linear and closer to every other amp. The default `strided` mode interleaves instead: `time_split_blocks` blocks, evenly-spaced ones to val, 0.98 dB gap at the default 10. **Read the two `[encode] time split=` / `[encode] split level:` lines in the run header** — the gap is measured per corpus and warns past 3 dB. The 2026-08-11 `sweep_base` run predates this and used the tail split.
-- **Reading the numbers.** SupCon bottoms out at `log(K-1)` — 1.0986 at `segments_per_device: 4` — **not** at 0; judge `--overfit` against that. The other end of the scale is `log(P*K-1)` (3.4340 at 8×4), which is what a *collapsed* embedding scores — all points on top of each other. `val_supcon_shuffled` (labels permuted within the batch) is the conditioning control, the analogue of the emulators' `val_esr_shuffled`.
-- **If `--overfit` sticks at exactly `log(P*K-1)`, re-run it on another seed before believing it.** One fixed batch at full LR is a harsher setting than training — collapse is an absorbing state there and fresh batches escape it. Measured: a smoke batch collapsed on 4 of 5 seeds while the real 404-device run over the same regions descended 2.89 → 2.64 → 2.44 over three epochs.
-- **A branch collapsing in epoch 0 of a real run is normal here — wait for epoch 2.** The dynamic branch pins `scd` at 3.4340 for a few hundred steps partway through epoch 0 and then recovers (3.41 → 2.76 → 2.27). The `[epoch]` line prints only `supcon_s`, so watch the `scd` field on the step lines or `train_supcon_d` in `encoder_log.csv` if you want to see it.
-- **The gate** writes `results/encoder/<name>/diagnostics.json` plus `capture_embeddings.npz` and `tsne.{csv,png}`. The two checks that decide the direction: retrieval top-1 on the unseen captures against the `1/46 = 2.2 %` chance line, and the **dry-channel ablation** — in sweep-only mode every device shares one dry file, so the encoder could ignore the dry channel entirely and still ace retrieval while having learned "what this recording sounds like" instead of "what this amp does". If branch redundancy comes back high, the two-branch split is decorative and the honest response is to collapse to one branch, not to retune the weights.
-- Encoder runs live under `results/encoder/`, deliberately not `results/emulate/`: they log a contrastive loss, not ESR, and `decisions.md` §6 exists because metrics that share a name got cross-compared once. `scripts/publish_run_dashboard.py` only globs `results/emulate/*/`, so encoder runs do not appear on the dashboard.
+- The generator is the same conditioned network, driven through its vector path
+  (`forward_emb`) instead of its table; the table is frozen and unused.
+- `joint.encoder.kind` picks the evidence: `wavenet` (encode a short `(dry, wet)`
+  reference), `fingerprint` (look up a frozen codec's pooled vector by device id), or
+  `dac_frames` (look up that codec's raw frames and pool them with a trained head).
+- **`joint-eval` is the gate**, and it is where the design is falsified rather than
+  tuned: a shuffled-reference control, a zeroed-reference control, embedding spread,
+  retrieval, and the holdout ESR. With no contrastive term, the cheap failure is an
+  encoder emitting a near-constant vector while ESR still looks respectable — so a good
+  `val_esr` means nothing unless shuffled is much worse and `emb_spread` is not ~0.
+- The encoder needs its own learning rate (`joint.enc_lr`, ~8x below the generator's)
+  or it collapses to output silence.
 
 ## Testing
 
@@ -181,7 +178,8 @@ python -m pytest
 
 - Acquisition tests mock the API and inject the NAM renderer; corpus/render/dataset tests use tiny real audio in `tmp_path`.
 - A few `test_validate.py` / `test_finalize.py` cases are skipped unless small `.nam` fixtures exist — see [`../tests/fixtures/README.md`](../tests/fixtures/README.md).
-- Key proofs: the chunked render is bit-identical to a full forward; the FiLM-TCN's receptive field matches its formula and its output is causal; FiLM conditioning actually changes the output.
+- Key proofs: the chunked render is bit-identical to a full forward; each arch's receptive field matches its formula and its output is causal; conditioning actually changes the output.
+- `tests/test_equivalence.py` pins current behaviour as sha256 snapshots — dataset items at fixed `(seed, index)`, every parameter after seeded construction, and a whole tiny run of both trainers. Regenerate deliberately with `OPENAMP_UPDATE_SNAPSHOTS=1`; the diff is the review.
 
 ## TONE3000 API notes
 

@@ -412,8 +412,6 @@ def test_load_model_rebuilds_arch_from_the_checkpoint(tmp_path):
 
 
 def test_mlpfilm_checkpoint_roundtrip_and_cross_arch_load_is_loud(tmp_path):
-    from dataclasses import asdict
-
     from openamp.evaluation import load_model
 
     torch.manual_seed(0)
@@ -844,7 +842,7 @@ def test_enroll_end_to_end(tmp_path):
     pytest.importorskip("auraloss")
     from dataclasses import asdict
 
-    from openamp.emulate.enroll import enroll
+    from openamp.enroll.fit import enroll
     from openamp.evaluation import load_model
 
     cfg = load_config(data_dir=tmp_path)
@@ -901,7 +899,7 @@ def test_enroll_end_to_end(tmp_path):
 
 def test_swap_embedding_init_modes(tmp_path):
     """New rows start at the trainer's own init scale by default, not the mean."""
-    from openamp.emulate.enroll import ENROLL_INIT_A, _swap_embedding
+    from openamp.enroll.fit import ENROLL_INIT_A, _swap_embedding
 
     spec = _rspec(tmp_path)
     dev = torch.device("cpu")
@@ -936,7 +934,7 @@ def test_swap_embedding_init_modes(tmp_path):
 def test_enrollment_csv_merges_by_device(tmp_path):
     import csv as _csv
 
-    from openamp.emulate.enroll import ENROLLMENT_COLUMNS, _merge_enrollment_rows
+    from openamp.enroll.fit import ENROLLMENT_COLUMNS, _merge_enrollment_rows
 
     def row(d, esr):
         return {c: 0 for c in ENROLLMENT_COLUMNS} | {"device_id": d, "test_esr": esr}
@@ -953,7 +951,7 @@ def test_enrollment_csv_merges_by_device(tmp_path):
 
 def test_enroll_rejects_seen_and_skips_unrenderable(tmp_path):
     pytest.importorskip("soundfile")
-    from openamp.emulate.enroll import _resolve_enroll_ids
+    from openamp.enroll.fit import _resolve_enroll_ids
 
     cfg = load_config(data_dir=tmp_path)
     sig = np.linspace(-0.4, 0.4, 300, dtype=np.float32)
@@ -972,7 +970,7 @@ def test_enroll_rejects_seen_and_skips_unrenderable(tmp_path):
 
 def test_wet_dry_dataset_and_lag_estimation():
     from openamp.data import WetDryDataset
-    from openamp.emulate.enroll import estimate_lag
+    from openamp.enroll import estimate_lag
 
     rng = np.random.default_rng(0)
     a = (0.3 * rng.standard_normal(20_000)).astype(np.float32)
@@ -1003,7 +1001,7 @@ def test_wet_dry_dataset_and_lag_estimation():
 
 
 def test_blip_lag_recovers_latency_through_a_coloring_amp():
-    from openamp.emulate.enroll import blip_lag, estimate_lag
+    from openamp.enroll import blip_lag, estimate_lag
 
     sr = 48_000
     rng = np.random.default_rng(0)
@@ -1041,7 +1039,7 @@ def test_enroll_pair_end_to_end(tmp_path):
     pytest.importorskip("auraloss")
     from dataclasses import asdict
 
-    from openamp.emulate.enroll import enroll_pair, load_pair_model, render_dry
+    from openamp.enroll import enroll_pair, load_pair_model, render_dry
 
     cfg = load_config(data_dir=tmp_path)
     clip = 8192                                        # >= the largest STFT window
@@ -1088,9 +1086,7 @@ def test_enroll_pair_end_to_end(tmp_path):
 def test_enroll_pair_batch_size_overrides_the_runs_value(tmp_path):
     """The fit is fp32, so a run's own batch can exceed the card it trained on."""
     pytest.importorskip("auraloss")
-    from dataclasses import asdict
-
-    from openamp.emulate.enroll import enroll_pair
+    from openamp.enroll.fit import enroll_pair
 
     cfg = load_config(data_dir=tmp_path)
     clip = 8192

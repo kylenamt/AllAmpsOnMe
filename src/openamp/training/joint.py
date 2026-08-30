@@ -1,6 +1,6 @@
 """Joint training: encoder and FiLM generator, end to end, from scratch.
 
-Forked from openamp.emulate.train and keeps its contracts (same
+Forked from openamp.training.emulate and keeps its contracts (same
 EmulationLoss, Adam + reduce-on-plateau, NaN guard, run-directory layout) so a
 joint run's val_esr is directly comparable to the table-conditioned runs.
 
@@ -35,13 +35,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from openamp.data import build_dataset, make_loader, manifest_signature
+from openamp.data import (build_dataset, make_loader, manifest_signature,
+                          training_device_index)
 from openamp.encoders import encoder_class, ref_mode_for
 from openamp.evaluation.metrics import pooled_esr_terms
 from openamp.models import count_parameters
-from openamp.emulate.train import _device_index
 from openamp.losses import build_loss, device_loss_weights
-from openamp.joint_model.model import build_joint, load_joint
+from openamp.models.joint import build_joint, load_joint
 from openamp.spec import RunSpec
 from openamp.training import (GRAD_CLIP_NORM, RunDir, amp_setup, build_scheduler,
                               check_resume_compatible, param_group_lrs)
@@ -81,7 +81,7 @@ def jitter(e: torch.Tensor, frac: float, normalize: bool) -> torch.Tensor:
 
     Same knob as :data:`openamp.spec.TrainingSpec.embed_noise_frac`, but
     it cannot share
-    :func:`openamp.emulate.train._conditioning`'s scale: that one is a fraction
+    :func:`openamp.training.emulate._conditioning`'s scale: that one is a fraction
     of the embedding *table*'s std, and a joint run has no trainable table --
     the conditioning is whatever the encoder emits this step. So the scale comes
     from the embedding's own geometry instead:
@@ -110,7 +110,7 @@ def evaluate_esr(model, loader, device, coeff: float, *, n_batches: int | None =
     """Energy-pooled pre-emphasized ESR over the loader, plus embedding spread.
 
     Pooled as one ratio of sums exactly like
-    :func:`openamp.emulate.train.evaluate_esr`, so the numbers are comparable
+    :func:`openamp.training.emulate.evaluate_esr`, so the numbers are comparable
     across the two trainers.
 
     ``emb_spread`` is the mean over dimensions of the across-batch standard
@@ -121,7 +121,7 @@ def evaluate_esr(model, loader, device, coeff: float, *, n_batches: int | None =
     epoch to epoch rather than re-rolled each time.
 
     ``weights`` [n_devices] applies the same per-device ESR weighting the train
-    loss uses (:func:`openamp.emulate.train.device_loss_weights`), indexed by
+    loss uses (:func:`openamp.training.emulate.device_loss_weights`), indexed by
     each item's true device (``batch["device_idx"]``) -- so checkpoint
     selection, ReduceLROnPlateau and early stopping score the objective the run
     actually optimizes. Only meaningful when ``loader``'s ``device_idx`` shares
@@ -215,7 +215,7 @@ def overfit_one_batch(spec: RunSpec, *, device: str = "cuda", steps: int = 400,
     torch.manual_seed(spec.seed)
     batch = int(batch_size or tcfg.batch_size)
 
-    ids, id_to_idx, _ = _device_index(spec, limit_devices)
+    ids, id_to_idx, _ = training_device_index(spec, limit_devices)
     model = build_joint(spec, len(ids)).to(dev)
     R = model.receptive_field
     train_ds, _, clip, ref_n = _build_datasets(spec, id_to_idx, R)
@@ -261,11 +261,11 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
     np.random.seed(spec.seed)
     torch.backends.cudnn.benchmark = True
 
-    ids, id_to_idx, holdout_ids = _device_index(spec, limit_devices)
+    ids, id_to_idx, holdout_ids = training_device_index(spec, limit_devices)
     if not ids:
         raise RuntimeError("No render-ok devices. Run `openamp render` first.")
     # Per-device ESR weighting, applied to the train loss and to the seen-device
-    # val ESR alike -- exactly openamp.emulate.train's device_loss_weighting,
+    # val ESR alike -- exactly openamp.training.emulate's device_loss_weighting,
     # forked here because the two trainers' loss/eval plumbing differs. Not
     # applied to the holdout probe: holdout_loader indexes device_idx against
     # its own {holdout id -> row} map, unrelated to `ids`, so weights fit here
@@ -386,7 +386,7 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
         resumed_from = int(ck["epoch"])
         start_epoch = resumed_from + 1
         best_val = float(ck.get("best_val_esr", float("inf")))
-        # Config is authoritative on resume (same rule as emulate/train.py): the
+        # Config is authoritative on resume (same rule as training/emulate.py): the
         # Adam moment buffers are what resuming preserves, not the lr value.
         enc_wd = float(jcfg.enc_weight_decay)
         enc_wd = tcfg.weight_decay if enc_wd < 0 else enc_wd
@@ -476,7 +476,7 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
                              n_batches=probe_batches, seed=spec.seed)["esr"]
                 if holdout_loader is not None else float("nan"))
 
-        # NaN guard, identical policy to emulate/train.py.
+        # NaN guard, identical policy to training/emulate.py.
         if not np.isfinite(val_esr):
             if not ckpt_path.is_file():
                 raise RuntimeError(

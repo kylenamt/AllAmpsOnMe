@@ -107,7 +107,7 @@ def _print_status(cfg) -> None:
 @click.option("-v", "--verbose", is_flag=True, help="Debug logging.")
 def cli(verbose: bool) -> None:
     """Open-Amp3000 pipeline: acquire TONE3000 captures, render a clean corpus,
-    and train the FiLM-TCN amp foundation model.
+    and train the conditioned amp foundation model.
 
     Run order: auth discover select download validate dedup finalize · corpus
     subset render verify · emulate emulate-compare emulate-validate emulate-demo
@@ -338,7 +338,7 @@ def _run_spec(config_path: Path | None):
               help="Mini-run on the first N render-ok devices (sanity #2).")
 def emulate(config_path, device, epochs, resume, overfit, limit_devices) -> None:
     """Train the FiLM-conditioned TCN amp foundation model (one-to-many)."""
-    from openamp.emulate import train as emu_train
+    from openamp.training import emulate as emu_train
 
     spec = _run_spec(config_path)
     if overfit:
@@ -434,7 +434,7 @@ def emulate_demo(run, n_devices, seconds, device) -> None:
 def emulate_enroll(run, config_path, devices, pairs, epochs, lr, device, seed,
                    batch_size, init) -> None:
     """Enroll unseen devices: freeze a trained run, fit new embeddings only."""
-    from openamp.emulate import enroll as emu_enroll
+    from openamp import enroll as emu_enroll
 
     cfg = _config(config_path)
     if not (run / "checkpoint.pt").is_file():
@@ -476,7 +476,7 @@ def emulate_export_bundle(run, out, profile_devices, profile_pairs) -> None:
     """Export the morph-plugin weight bundle (weights + FiLM + profiles)."""
     import json as _json
 
-    from openamp.emulate import export as emu_export
+    from openamp import export as emu_export
 
     if not (run / "checkpoint.pt").is_file():
         raise click.ClickException(f"No checkpoint.pt under {run}.")
@@ -508,7 +508,7 @@ def emulate_export_profile(run, device_id, mean, pair_name, name, out) -> None:
     """Print one pasteable embedding profile (JSON) for the morph plugin."""
     import json as _json
 
-    from openamp.emulate import export as emu_export
+    from openamp import export as emu_export
 
     if not (run / "checkpoint.pt").is_file():
         raise click.ClickException(f"No checkpoint.pt under {run}.")
@@ -538,7 +538,7 @@ def emulate_export_profiles(run, mean, pairs, out) -> None:
     """Print all trained device embeddings as a JSON list of pasteable profiles."""
     import json as _json
 
-    from openamp.emulate import export as emu_export
+    from openamp import export as emu_export
 
     if not (run / "checkpoint.pt").is_file():
         raise click.ClickException(f"No checkpoint.pt under {run}.")
@@ -573,7 +573,7 @@ def emulate_export_profiles(run, mean, pairs, out) -> None:
 def joint(config_path, device, epochs, resume, overfit, overfit_batch,
           limit_devices) -> None:
     """Train the reference encoder and the FiLM generator jointly, from scratch."""
-    from openamp.joint_model import train as joint_train
+    from openamp.training import joint as joint_train
 
     spec = _run_spec(config_path)
     if overfit:

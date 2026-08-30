@@ -19,7 +19,8 @@ from openamp.core import manifest as manifests
 from openamp.core.util import sha256_file
 
 __all__ = ["CorpusPaths", "render_ok_devices", "load_or_create_holdout",
-           "build_device_index", "manifest_signature", "device_names"]
+           "build_device_index", "training_device_index", "manifest_signature",
+           "device_names"]
 
 
 @dataclass(frozen=True)
@@ -134,3 +135,22 @@ def device_names(paths: CorpusPaths) -> dict[int, str]:
         name = f"{title} — {variant}" if title and variant else (title or variant)
         names[int(did)] = name or f"device {int(did)}"
     return names
+
+
+def training_device_index(spec, limit_devices: int | None = None):
+    """``(device_ids, id_to_idx, holdout_ids)`` for a run.
+
+    The ``data.holdout_frac`` device holdout is excluded first (those amps are
+    enrolled later, never trained on), then ``--limit-devices N`` keeps the first
+    N — the mini-run of the sanity ladder.
+
+    Takes a :class:`~openamp.spec.RunSpec` rather than three loose arguments
+    because both training loops want exactly this, and it is the one place the
+    holdout file is created if it does not exist yet.
+    """
+    paths = spec.paths
+    holdout = load_or_create_holdout(paths, spec.data.holdout_frac, spec.seed)
+    ids, _ = build_device_index(paths, exclude=holdout)
+    if limit_devices:
+        ids = ids[:int(limit_devices)]
+    return ids, {d: i for i, d in enumerate(ids)}, holdout

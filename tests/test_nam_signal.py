@@ -1,4 +1,4 @@
-"""NAM standardized-signal region math (openamp.emulate.enroll). Pure integer
+"""NAM standardized-signal region math (openamp.enroll.fit). Pure integer
 geometry — no torch, checkpoint, or corpus — so it pins the split boundaries we
 adopt from nam/train/core.py against silent drift."""
 
@@ -6,7 +6,7 @@ import pytest
 
 pytest.importorskip("torch")   # enroll imports torch at module load
 
-from openamp.emulate.enroll import _norm_region, nam_signal_regions
+from openamp.enroll.alignment import _norm_region, nam_signal_regions
 
 V3_LEN = 9_120_000          # 3:10 @ 48 kHz
 

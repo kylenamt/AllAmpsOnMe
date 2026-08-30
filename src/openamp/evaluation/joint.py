@@ -36,9 +36,9 @@ import torch
 from openamp.core.config import Config
 from openamp.data import CorpusPaths, JointDataset, device_names, make_loader
 from openamp.encoders import ref_mode_for
-from openamp.joint_model.model import load_joint
+from openamp.models.joint import load_joint
 from openamp.spec import spec_from_checkpoint
-from openamp.joint_model.train import EVAL_MODES, evaluate_esr
+from openamp.training.joint import EVAL_MODES, evaluate_esr
 
 __all__ = ["diagnose", "conditioning_check", "leakage_check", "capture_embeddings"]
 

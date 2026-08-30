@@ -23,8 +23,8 @@ is the part that genuinely differs:
 =========================================  ==========================================
 caller                                     reduction
 =========================================  ==========================================
-``emulate.train.evaluate_esr``             one scalar over the loader
-``joint_model.train.evaluate_esr``         one scalar, plus embedding spread
+``training.emulate.evaluate_esr``          one scalar over the loader
+``training.joint.evaluate_esr``            one scalar, plus embedding spread
 ``evaluation.emulate.evaluate_run``        mean and median over kept windows
 ``evaluation.emulate.validate_per_device``  one scalar per device
 ``per_device_esr`` (enrollment, probes)    one scalar per embedding row

@@ -21,7 +21,7 @@ from openamp.core.config import load_config  # noqa: E402
 from openamp.spec import (DataSpec, EncoderSpec, JointSpec,  # noqa: E402
                           LossSpec, ModelSpec, RefSpec, RunSpec, TrainingSpec)
 from openamp.models import FiLMWaveNet  # noqa: E402
-from openamp.joint_model.model import JointModel, build_joint  # noqa: E402
+from openamp.models.joint import JointModel, build_joint  # noqa: E402
 from openamp.encoders import AttentiveStatsPool, WaveNetEncoder  # noqa: E402
 
 # A shrunken encoder schedule: same structure, tiny receptive field, fast.
@@ -296,7 +296,7 @@ def test_forward_emb_carries_gradient_into_the_embedding():
 
 def test_export_reference_forward_matches_the_model():
     """export.forward_with_embedding is now a wrapper, so it cannot drift."""
-    from openamp.emulate.export import forward_with_embedding
+    from openamp.export import forward_with_embedding
 
     m = _small_generator().eval()
     x = torch.randn(2, 256)
@@ -543,8 +543,8 @@ def test_train_writes_a_run_and_logs_the_tripwire(tmp_path):
     import csv
     import json
 
-    from openamp.joint_model import train as joint_train
-    from openamp.joint_model.train import LOG_COLUMNS
+    from openamp.training import joint as joint_train
+    from openamp.training.joint import LOG_COLUMNS
 
     spec = _jspec(tmp_path, clip_seconds=0.1, batch_size=4, epochs=2, val_pairs=8,
                   amp=False, log_every=1,
@@ -573,7 +573,7 @@ def test_train_writes_a_run_and_logs_the_tripwire(tmp_path):
 
 
 def test_resume_is_refused_when_the_encoder_shape_changed(tmp_path):
-    from openamp.joint_model.train import _check_resume_compatible
+    from openamp.training.joint import _check_resume_compatible
 
     def spec(**enc):
         return _jspec(tmp_path, encoder=EncoderSpec("wavenet", enc))
@@ -593,7 +593,7 @@ def test_resume_is_refused_when_the_head_changed(tmp_path):
     false for all of them — without the legacy defaults the guard would wave a head
     swap straight through into a strict load_state_dict failure far from the cause.
     """
-    from openamp.joint_model.train import _check_resume_compatible
+    from openamp.training.joint import _check_resume_compatible
 
     def spec(**enc):
         return _jspec(tmp_path, encoder=EncoderSpec("wavenet", {"channels": 16, **enc}))
@@ -612,7 +612,7 @@ def test_resume_is_refused_when_the_head_changed(tmp_path):
 def test_resume_tolerates_a_yaml_list_tuple_round_trip(tmp_path):
     """enc_taps survives torch.save/yaml as either list or tuple; the guard must
     not read that as a structural change and refuse a legitimate resume."""
-    from openamp.joint_model.train import _check_resume_compatible
+    from openamp.training.joint import _check_resume_compatible
 
     saved = _jspec(tmp_path, encoder=EncoderSpec(
         "wavenet", {"channels": 16, "taps": (6, 13, 22)}))
@@ -742,7 +742,7 @@ def test_device_mode_yields_ids_reads_no_reference_and_keeps_window_a(tmp_path):
 
 def test_build_joint_selects_the_fingerprint_encoder(tmp_path):
     from openamp.encoders import FingerprintEncoder
-    from openamp.joint_model.model import build_joint
+    from openamp.models.joint import build_joint
 
     run, _, _ = _write_fingerprints(tmp_path, list(range(4)), dim=32)
     spec = _jspec(tmp_path, encoder=EncoderSpec(
@@ -773,7 +773,7 @@ def test_encoder_kind_and_its_path_are_validated(tmp_path):
 
 def test_resume_is_refused_when_the_fingerprint_knobs_change(tmp_path):
     """Including path/preprocess, which change no shape at all."""
-    from openamp.joint_model.train import _check_resume_compatible
+    from openamp.training.joint import _check_resume_compatible
 
     base = {"path": "/a", "preprocess": "dry_l2", "layernorm": False}
     spec = _jspec(tmp_path, encoder=EncoderSpec("fingerprint", base))
@@ -799,7 +799,7 @@ def test_a_key_absent_on_one_side_is_a_change(tmp_path):
     checkpoint was written could not be waved through. Comparing the whole
     encoder section gets that for free: absent on one side and set on the other
     is a difference, and absent on both means both build the same default."""
-    from openamp.joint_model.train import _check_resume_compatible
+    from openamp.training.joint import _check_resume_compatible
 
     bare = _jspec(tmp_path, encoder=EncoderSpec("wavenet", {"channels": 4}))
     ck = {"spec": bare.to_dict()}
@@ -899,7 +899,7 @@ def test_frame_window_must_fit_the_shards(tmp_path):
 
 def test_frame_window_is_structural_on_resume(tmp_path):
     """Changing what the encoder reads mid-run would silently change the method."""
-    from openamp.joint_model.train import _check_resume_compatible
+    from openamp.training.joint import _check_resume_compatible
 
     base = {"frames_path": "/a", "frame_window": 1700}
     spec = _jspec(tmp_path, encoder=EncoderSpec("dac_frames", base))
@@ -912,7 +912,7 @@ def test_frame_window_is_structural_on_resume(tmp_path):
 
 # --- Embedding jitter (emulate.embed_noise_frac) ---------------------------------
 def test_jitter_is_off_at_zero():
-    from openamp.joint_model.train import jitter
+    from openamp.training.joint import jitter
 
     e = torch.randn(4, 64)
     assert torch.equal(jitter(e, 0.0, True), e)
@@ -923,7 +923,7 @@ def test_jitter_stays_on_the_sphere_and_scales_with_frac():
     """enc_normalize puts e on the unit sphere, so jitter must move it *along* the
     sphere: an additive perturbation would move |e| instead, an axis the generator
     never sees vary. frac is read against 1/sqrt(De), so ||de|| ~= frac."""
-    from openamp.joint_model.train import jitter
+    from openamp.training.joint import jitter
 
     torch.manual_seed(0)
     e = torch.nn.functional.normalize(torch.randn(256, 512), dim=-1)
@@ -934,7 +934,7 @@ def test_jitter_stays_on_the_sphere_and_scales_with_frac():
 
 
 def test_jitter_without_normalize_scales_with_the_batch_std():
-    from openamp.joint_model.train import jitter
+    from openamp.training.joint import jitter
 
     torch.manual_seed(0)
     e = torch.randn(256, 512) * 4.0
@@ -945,7 +945,7 @@ def test_jitter_without_normalize_scales_with_the_batch_std():
 
 def test_jitter_carries_gradient_to_the_clean_embedding():
     """Noise must not become a gradient path of its own — e still has to train."""
-    from openamp.joint_model.train import jitter
+    from openamp.training.joint import jitter
 
     e = torch.nn.functional.normalize(torch.randn(4, 32), dim=-1).requires_grad_(True)
     jitter(e, 0.2, True).sum().backward()

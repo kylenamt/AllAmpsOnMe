@@ -1,7 +1,7 @@
 """Cross-attention pooling over frozen DAC frames, regressed onto a trained table.
 
 A feasibility probe, deliberately standalone: nothing here is wired into
-``openamp.joint_model``, ``openamp.cli`` or ``openamp.core.config``, and nothing
+``openamp.training.joint``, ``openamp.cli`` or ``openamp.core.config``, and nothing
 imports from here. Two argparse entry points and a printed report.
 
 **The question.** Every conditioning front-end tried in this project recognizes

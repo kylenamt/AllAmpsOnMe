@@ -9,7 +9,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from openamp.emulate.export import (_blob, _unblob, folded_model,
+from openamp.export import (_blob, _unblob, folded_model,
                                     forward_with_embedding)
 from openamp.models import DeltaWaveNet, FiLMWaveNet, MLPFiLMWaveNet, build_model
 from openamp.spec import ModelSpec, RunSpec
@@ -136,7 +136,7 @@ def test_blob_roundtrip_exact():
 
 def test_export_bundle_and_profile_from_fake_run(tmp_path):
     # Fake a run dir: a checkpoint with exactly the keys export reads.
-    from openamp.emulate import export as ex
+    from openamp import export as ex
 
     m = _model(4)
     spec = _spec("film_wavenet")
@@ -212,7 +212,7 @@ def test_bundle_conditioning_payload_is_arch_specific(tmp_path):
     the regression guard on the already-shipped contract."""
     import json
 
-    from openamp.emulate import export as ex
+    from openamp import export as ex
 
     def _bundle(arch, **extra):
         spec = _spec(arch, **extra)

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from openamp.data.corpus_index import (CorpusPaths, build_device_index, device_names,
                                        load_or_create_holdout, manifest_signature,
-                                       render_ok_devices)
+                                       render_ok_devices, training_device_index)
 from openamp.data.emulation import EmulationDataset, read_with_retry
 from openamp.data.grid import DeviceGridDataset
 from openamp.data.joint import REF_MODES, JointDataset
@@ -42,6 +42,7 @@ from openamp.data.pair import WetDryDataset
 
 __all__ = ["CorpusPaths", "build_device_index", "device_names",
            "load_or_create_holdout", "manifest_signature", "render_ok_devices",
+           "training_device_index",
            "EmulationDataset", "read_with_retry", "DeviceGridDataset",
            "JointDataset", "REF_MODES", "WetDryDataset", "make_loader",
            "DATASETS", "register_dataset", "build_dataset"]

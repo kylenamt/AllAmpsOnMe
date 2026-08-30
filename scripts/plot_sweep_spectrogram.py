@@ -2,7 +2,7 @@
 
 Renders ``data/raw/nam_sweep/T3K-sweep-v3.wav`` with NAM's own region layout drawn
 on top — the layout ``scripts/build_sweep_corpus.py`` slices the sweep corpus along
-and ``openamp.emulate.enroll.nam_signal_regions`` mirrors:
+and ``openamp.enroll.fit.nam_signal_regions`` mirrors:
 
     0.0-10.0 s   lead-in    discarded by NAM (7.75 s of guitar DI, then silence)
    10.0-181.0 s  train      2 blips, 3 chirps, 4 noise bursts, then guitar DI body

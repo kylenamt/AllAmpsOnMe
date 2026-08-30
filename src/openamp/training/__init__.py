@@ -1,7 +1,7 @@
 """The parts of a training run that are not the loop.
 
-Two loops live on, in :mod:`openamp.emulate.train` and
-:mod:`openamp.joint_model.train`: one conditions the generator on a table row,
+Two loops live on, in :mod:`openamp.training.emulate` and
+:mod:`openamp.training.joint`: one conditions the generator on a table row,
 the other on an encoder's output, and they disagree about what validation means
 (the joint loop measures shuffled/zero/holdout probes every epoch). Folding them
 into one loop with flags would hide that difference rather than remove it.

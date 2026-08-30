@@ -102,7 +102,7 @@ def main() -> None:
     audio_io.write_wav(wet_path, wet, sr)
 
     # sanity: blip alignment should recover exactly the latency we injected
-    from openamp.emulate.enroll import blip_lag
+    from openamp.enroll import blip_lag
     detected = blip_lag(dry, wet, sample_rate=sr)
     print(f"dry: {len(dry) / sr:5.1f}s  rms {rms_dbfs(dry):6.1f} / peak {peak_dbfs(dry):6.1f} dBFS -> {dry_path}")
     print(f"wet: {len(wet) / sr:5.1f}s  rms {rms_dbfs(wet):6.1f} / peak {peak_dbfs(wet):6.1f} dBFS -> {wet_path}")

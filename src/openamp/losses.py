@@ -9,7 +9,7 @@ Add one by writing a class here (or in its own module) and decorating it with
 ``@register_loss("name")``; the trainers reach it through :func:`build_loss`, so
 a new objective never means editing a training loop.
 
-Split out of ``emulate/train.py`` unchanged, so the numbers are identical to
+Split out of the training loop unchanged, so the numbers are identical to
 every run made before the split. :func:`device_loss_weights` takes the renders
 manifest path rather than a whole ``Config``: it is the one part of this module
 that touches the corpus, and it only ever needed that one path.
