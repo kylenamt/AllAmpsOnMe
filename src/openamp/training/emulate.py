@@ -27,6 +27,7 @@ from openamp.models import build_model, count_parameters
 from openamp.losses import build_loss, device_loss_weights
 from openamp.spec import RunSpec
 from openamp.training import (GRAD_CLIP_NORM, RunDir, amp_setup, build_scheduler,
+                              step_scheduler,
                               check_resume_compatible)
 
 LOG_COLUMNS = ["epoch", "step", "train_loss", "train_esr", "train_stft", "val_esr",
@@ -201,7 +202,6 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
               f"too — not comparable with a strength-0 run)")
     opt = torch.optim.Adam(model.parameters(), lr=tcfg.lr,
                            weight_decay=tcfg.weight_decay)
-    sched = build_scheduler(opt, tcfg)
     use_amp, amp_dtype, scaler = amp_setup(tcfg, dev)
 
     run = RunDir(spec.run_dir)
@@ -226,6 +226,9 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
               f"lr={tcfg.lr:.2e} weight_decay={tcfg.weight_decay:g} (from config)")
     else:
         run.start_log(LOG_COLUMNS)
+    # After the resume block: see the note in training/joint.py -- a cosine
+    # schedule starts from the lr the config just applied, not the checkpoint's.
+    sched = build_scheduler(opt, tcfg, max_epochs=max_epochs, start_epoch=start_epoch)
     run.append_config_history(
         mode="resume" if resumed_from is not None else "start",
         start_epoch=start_epoch, resumed_from=resumed_from, best_val=best_val,
@@ -317,7 +320,7 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
             print(f"[nan-guard] epoch {epoch:02d}: non-finite train loss but finite val "
                   f"({val_esr:.5f}) — overflow absorbed; AMP off, fp32 from here")
 
-        sched.step(val_esr)
+        step_scheduler(sched, val_esr)
         cur_lr = opt.param_groups[0]["lr"]
         improved = val_esr < best_val
         if improved:
@@ -388,4 +391,4 @@ def _check_resume_compatible(ck: dict, spec: RunSpec, receptive_field: int,
     check_resume_compatible(
         ck, [(ck.get("spec", {}).get("model", {}), spec.model.to_dict(), "model.")],
         receptive_field=receptive_field, n_devices=n_devices,
-        dynamics="lr, weight_decay, plateau_*, epochs, loss, batch_size")
+        dynamics="lr, weight_decay, scheduler, plateau_*, cosine_*, epochs, loss, batch_size")

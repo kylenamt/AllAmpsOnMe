@@ -131,8 +131,11 @@ class TrainingSpec:
 
     lr: float = 5e-4
     weight_decay: float = 0.0
+    scheduler: str = "plateau"         # "plateau" | "cosine"
     plateau_patience: int = 3          # ReduceLROnPlateau patience, in epochs
     plateau_factor: float = 0.5
+    # cosine only: the floor each group anneals to, as a fraction of its own lr
+    cosine_min_lr_frac: float = 0.01
     early_stop_patience: int = 8       # stop after N epochs with no val-ESR gain
     epochs: int = 60                   # max; early stopping usually ends it sooner
     batch_size: int = 16

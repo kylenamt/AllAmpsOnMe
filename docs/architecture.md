@@ -196,12 +196,14 @@ architecture-independent.
   frozen and unused. Two parameter groups — the encoder needs its own learning rate
   or it collapses to silence — and a per-epoch collapse tripwire
   (`val_esr_shuffled`, `emb_spread`), because an encoder emitting a near-constant
-  vector still posts a respectable ESR.
+  vector still posts a respectable ESR. AdamW here, not emulate's Adam, because
+  `enc_weight_decay` is a real value under test.
 
 They stay two loops on purpose: they disagree about what validation *means*, and one
 loop with flags would hide that rather than remove it. What they genuinely shared —
-run-directory I/O, the resume check, the plateau/AMP setup — is `training/artifacts.py`
-and `training/optim.py`.
+run-directory I/O, the resume check, the schedule/AMP setup — is `training/artifacts.py`
+and `training/optim.py`. `training.scheduler` picks `plateau` (the default, on val ESR) or
+`cosine` (on epoch count, each group annealing to `cosine_min_lr_frac` of its own LR).
 
 #### Conditioning encoders (`openamp.encoders`)
 

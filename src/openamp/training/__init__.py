@@ -20,7 +20,8 @@ from __future__ import annotations
 from openamp.training.artifacts import (RunDir, check_resume_compatible,
                                         same_config_value)
 from openamp.training.optim import (GRAD_CLIP_NORM, amp_setup, build_scheduler,
-                                    param_group_lrs)
+                                    param_group_lrs, step_scheduler)
 
 __all__ = ["RunDir", "check_resume_compatible", "same_config_value",
-           "GRAD_CLIP_NORM", "amp_setup", "build_scheduler", "param_group_lrs"]
+           "GRAD_CLIP_NORM", "amp_setup", "build_scheduler", "step_scheduler",
+           "param_group_lrs"]

@@ -1,7 +1,7 @@
 """Joint training: encoder and FiLM generator, end to end, from scratch.
 
 Forked from openamp.training.emulate and keeps its contracts (same
-EmulationLoss, Adam + reduce-on-plateau, NaN guard, run-directory layout) so a
+EmulationLoss, reduce-on-plateau, NaN guard, run-directory layout) so a
 joint run's val_esr is directly comparable to the table-conditioned runs.
 
 What's different:
@@ -18,6 +18,8 @@ What's different:
 - joint.enc_frame_window (dac_frames only) draws a random contiguous span of
   frames per step instead of the amp's whole fixed tensor, so one device id
   stops being one deterministic encoder input.
+- AdamW, not emulate's Adam (see `_optimizer`). joint.enc_weight_decay is a
+  real value under test, and only AdamW makes it mean one shrinkage strength.
 
 - A collapse tripwire runs every epoch: val_esr_shuffled (embeddings permuted
   within the batch) and emb_spread (how much e varies across amps). With no
@@ -44,6 +46,7 @@ from openamp.losses import build_loss, device_loss_weights
 from openamp.models.joint import build_joint, load_joint
 from openamp.spec import RunSpec
 from openamp.training import (GRAD_CLIP_NORM, RunDir, amp_setup, build_scheduler,
+                              step_scheduler,
                               check_resume_compatible, param_group_lrs)
 
 LOG_COLUMNS = ["epoch", "step", "train_loss", "train_esr", "train_stft", "val_esr",
@@ -186,13 +189,20 @@ def _optimizer(model, spec: RunSpec):
     cannot be trained even by accident. Under ``dac_frames`` the frames themselves
     aren't even a buffer -- ``FrameStore`` is a plain attribute, not registered --
     so ``model.encoder.parameters()`` is exactly the attention pool plus the adapter.
+
+    AdamW, where emulate uses Adam. Adam folds weight decay into the gradient, so
+    the adaptive per-parameter scaling divides it too and joint.enc_weight_decay
+    would buy a different shrinkage on every adapter weight. AdamW decouples it
+    into one uniform pull toward zero, which is the guard against adapter
+    memorization that the encoder group is asking for. The generator group is
+    unaffected either way: at 3.17e-7 its decay does nothing under either rule.
     """
     tcfg = spec.training
     gen_params = [p for n, p in model.generator.named_parameters()
                   if p.requires_grad and not n.startswith("embedding.")]
     enc_wd = float(spec.joint.enc_weight_decay)
     enc_wd = tcfg.weight_decay if enc_wd < 0 else enc_wd
-    return torch.optim.Adam(
+    return torch.optim.AdamW(
         [{"params": gen_params, "lr": tcfg.lr, "name": "generator",
           "weight_decay": tcfg.weight_decay},
          {"params": list(model.encoder.parameters()), "lr": spec.joint.enc_lr,
@@ -368,7 +378,6 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
     # --- Optim / loss / bookkeeping --------------------------------------------
     lossfn = build_loss(spec.loss).to(dev)
     opt = _optimizer(model, spec)
-    sched = build_scheduler(opt, tcfg)
     use_amp, amp_dtype, scaler = amp_setup(tcfg, dev)
 
     run = RunDir(spec.run_dir)
@@ -387,7 +396,7 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
         start_epoch = resumed_from + 1
         best_val = float(ck.get("best_val_esr", float("inf")))
         # Config is authoritative on resume (same rule as training/emulate.py): the
-        # Adam moment buffers are what resuming preserves, not the lr value.
+        # AdamW moment buffers are what resuming preserves, not the lr value.
         enc_wd = float(jcfg.enc_weight_decay)
         enc_wd = tcfg.weight_decay if enc_wd < 0 else enc_wd
         for g in opt.param_groups:
@@ -400,6 +409,11 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
               f"lr_gen={tcfg.lr:.2e} lr_enc={jcfg.enc_lr:.2e} (from config)")
     else:
         run.start_log(LOG_COLUMNS)
+    # After the resume block, not before it: a cosine schedule reads each group's
+    # lr as its curve's starting point, and on resume that lr is the config's
+    # (set just above), not the checkpoint's. start_epoch then replays the curve
+    # forward to where the run left off.
+    sched = build_scheduler(opt, tcfg, max_epochs=max_epochs, start_epoch=start_epoch)
     run.append_config_history(mode="resume" if resumed_from is not None else "start",
                               start_epoch=start_epoch, resumed_from=resumed_from,
                               best_val=best_val, max_epochs=max_epochs,
@@ -503,7 +517,7 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
             print(f"[nan-guard] epoch {epoch:02d}: non-finite train loss but finite val "
                   f"({val_esr:.5f}) — overflow absorbed; AMP off, fp32 from here")
 
-        sched.step(val_esr)
+        step_scheduler(sched, val_esr)
         improved = val_esr < best_val
         if improved:
             best_val, since_improved = val_esr, 0
@@ -591,7 +605,7 @@ def _check_resume_compatible(ck: dict, spec: RunSpec, receptive_field: int,
              (saved.get("joint", {}).get("encoder", {}),
               spec.joint.encoder.to_dict(), "joint.encoder.")],
         receptive_field=receptive_field, n_devices=n_devices,
-        dynamics="lr, enc_lr, plateau_*, epochs, loss, batch_size")
+        dynamics="lr, enc_lr, scheduler, plateau_*, cosine_*, epochs, loss, batch_size")
 
 
 __all__ = ["jitter", "train", "overfit_one_batch", "evaluate_esr", "load_joint", "LOG_COLUMNS",

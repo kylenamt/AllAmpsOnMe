@@ -546,6 +546,29 @@ pooling → MLP). Both halves train from scratch; there is **no contrastive term
     At 4e-3 the encoder collapses first and the generator follows it into the output-silence
     solution. A 200-step encoder warmup measured 0.279 / 0.0419 / 7.33x — no better than the
     plain lower LR, so it was not added. **The generator's own 4e-3 was fine throughout.**
+- **`training.scheduler: cosine`, alongside the plateau default.** Reduce-on-plateau
+  schedules on the generator's val ESR, and the joint loop has two groups whose LRs it moves
+  together — which is how `fp_dac_delta512`'s encoder ended up effectively frozen from ~epoch
+  105 while it was still the component under test. Cosine anneals on epoch count alone, so the
+  encoder's budget stops depending on whether the generator has converged. Implemented as a
+  `LambdaLR` curve rather than `CosineAnnealingLR`, because that class's `eta_min` is one
+  scalar shared by all groups: at the joint loop's 8x LR split a shared floor is a different
+  fraction of each group, so `cosine_min_lr_frac` floors every group at a fraction of *its own*
+  rate. It also makes resume exact — a cosine LR is a pure function of the epoch number, so
+  `build_scheduler(start_epoch=...)` replays it rather than reconstructing it, which is what
+  plateau state can never do. Cosine's shape *is* the epoch budget, so a run using it should
+  disable early stopping; stopping mid-anneal leaves neither a finished schedule nor something
+  comparable to one.
+
+- **AdamW for the joint loop, Adam for emulate.** Adam adds weight decay to the gradient,
+  where Adam's own per-parameter scaling then divides it — so one `weight_decay` number buys a
+  different shrinkage on every weight, and a smaller one as the plateau scheduler anneals the
+  LR. That is harmless in emulate, whose `3.17e-7` (NAM's) does nothing under either rule, but
+  `joint.enc_weight_decay: 1.0e-4` is a real value chosen as the guard against the adapter
+  memorizing one fixed vector per amp. AdamW decouples the decay into one uniform pull toward
+  zero, so the knob means what the config comment claims. **Joint runs from before this change
+  are not comparable on the encoder side**; it takes a fresh run, not a resume.
+
 - **A `--overfit` *pass* is not conclusive either.** §12 established that a single-batch
   collapse can be a false alarm; the joint model shows the converse and it is worse. The fixed
   batch fit happily (ESR 0.0116, shuffled ratio 38x) at the exact `enc_lr` that collapses to

@@ -950,3 +950,73 @@ def test_jitter_carries_gradient_to_the_clean_embedding():
     e = torch.nn.functional.normalize(torch.randn(4, 32), dim=-1).requires_grad_(True)
     jitter(e, 0.2, True).sum().backward()
     assert e.grad is not None and torch.isfinite(e.grad).all() and e.grad.abs().sum() > 0
+
+
+# --- LR schedule ----------------------------------------------------------------
+def _two_group_opt():
+    """The joint trainer's shape: two groups 8x apart, as the configs run them."""
+    a, b = torch.nn.Parameter(torch.zeros(2)), torch.nn.Parameter(torch.zeros(2))
+    return torch.optim.AdamW([{"params": [a], "lr": 4.0e-3, "name": "generator"},
+                              {"params": [b], "lr": 5.0e-4, "name": "encoder"}])
+
+
+def test_cosine_floors_each_group_at_a_fraction_of_its_own_lr():
+    """The reason this is a LambdaLR: CosineAnnealingLR's eta_min is one scalar."""
+    from openamp.training import build_scheduler, step_scheduler
+
+    tcfg = TrainingSpec(scheduler="cosine", cosine_min_lr_frac=0.01)
+    opt = _two_group_opt()
+    sched = build_scheduler(opt, tcfg, max_epochs=300)
+    assert [g["lr"] for g in opt.param_groups] == [4.0e-3, 5.0e-4]
+    for _ in range(300):
+        step_scheduler(sched, 0.5)
+    assert [pytest.approx(g["lr"]) for g in opt.param_groups] == [4.0e-5, 5.0e-6]
+
+
+def test_cosine_decreases_monotonically_and_ignores_the_metric():
+    from openamp.training import build_scheduler, step_scheduler
+
+    opt = _two_group_opt()
+    sched = build_scheduler(opt, TrainingSpec(scheduler="cosine"), max_epochs=50)
+    lrs = []
+    for epoch in range(51):
+        lrs.append(opt.param_groups[0]["lr"])
+        # A metric that gets *worse* must not change the curve.
+        step_scheduler(sched, 0.5 + epoch)
+    assert all(b < a for a, b in zip(lrs, lrs[1:]))
+
+
+def test_cosine_resume_replays_to_the_same_lr():
+    """Scheduler state is not checkpointed; start_epoch has to reconstruct it."""
+    from openamp.training import build_scheduler, step_scheduler
+
+    tcfg = TrainingSpec(scheduler="cosine", cosine_min_lr_frac=0.01)
+    opt = _two_group_opt()
+    sched = build_scheduler(opt, tcfg, max_epochs=300)
+    for _ in range(137):
+        step_scheduler(sched, 0.5)
+    fresh = _two_group_opt()
+    build_scheduler(opt=fresh, ecfg=tcfg, max_epochs=300, start_epoch=137)
+    assert ([pytest.approx(g["lr"]) for g in fresh.param_groups]
+            == [g["lr"] for g in opt.param_groups])
+
+
+def test_plateau_is_still_the_default_and_reads_the_metric():
+    from openamp.training import build_scheduler, step_scheduler
+
+    opt = _two_group_opt()
+    sched = build_scheduler(opt, TrainingSpec(), max_epochs=300)
+    assert isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau)
+    for _ in range(6):                       # patience 3, factor 0.5, no improvement
+        step_scheduler(sched, 0.5)
+    assert [pytest.approx(g["lr"]) for g in opt.param_groups] == [2.0e-3, 2.5e-4]
+
+
+@pytest.mark.parametrize("changes", [dict(scheduler="cosinne"),
+                                     dict(scheduler="cosine", cosine_min_lr_frac=-0.1),
+                                     dict(scheduler="cosine", cosine_min_lr_frac=1.5)])
+def test_scheduler_config_is_validated(changes):
+    from openamp.training import build_scheduler
+
+    with pytest.raises(ValueError):
+        build_scheduler(_two_group_opt(), TrainingSpec(**changes), max_epochs=10)

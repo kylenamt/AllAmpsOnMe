@@ -1,0 +1,195 @@
+# fp_dac_attn512 + BOTH treatments at once: train-time jitter on the embedding
+# and a random contiguous frame window per step. Run name is the file stem ->
+# results/joint/fp_dac_attn512_noise15_win20/.
+#
+#   OPENAMP_DATA_DIR=data openamp joint --config configs/joint/fp_dac_attn512_noise15_win20.yaml
+#   OPENAMP_DATA_DIR=data openamp joint-eval results/joint/fp_dac_attn512_noise15_win20
+#
+# TWO fields differ from fp_dac_attn512.yaml (this file is a copy of it):
+# training.embed_noise_frac 0.0 -> 0.15 and joint.encoder.frame_window 0 ->
+# 1723. Generator, pooling, frames and device_loss_weighting are all unchanged;
+# the schedule is no longer (see the RESTART note below).
+# Confounded by construction: if this run improves, it does not say
+# which of the two did it -- fp_dac_attn512_noise15 and fp_dac_attn512_win20
+# are the single-knob arms that separate them, and this file exists to ask
+# whether the combination clears the bar at all before spending 31 h each on
+# splitting the credit.
+#
+# Why they are expected to compose rather than overlap. They act on different
+# halves of the same failure. fp_dac_delta512 ran 300 epochs and ended with
+# seen val ESR 0.121 while holdout ESR *rose*, 0.98 -> 1.077, against a
+# zero-conditioning floor of 1.117; the shuffled ratio went x1.2 -> x15.4. That
+# is a generator depending enormously on e while the encoder holds 405
+# memorized coordinates -- 405 isolated wells with nothing decodable between
+# them, so an unseen amp lands in dead space however well it is placed.
+#
+#   - The jitter treats the *generator*: it forces a neighbourhood of each
+#     embedding to decode, which is the precondition for the space between amps
+#     meaning anything. It does nothing about how e is produced.
+#   - The window treats the *encoder*: under enc_kind dac_frames one device id
+#     resolves to one fixed [14728, 1024] tensor, so the training set holds 405
+#     distinct encoder inputs and memorizing them is simply available to a 263k
+#     parameter encoder as a strategy. A random window makes one amp many
+#     inputs instead of exactly one. It does nothing about the wells being
+#     isolated.
+#
+# Neither one alone is sufficient on the argument above, which is the case for
+# running them together first.
+#
+# Why 0.15. With enc_normalize: true, e is a unit vector, so training.jitter
+# reads the fraction against 1/sqrt(512) and re-projects onto the sphere -- a
+# plain additive perturbation would mostly move |e|, an axis the generator
+# never sees vary, so it would change drive level instead of teaching anything.
+# At 0.15 that is a mean ||de|| of ~0.15 on a unit vector (cos ~0.989 to the
+# clean embedding). The middle of the fp_dac_attn512_noise05/15/30 sweep.
+#
+# Why 1723 frames = 20.0 s. The frame rate is 86.1328125 Hz (44.1 kHz over
+# DAC's hop of 512). Contiguous rather than scattered: DAC's encoder receptive
+# field measures 181 ms by gradient probe, so consecutive frames overlap ~94%
+# and the 14,728 frames hold only ~920 independent views -- a scattered draw
+# would re-sample the same stationary average, whereas a 20 s span is a
+# genuinely different look at the amp, still carries ~108 independent views,
+# and gives ~8 non-overlapping windows per device.
+#
+# Both are train-time only. val, shuffled and holdout score clean embeddings,
+# and the eval window is the centre one -- deterministic, so a number is
+# comparable epoch to epoch, and the *same length* as training. Scoring on all
+# 14,728 frames would change the pool's softmax distribution, taken over the
+# frame axis, and hand the generator an embedding from a distribution it never
+# saw.
+#
+# Read against fp_dac_attn512 at the same epoch, not against fp_dac_delta512 --
+# device_loss_weighting differs between those two. Success is holdout ESR below
+# 1.077 *and* the shuffled ratio coming down from x15.4. Watch that seen val
+# ESR does not degrade much, which would mean the window is too short to
+# identify an amp, or the jitter too large to condition on.
+#
+# RESTART 2026-08-31. The first attempt ran 25 epochs on Adam + reduce-on-plateau
+# and was killed, not resumed. Three things changed together, so this run is not
+# comparable to fp_dac_attn512 on the schedule axis -- only on the two fields
+# above, and only against a future arm sharing this schedule:
+#   - AdamW, so joint.enc_weight_decay is one uniform shrinkage on the adapter
+#     instead of Adam's per-parameter, gradient-scaled version.
+#   - scheduler: cosine over the full epoch budget, replacing plateau.
+#   - epochs 150 -> 300 with early stopping off, because cosine's shape is the
+#     epoch budget.
+#   - joint.enc_weight_decay 1.0e-4 -> 0.01 (second restart, at epoch 1, so
+#     nothing was lost). The encoder group only.
+# lr and enc_lr are unchanged at their original 4.0e-3 / 5.0e-4 -- the 2.0e-3 /
+# 2.5e-4 the first attempt reached was one in-memory plateau halving, never
+# written back here, so a fresh start already restores them.
+
+data_dir: data   # was an OPENAMP_DATA_DIR prefix in the commands above
+
+model:
+  arch: delta_wavenet
+  channels: 8
+  activation: tanh
+  embedding_dim: 512
+  delta_rank: 32
+
+data:
+  dataset: joint
+
+  # later hand-annealed resume state -- this is a new run and should get a
+  # normal schedule, not one tuned to a different run's trajectory. -----------
+  holdout_frac: 0.1
+  clip_seconds: 2.0
+  pairs_per_epoch: 50000
+  sources: []
+
+loss:
+  name: esr_mrstft
+  stft_weight: 0.05
+  preemph_coeff: 0.85
+  # NEW vs fp_dac_delta512 (which ran at the 0.0 default): equalizes each
+  # device's expected share of the pooled ESR gradient instead of letting it
+  # track render power. joint_model/train.py did not read this field at all
+  # until this run needed it -- see its device_loss_weighting wiring, forked
+  # from emulate.train's. Not comparable against a strength-0 val_esr; per the
+  # holdout note there, the holdout probe stays unweighted regardless.
+  device_loss_weighting: 1.0
+
+training:
+  batch_size: 32
+  # 300, not 150: cosine's shape is set by the epoch budget, so the budget is now
+  # part of the schedule rather than a ceiling early stopping was expected to
+  # reach first.
+  epochs: 300
+  lr: 4.0e-3
+  weight_decay: 3.17e-7
+  # Cosine on epoch count, replacing reduce-on-plateau. The plateau schedule tied
+  # both groups to the generator's val-ESR plateau, which is how fp_dac_delta512's
+  # encoder ended up effectively frozen from ~epoch 105 while it was still the
+  # component under test. A fixed curve anneals the encoder on its own budget
+  # regardless of what the generator's loss is doing.
+  scheduler: cosine
+  # Each group floors at 1/100 of its own lr -- generator 4.0e-5, encoder 5.0e-6 --
+  # rather than at a shared absolute floor, which at an 8x lr split would be a
+  # different fraction of each. About 6-7 plateau halvings' worth, spread smoothly.
+  cosine_min_lr_frac: 0.01
+  plateau_patience: 3     # unused under scheduler: cosine, kept for provenance
+  plateau_factor: 0.5
+  # Off: > epochs, so it can never fire. Cosine assumes the whole curve runs, and
+  # stopping mid-anneal at a high lr would leave a run that is neither a finished
+  # cosine schedule nor comparable to one. checkpoint.pt still tracks best val ESR
+  # whenever it occurs.
+  early_stop_patience: 301
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50
+  # NEW vs fp_dac_attn512 -- one of the two fields this file changes. See the
+  # header for why the scale is 1/sqrt(512) on the sphere, not the table std
+  # training/emulate.py uses.
+  embed_noise_frac: 0.15
+
+joint:
+  encoder:
+    kind: dac_frames
+    # openamp.probes.extract's output: per-device [~14700, 1024] fp16 frame
+    # shards, memmapped and looked up by device id -- same lookup design as
+    # enc_kind: fingerprint, for the same reason (a codec fingerprint needs long
+    # audio to be reliable; a joint reference window is 2 s).
+    frames_path: results/dac_frames/sweep_train
+
+    # CrossAttentionPool(latent_dim=1024, n_queries, d_model) -> pooled
+    # n_queries*d_model -> proj (Linear -> tanh -> Linear) -> 512. Same
+    # projection shape FingerprintEncoder and WaveNetEncoder both use, so this
+    # arm differs from the fingerprint arm in exactly one place: a trained pool
+    # stands where a frozen mean+std vector was looked up.
+    # 8x64=512, not probe.py's own 4x64=256 default: the fingerprint arm pools to
+    # 2048-d (ceiling exactly embedding_dim=512), so leaving this at 256 would
+    # hand the comparison a capacity handicap that has nothing to do with the
+    # pooling method being tested.
+    n_queries: 8
+    d_model: 64
+    # NEW vs fp_dac_attn512 -- the other field this file changes. 0 = all
+    # 14,728 frames (what every dac_frames run so far did).
+    frame_window: 1723
+    proj_hidden: 128
+    activation: tanh
+    # ON, for the same reason fp_dac_delta512 turns it on: nothing else bounds
+    # |e| and the reconstruction gradient inflates it.
+    normalize: true
+
+  ref:
+    # fp_path / fp_preprocess / fp_layernorm belong to enc_kind: fingerprint and
+    # do nothing here -- dac_frames has no precomputed pooled vector to look up
+    # and no dry row to subtract (extract.py keeps wet frames only). Left at
+    # their JointConfig defaults rather than restated.
+    seconds: 2.0
+    different_file: true
+    min_gap_seconds: 1.0
+
+  enc_lr: 5.0e-4
+  # 0.01, up from the 1.0e-4 every earlier dac_frames arm ran -- AdamW's own
+  # PyTorch default, and only meaningful now that AdamW makes it one uniform
+  # shrinkage rather than Adam's per-parameter, gradient-scaled version. The
+  # adapter's deepest failure mode is memorization: it sees the identical vector
+  # for a given amp on all 50,000 draws per epoch, and 1.0e-4 was a guess at the
+  # guard, not a measured one. Only this group -- training.weight_decay stays at
+  # NAM's 3.17e-7 so the generator is still a NAM-comparable network.
+  enc_weight_decay: 0.01
+  grad_checkpoint_encoder: false

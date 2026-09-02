@@ -68,7 +68,7 @@ training:
   # at its raised learning rate.
   epochs: 300
   # Hand-annealed to train_log.csv's last value at the epoch-126 resume: --resume
-  # applies the config lr verbatim (the Adam moment buffers are what resuming
+  # applies the config lr verbatim (the AdamW moment buffers are what resuming
   # preserves, not the lr), so leaving 4.0e-3 here would undo 126 epochs of
   # ReduceLROnPlateau annealing. Original fresh-run value was 4.0e-3.
   lr: 3.13e-5
