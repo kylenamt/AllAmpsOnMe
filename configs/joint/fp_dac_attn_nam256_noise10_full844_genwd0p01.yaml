@@ -1,0 +1,142 @@
+# fp_dac_attn_nam256_noise10_full844 with one field moved: the generator's
+# (a.k.a. the decoder's) weight decay. Run name is the file stem ->
+# results/joint/fp_dac_attn_nam256_noise10_full844_genwd0p01/.
+#
+#   openamp joint --config configs/joint/fp_dac_attn_nam256_noise10_full844_genwd0p01.yaml
+#   openamp joint-eval results/joint/fp_dac_attn_nam256_noise10_full844_genwd0p01
+#
+# THE ONLY DIFFERENCE from fp_dac_attn_nam256_noise10_full844.yaml:
+#
+#   training.weight_decay  3.17e-7 -> 0.01
+#
+# That is the weight decay AdamW applies to the FiLM generator group (see
+# training/joint.py _optimizer: the "generator" param group takes
+# tcfg.weight_decay). The encoder group is unchanged -- it was already at
+# joint.enc_weight_decay: 0.01 -- so this arm makes both groups decay at the
+# same 0.01 rate instead of leaving the generator at NAM's 3.17e-7.
+#
+# Consequence to keep in mind when reading the result: the generator is no
+# longer a NAM-comparable network. NAM's config ships 3.17e-7; at 0.01 under
+# AdamW this is ~30,000x more shrinkage on every generator weight. Compare this
+# run to fp_dac_attn_nam256_noise10_full844 as a generator-regularization arm,
+# not to any NAM baseline.
+#
+# Everything below is byte-identical to fp_dac_attn_nam256_noise10_full844.yaml
+# except that one line. Its header, quoted for context:
+#
+#   # fp_dac_attn_nam256_noise10 re-run on the full 844-device corpus.
+#   #   - data/renders went 450 -> 844 devices on 2026-09-02 (the 394 devices in
+#   #     the manifest that had never been rendered, all from A1 captures, same
+#   #     render settings as the original 450). The embedding table grows with it.
+#   #   - results/dac_frames/sweep_train grew 450 -> 844 shards to match, same
+#   #     encoder and same -16 LUFS normalization.
+#   #   - data/manifests/emulate_holdout.txt grew 45 -> 84 so holdout_frac: 0.1
+#   #     is honoured against the larger pool. It is a superset: the original 45
+#   #     are kept verbatim and 39 were drawn from the new devices.
+#   # So the training set goes 405 -> 760 devices and the holdout probe 45 -> 84.
+#   # The frame shards are now 23.71 GiB against 30 GB of system RAM, so they no
+#   # longer sit in page cache -- watch smp/s in the stdout log before reading
+#   # anything into wall-clock comparisons.
+
+data_dir: data   # was an OPENAMP_DATA_DIR prefix in the commands above
+
+model:
+  arch: film_wavenet
+  channels: 8
+  activation: tanh
+  embedding_dim: 256
+
+data:
+  dataset: joint
+
+  holdout_frac: 0.1
+  clip_seconds: 2.0
+  pairs_per_epoch: 50000
+  sources: []
+
+loss:
+  name: esr_mrstft
+  stft_weight: 0.05
+  preemph_coeff: 0.85
+  # Same as fp_dac_attn512: equalizes each device's expected share of the
+  # pooled ESR gradient instead of letting it track render power. Not
+  # comparable against a strength-0 val_esr; the holdout probe stays unweighted
+  # regardless.
+  device_loss_weighting: 1.0
+
+training:
+  batch_size: 32
+  # 300, not 150: cosine's shape is set by the epoch budget, so the budget is now
+  # part of the schedule rather than a ceiling early stopping was expected to
+  # reach first.
+  epochs: 300
+  lr: 4.0e-3
+  # 0.01, up from NAM's 3.17e-7 -- the one field this arm moves. AdamW weight
+  # decay on the FiLM generator group. Matches the encoder group's 0.01.
+  weight_decay: 0.01
+  # Cosine on epoch count, replacing reduce-on-plateau. The plateau schedule tied
+  # both groups to the generator's val-ESR plateau, which is how fp_dac_delta512's
+  # encoder ended up effectively frozen from ~epoch 105 while it was still the
+  # component under test. A fixed curve anneals the encoder on its own budget
+  # regardless of what the generator's loss is doing.
+  scheduler: cosine
+  # Each group floors at 1/100 of its own lr -- generator 4.0e-5, encoder 5.0e-6 --
+  # rather than at a shared absolute floor, which at an 8x lr split would be a
+  # different fraction of each. About 6-7 plateau halvings' worth, spread smoothly.
+  cosine_min_lr_frac: 0.01
+  plateau_patience: 3     # unused under scheduler: cosine, kept for provenance
+  plateau_factor: 0.5
+  # Off: > epochs, so it can never fire. Cosine assumes the whole curve runs, and
+  # stopping mid-anneal at a high lr would leave a run that is neither a finished
+  # cosine schedule nor comparable to one. checkpoint.pt still tracks best val ESR
+  # whenever it occurs.
+  early_stop_patience: 301
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50
+  # See the header for why the scale is 1/sqrt(256) on the sphere, not the table
+  # std training/emulate.py uses.
+  embed_noise_frac: 0.1
+
+joint:
+  encoder:
+    kind: dac_frames
+    # openamp.probes.extract's output: per-device [~14700, 1024] fp16 frame
+    # shards, memmapped and looked up by device id -- same lookup design as
+    # enc_kind: fingerprint, for the same reason (a codec fingerprint needs long
+    # audio to be reliable; a joint reference window is 2 s).
+    frames_path: results/dac_frames/sweep_train
+
+    # CrossAttentionPool(latent_dim=1024, n_queries, d_model) -> pooled
+    # n_queries*d_model -> proj (Linear -> tanh -> Linear) -> 256.
+    # 8x64=512 is left exactly as fp_dac_attn512 sets it, so the encoder is one
+    # unchanged component across the two runs; with embedding_dim now 256 the
+    # pool no longer ceilings the projection, it feeds a 2:1 reduction into it.
+    n_queries: 8
+    d_model: 64
+    proj_hidden: 128
+    activation: tanh
+    # ON, for the same reason fp_dac_delta512 turns it on: nothing else bounds
+    # |e| and the reconstruction gradient inflates it. It is also what puts the
+    # jitter above on the sphere.
+    normalize: true
+
+  ref:
+    # fp_path / fp_preprocess / fp_layernorm belong to enc_kind: fingerprint and
+    # do nothing here -- dac_frames has no precomputed pooled vector to look up
+    # and no dry row to subtract (extract.py keeps wet frames only). Left at
+    # their JointConfig defaults rather than restated.
+    seconds: 2.0
+    different_file: true
+    min_gap_seconds: 1.0
+
+  enc_lr: 5.0e-4
+  # 0.01, up from the 1.0e-4 every earlier dac_frames arm ran -- AdamW's own
+  # PyTorch default, and only meaningful now that the joint trainer uses AdamW,
+  # making it one uniform shrinkage rather than Adam's per-parameter,
+  # gradient-scaled version. In this arm training.weight_decay matches it at
+  # 0.01, so both groups decay at the same rate.
+  enc_weight_decay: 0.01
+  grad_checkpoint_encoder: false

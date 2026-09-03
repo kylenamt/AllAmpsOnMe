@@ -126,11 +126,15 @@ class MultiHeadAttentiveStatsPool(nn.Module):
         if mask is not None and mask.shape[-1] != T:
             raise ValueError(f"mask length {mask.shape[-1]} does not match feature "
                              f"length {T}")
+            
         gmean, gstd = _masked_global_stats(h, mask, self.eps)
+        
         ctx = torch.cat([h, gmean.expand(-1, -1, T), gstd.expand(-1, -1, T)], dim=1)
         logits = self.score(ctx).view(B, self.n_heads, E, T)
+        
         if mask is not None:
             logits = logits.masked_fill(~mask.bool()[:, None, None, :], float("-inf"))
+            
         alpha = torch.softmax(logits.float(), dim=-1).to(h.dtype)
         mean, std = _weighted_moments(alpha, h.unsqueeze(1), self.eps)   # [B, K, E]
         return torch.cat([mean, std], dim=-1).flatten(1)                 # [B, K*2E]
@@ -246,11 +250,15 @@ class CrossAttentionPool(nn.Module):
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         K, V = self.k(x), self.v(x)                       # [B, T, d]
         logits = (self.q @ K.transpose(1, 2)) / self.d_model ** 0.5      # [B, n_q, T]
+        
         if mask is not None:
             if mask.shape[-1] != x.shape[1]:
                 raise ValueError(f"mask length {mask.shape[-1]} does not match frame "
                                  f"count {x.shape[1]}")
+                
             logits = logits.masked_fill(~mask.bool()[:, None, :], float("-inf"))
+            
+            
         alpha = torch.softmax(logits.float(), dim=-1).to(V.dtype)
         return (alpha @ V).flatten(1)                     # [B, n_q * d]
 
