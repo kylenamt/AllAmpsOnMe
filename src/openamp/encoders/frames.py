@@ -74,7 +74,6 @@ from torch import nn
 
 from openamp.core.config import ConfigError
 from openamp.encoders.pooling import CrossAttentionPool, FrameStore
-from openamp.models import make_activation, normalize_activation
 
 __all__ = ["FrameAttentionEncoder"]
 
@@ -82,9 +81,8 @@ __all__ = ["FrameAttentionEncoder"]
 class FrameAttentionEncoder(nn.Module):
     """``[B]`` device ids ``-> [B, embedding_dim]``.
 
-    The adapter copies FingerprintEncoder's projection head shape
-    (``Linear(pooled, h) -> act -> Linear(h, De)``, ``proj_hidden=0`` deriving
-    as ``pooled_dim // 4``), so this arm differs from the fingerprint arm in
+    The adapter copies FingerprintEncoder's projection head shape (a single
+    ``Linear(pooled, De)``), so this arm differs from the fingerprint arm in
     exactly one place: a trained ``CrossAttentionPool`` over raw frames stands
     where a frozen mean+std vector was looked up.
     """
@@ -97,9 +95,9 @@ class FrameAttentionEncoder(nn.Module):
     ref_mode = "device"
 
     def __init__(self, *, embedding_dim: int, frames: FrameStore,
-                 n_queries: int = 4, d_model: int = 64, proj_hidden: int = 128,
-                 activation: str = "tanh", normalize: bool = True,
-                 frame_window: int = 0, grad_checkpoint: bool = False):
+                 n_queries: int = 4, d_model: int = 64, normalize: bool = True,
+                 frame_window: int = 0, grad_checkpoint: bool = False,
+                 pool: nn.Module | None = None):
         super().__init__()
         # Accepted and ignored -- see FingerprintEncoder.
         del grad_checkpoint
@@ -112,7 +110,6 @@ class FrameAttentionEncoder(nn.Module):
         if self.frame_window > frames.n_frames:
             raise ValueError(f"frame_window {self.frame_window} exceeds the store's "
                              f"{frames.n_frames} frames per device")
-        self.activation = normalize_activation(activation, field="enc_activation")
         self.frames = frames
 
         ids = np.asarray(frames.device_ids, dtype=np.int64)
@@ -128,11 +125,16 @@ class FrameAttentionEncoder(nn.Module):
         # themselves live in `frames`, memmapped, never a tensor buffer.
         self.register_buffer("device_ids", torch.from_numpy(ids))
 
-        self.pool = CrossAttentionPool(frames.latent_dim, n_queries, d_model)
-        hidden = int(proj_hidden) if int(proj_hidden) > 0 else max(1, self.pool.pooled_dim // 4)
-        self.proj = nn.Sequential(nn.Linear(self.pool.pooled_dim, hidden),
-                                  make_activation(self.activation),
-                                  nn.Linear(hidden, self.embedding_dim))
+        # `pool` is the one seam a frames-arm variant needs: everything else on
+        # this class -- the memmapped lookup, the window draw, the adapter, the
+        # normalize -- is what the variants agree on. Not a config knob (a YAML
+        # value could only ever be a string); openamp.encoders.refine passes it.
+        self.pool = pool if pool is not None else CrossAttentionPool(
+            frames.latent_dim, n_queries, d_model)
+        # An adapter, not a stage: one Linear whose only job is to change width
+        # from pooled_dim to De. No hidden layer, so nothing here narrows what
+        # the pool found before the generator sees it.
+        self.proj = nn.Linear(self.pool.pooled_dim, self.embedding_dim)
 
     # --- Construction -------------------------------------------------------------
     @staticmethod

@@ -34,7 +34,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from openamp.core.config import ConfigError
-from openamp.models import make_activation, normalize_activation
 
 __all__ = ["FingerprintEncoder", "FINGERPRINT_PREPROCESS", "DRY_ID"]
 
@@ -49,17 +48,16 @@ class FingerprintEncoder(nn.Module):
     """``[B] device ids -> [B, embedding_dim]``.
 
     The adapter deliberately copies ``WaveNetEncoder``'s projection head shape
-    (``Linear(pooled, h) -> act -> Linear(h, De)``, ``proj_hidden=0`` deriving as
-    ``pooled_dim // 4``) so that this arm differs from a WaveNet-encoder arm in
-    exactly one place: the provenance of the pooled vector.
+    (a single ``Linear(pooled, De)``) so that this arm differs from a
+    WaveNet-encoder arm in exactly one place: the provenance of the pooled
+    vector.
     """
 
     ref_mode = "device"                                  # a device id to look up
 
     def __init__(self, *, embedding_dim: int, fingerprints: np.ndarray,
                  device_ids: np.ndarray, dry: np.ndarray,
-                 preprocess: str = "dry_l2", proj_hidden: int = 128,
-                 activation: str = "tanh", normalize: bool = True,
+                 preprocess: str = "dry_l2", normalize: bool = True,
                  layernorm: bool = False, eps: float = 1e-12,
                  grad_checkpoint: bool = False):
         super().__init__()
@@ -89,7 +87,6 @@ class FingerprintEncoder(nn.Module):
         self.preprocess = str(preprocess)
         self.normalize = bool(normalize)
         self.eps = float(eps)
-        self.activation = normalize_activation(activation, field="enc_activation")
 
         self.register_buffer("fingerprints", torch.from_numpy(fp))
         self.register_buffer("dry", torch.from_numpy(dry_v))
@@ -102,7 +99,6 @@ class FingerprintEncoder(nn.Module):
         self.register_buffer("id_to_row", lut)
 
         d_fp = fp.shape[1]
-        hidden = int(proj_hidden) if int(proj_hidden) > 0 else max(1, d_fp // 4)
         layers: list[nn.Module] = []
         if layernorm:
             # Per-sample, learned affine, no corpus statistics -- composable with any
@@ -110,8 +106,10 @@ class FingerprintEncoder(nn.Module):
             # halves on different scales, and one LayerNorm across the concatenation
             # mixes them.
             layers.append(nn.LayerNorm(d_fp))
-        layers += [nn.Linear(d_fp, hidden), make_activation(self.activation),
-                   nn.Linear(hidden, self.embedding_dim)]
+        # An adapter, not a stage: one Linear whose only job is to change width
+        # from the fingerprint's to De. No hidden layer, so nothing here narrows
+        # the fingerprint before the generator sees it.
+        layers.append(nn.Linear(d_fp, self.embedding_dim))
         self.proj = nn.Sequential(*layers)
 
     # --- Construction -------------------------------------------------------------

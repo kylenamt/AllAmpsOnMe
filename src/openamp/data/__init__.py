@@ -18,6 +18,10 @@ key              shape / dtype           meaning
 
 A model consumes ``input`` and compares ``output[..., R:]`` against ``target``.
 
+One dataset sits outside that contract on purpose:
+:class:`~openamp.data.amps.AmpClipsDataset` yields a whole amp per item (fit
+clips and score clips), for the unfolder, and is not in :data:`DATASETS`.
+
 **Adding a dataset** = one new module with a class honouring that contract, plus
 either an entry in :data:`DATASETS` or a ``@register_dataset("name")`` decorator
 on the class. Nothing in a training loop changes.
@@ -31,6 +35,7 @@ built from a ``Config`` at the boundary — no dataset holds a ``Config``.
 
 from __future__ import annotations
 
+from openamp.data.amps import AmpClipsDataset
 from openamp.data.corpus_index import (CorpusPaths, build_device_index, device_names,
                                        load_or_create_holdout, manifest_signature,
                                        render_ok_devices, training_device_index)
@@ -44,7 +49,7 @@ __all__ = ["CorpusPaths", "build_device_index", "device_names",
            "load_or_create_holdout", "manifest_signature", "render_ok_devices",
            "training_device_index",
            "EmulationDataset", "read_with_retry", "DeviceGridDataset",
-           "JointDataset", "REF_MODES", "WetDryDataset", "make_loader",
+           "JointDataset", "REF_MODES", "WetDryDataset", "AmpClipsDataset", "make_loader",
            "DATASETS", "register_dataset", "build_dataset"]
 
 DATASETS: dict[str, type] = {

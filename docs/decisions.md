@@ -264,6 +264,14 @@ devices past 3 dB).
 - `enroll.py` also owns `nam_signal_regions` — NAM's own train/val slicing of the v3
   capture signal (lead-in dropped, blips kept in train, val = the last 9 s), identified by
   sample length.
+- **The fit honours the run's `device_loss_weighting`** (2026-09-06). It previously fitted
+  and scored plain pooled ESR whatever the run had trained on. Weights are rebuilt from the
+  *enrolled* devices' own train-split render levels and normalized to mean 1 over that
+  cohort, so they balance the enrollment set, not the trained table. `enroll_pair` stays
+  unweighted (one row; mean-1 over one device is 1.0). Consequence for analysis: on a
+  weighted run the pooled val ESR is not comparable with the strength-0 mass enrolls
+  (`delta_a2_tanh_r32_512`, `nam_a2_tanh_ch16_512`, `nam_a2_256_mixed_n10`), and since the
+  weighting also steers the fit, their per-device ESR is not a like-for-like either.
 
 ## 8. The sweep saga (how three extra data dirs happened)
 
@@ -618,6 +626,27 @@ was 0.439 against the table baseline's 0.0519, so nothing here is a quality clai
   on collapse, not a requirement for the embedding to mean something — and a reason to fix the
   generator side before adding loss terms.
 
+### 13.2 The pooling -> embedding adapter is one Linear (2026-09-07)
+
+Every encoder arm used to project its pooled vector through
+`Linear(pooled, h) -> act -> Linear(h, De)` with `h` defaulting to 128 (or
+`pooled // 4`). On the live `dac_frames` arm that was 512 -> 128 -> 256: a
+hidden layer narrower than *both* ends, sitting between the pool and the only
+path amp identity has into the generator. Nothing chose 128 for a reason —
+it was copied across arms so they would differ in one place.
+
+It is now a single `Linear(pooled_dim, De)`, in all four arms
+(`MultiTapStatsHead`, `WaveNetEncoder`'s stats head, `FingerprintEncoder`,
+`FrameAttentionEncoder`). The adapter's only job is to change width. The
+`proj_hidden` knob is gone, and with it `enc_activation` on the two lookup
+arms, where it had no other use.
+
+**Nothing before this date is comparable across the adapter.** Old joint
+checkpoints cannot load (`proj.0`/`proj.2` against `proj`), and any ESR from a
+run launched earlier was measured through the bottleneck. The `configs/joint/`
+files were edited in place rather than forked, so they no longer reproduce the
+runs whose names they carry.
+
 ## 14. Open threads
 
 - The device-energy weighting fix (per-device reference denominator) — proposed, not run.
@@ -650,3 +679,64 @@ was 0.439 against the table baseline's 0.0519, so nothing here is a quality clai
   months. Now actively confusing next to the real `tests/test_encoder.py` — delete it.
 - `publish_run_dashboard.py` only globs `results/emulate/*/` and charts `train_esr`/`val_esr`, so
   encoder runs never appear. A `--results-dir` pass-through plus a `SERIES` override would fix it.
+
+---
+
+## 15. Deep-unfolded enrollment (2026-10-06)
+
+The frozen-decoder encoder places unseen amps badly (median test ESR 0.45), while a fitted
+vector on the same generator reaches 0.009 — so the gap is placement, not the generator (§13).
+Deep unfolding sits between the two: take the encoder's guess, then K gradient steps through the
+frozen generator whose shape is learned. `enroll/unfold.py`, trained by `training/unfold.py`
+(`openamp unfold`).
+
+- **Why it can be learned at all.** `delta_wavenet` reads `e` only through 23 linear maps
+  (`layer.delta.coeff`, `[32, 512]` each), so `dL/de = Σ_l W_lᵀ g_l` exactly. A step keeps that
+  form but owns a trainable `V_{k,l}` per step and layer (initialized at `W_l`) plus a
+  per-dimension step size. Untrained, it *is* normalized gradient descent.
+- **First-order, on purpose.** Full backprop through the steps keeps every step's graph alive at
+  once — ~13 GiB at K=5 for a single amp × 16 clips, more than the 12 GB card — and costs ~2–3×
+  per step. First-order holds one generator pass and still gives `V` and the step sizes an exact
+  gradient through the update path.
+- **The gradient is unit-normalized per amp.** Raw gradient size spans orders of magnitude
+  between amps (badly placed amps start at ESR 5–40); no single step size suits both ends.
+- **Holdout split 42/42 by sorted id.** Even positions pick the epoch (val files), odd positions
+  are reported (test files, 200 clips). No amp both selects and scores. The steps' own clips come
+  from each amp's train files — "the recording you enroll from".
+- **Size.** `V` is one copy of the generator's coeff maps per step: 377,568 numbers each, so
+  1.89 M at K=5 and 3.77 M at K=10 — 3–6× the encoder (626 k). Some of any gain may be capacity.
+
+Results (report amps, median test ESR; plain Adam = `scripts/unfold_headroom.py`):
+
+| | median | mean |
+|---|---|---|
+| encoder alone | 0.446 | 1.53 |
+| plain Adam, 5 / 10 / 25 steps | 0.195 / 0.143 / 0.097 | |
+| untrained unfold, K=5 / K=10 | 0.158 / 0.130 | 0.52 / 0.24 |
+| **trained unfold, K=5** (best epoch 21 of 29) | **0.118** | **0.21** |
+| **trained unfold, K=10** (best epoch 9 of 17) | **0.081** | **0.16** |
+| full enrollment (~2,800 steps/amp) | 0.009 | 0.023 |
+
+- K=5 beats Adam@10 on 34/42 amps, Adam@25 on 12/42. K=10 beats Adam@25 on 26/42 (Adam@50 on
+  6/42) and K=5 on 39/42; training cut its untrained 0.130 by 38% (K=5: 25%). The biggest gains are on the worst-placed
+  amps (device 784: 40 → 1.1, where 5 Adam steps leave 13.6).
+- Mild overfit: train loss kept falling while the select median went flat after ~epoch 20, and
+  the select half improved 37% over untrained but the report half only 25%. Training amps' encoder
+  guesses are far better than held-out ones', so the steps mostly learn small corrections.
+- These numbers come from the prototype (`scripts/unfold_train.py`, since deleted; runs in
+  `results/unfold/unfold_k*`).
+  The official stage draws its held-out fit clips and select scores differently, so it is not
+  bit-comparable — re-run, don't quote across.
+- The 84 holdout amps have now steered several choices (which encoder, K=5 vs 10); a final claim
+  wants a fresh set of unseen amps.
+- **8 amps × 16 clips per update OOMs the 12 GB card**; 6 fits at ~9.2 GB. The GPU is saturated
+  at batch 16 already (113 clips/s fp32, ~200 bf16), so a bigger batch buys nothing but memory.
+- **Training on the capture file instead does not help.** `configs/unfold/k10_capture_v2_b32.yaml`
+  (the official stage's first real run): steps fit on each amp's capture train region, loss on its
+  9 s val region, select/report unchanged on EGDB. Report median 0.103 (mean 0.26) against
+  untrained 0.110 — and worse than the *EGDB-trained* K=10 fitting on the same whole-capture clips
+  at test time (0.092, mean 0.19; `scripts/unfold_capture_test.py`). Train loss fell all run while
+  select stayed flat from epoch 0: what suits 9 s of quiet DI does not carry to guitar playing.
+  So: train on diverse corpus audio, fit on the capture at use time (costs 8-14% vs corpus clips).
+- Open: K>10, harder training starts (perturb the training amps' guesses toward
+  held-out error), and fitting the steps on the NAM capture file itself instead of corpus clips.

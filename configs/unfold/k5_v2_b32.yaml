@@ -1,0 +1,38 @@
+# Deep-unfolded enrollment: the b32 encoder's zero-shot guess, then K=5 learned
+# steps through the frozen v2 generator. Run name is the file stem ->
+# results/unfold/k5_v2_b32/.
+#
+#   openamp unfold --config configs/unfold/k5_v2_b32.yaml
+#   openamp unfold --config configs/unfold/k5_v2_b32.yaml --resume
+#
+# No model:/data:/loss: sections: the generator run supplies all three (it *is*
+# the model), and resolved_config.yaml records what it supplied.
+#
+# Prototyped as scripts/unfold_train.py (results/unfold/unfold_k5_v2_b32,
+# report median 0.118 vs the untrained steps' 0.158 and the encoder alone's
+# 0.446). This official version is not bit-comparable to that run -- its held-out
+# fit clips and select scoring draw differently -- so re-run rather than quote.
+
+data_dir: data
+
+unfold:
+  generator_run: results/emulate/delta_a2_tanh_r32_512_v2
+  encoder_run: results/joint/frozen_delta_a2_tanh_r32_512_v2_b32
+  # The b32 checkpoint names /var/tmp/openamp_frames_sweep_train, which exists
+  # on one host only; this is the shared copy of the same store.
+  frames_path: results/dac_frames/sweep_train
+  steps: 5
+  clips: 16
+  step_lr: 1.0e-2
+  init_step_frac: 0.0226
+
+training:
+  lr: 3.0e-4                # V
+  batch_size: 6             # amps per update; 8 x 16 clips OOMs the 12 GB card
+  epochs: 80
+  early_stop_patience: 8
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16           # how v2 trained; 1.8x over fp32 on this card
+  val_pairs: 2688           # select clips in total: 64 per amp over 42 amps
+  log_every: 20

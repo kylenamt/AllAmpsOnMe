@@ -110,13 +110,9 @@ joint:
     preprocess: dry_l2
     layernorm: false
 
-    # Same two-layer shape WaveNetEncoder projects with, so this arm differs from an
-    # encoder arm in exactly one place: where the pooled vector comes from.
-    # 2048 -> 128 -> 512 = 327,680 params, against the generator's 928,360. The 128
-    # bottleneck is not a throttle here: the fingerprint cloud's own effective
-    # dimensionality is ~2.8, so the input, not the adapter, is the narrow part.
-    proj_hidden: 128
-    activation: tanh
+    # Same single-Linear adapter WaveNetEncoder projects with, so this arm differs
+    # from an encoder arm in exactly one place: where the pooled vector comes from.
+    # 2048 -> 512 = 1,049,088 params, against the generator's 928,360.
     # ON. Nothing else bounds |e| and the reconstruction gradient inflates it: proto
     # measured |e| -> 123 and total collapse (shuffled ratio exactly 1.00) with it off.
     normalize: true

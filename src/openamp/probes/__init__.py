@@ -22,12 +22,22 @@ predicted from a 2.8-dimensional input, and that 2.84 is a property of the
 collapses them. Whether a learned pooler recovers more of that is the whole
 experiment, and it has a number to beat before any ESR is measured.
 
-- :mod:`~openamp.probes.extract` -- frozen DAC over each render, frames kept.
-- :mod:`~openamp.probes.probe`   -- the pooler, the regression, the report.
+- :mod:`~openamp.probes.extract`    -- frozen DAC over each render, frames kept.
+- :mod:`~openamp.probes.probe`      -- the pooler, the regression, the report.
+- :mod:`~openamp.probes.probe_attn` -- same regression, the package's own
+  :class:`~openamp.encoders.refine.AttentionEncoder` in place of the probe's
+  smaller single-block pool.
+- :mod:`~openamp.probes.probe_synth` -- probe_attn's head on log-mel tokens of
+  the T3K capture, trained on real amps plus made-up amps the frozen generator
+  renders online.
+- :mod:`~openamp.probes.probe_esr`  -- reload a finished ``probe_attn`` encoder
+  (or a ``probe_synth`` run's predictions), wire it to the frozen decoder, report
+  ESR for trained vs held-out amps against each group's oracle vector.
 
-``python -m openamp.probes.extract`` then ``python -m openamp.probes.probe``.
+``python -m openamp.probes.extract`` then ``python -m openamp.probes.probe``
+(or ``python -m openamp.probes.probe_attn``, then ``probe_esr`` on its output).
 """
 
 from __future__ import annotations
 
-__all__ = ["extract", "probe"]
+__all__ = ["extract", "probe", "probe_attn", "probe_synth", "probe_esr"]

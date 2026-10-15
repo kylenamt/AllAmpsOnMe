@@ -6,6 +6,7 @@
     corpus  :  corpus · subset · render · verify
     emulate :  emulate · emulate-compare · emulate-validate · emulate-demo · emulate-enroll
     encoder :  encode · encode-eval
+    unfold  :  unfold
 
 - Each command is thin: loads the one :class:`~openamp.core.config.Config`, then
   calls into a stage module. Heavy imports (torch, NAM, soundfile) live inside
@@ -111,7 +112,7 @@ def cli(verbose: bool) -> None:
 
     Run order: auth discover select download validate dedup finalize · corpus
     subset render verify · emulate emulate-compare emulate-validate emulate-demo
-    emulate-enroll · encode encode-eval.
+    emulate-enroll · encode encode-eval · unfold.
     """
     _setup_logging(verbose)
 
@@ -497,14 +498,13 @@ def emulate_export_bundle(run, out, profile_devices, profile_pairs) -> None:
 @click.argument("run", type=Path)
 @click.option("--device", "device_id", type=int, default=None,
               help="Export this trained device's table row.")
-@click.option("--mean", is_flag=True, help="Export the table-mean embedding.")
 @click.option("--pair", "pair_name", default=None,
               help="Export enroll/pairs/<name>'s enrolled embedding.")
 @click.option("--name", default=None, help="Display name inside the profile.")
 @click.option("--out", type=Path, default=None,
               help="Also write the JSON here, prefixed with the run's name "
                    "(always printed to stdout).")
-def emulate_export_profile(run, device_id, mean, pair_name, name, out) -> None:
+def emulate_export_profile(run, device_id, pair_name, name, out) -> None:
     """Print one pasteable embedding profile (JSON) for the morph plugin."""
     import json as _json
 
@@ -513,7 +513,7 @@ def emulate_export_profile(run, device_id, mean, pair_name, name, out) -> None:
     if not (run / "checkpoint.pt").is_file():
         raise click.ClickException(f"No checkpoint.pt under {run}.")
     try:
-        p = emu_export.export_profile(run, device_id=device_id, mean=mean,
+        p = emu_export.export_profile(run, device_id=device_id,
                                       pair_name=pair_name, name=name,
                                       names=_device_names())
     except RuntimeError as exc:
@@ -528,13 +528,12 @@ def emulate_export_profile(run, device_id, mean, pair_name, name, out) -> None:
 
 @cli.command("emulate-export-profiles")
 @click.argument("run", type=Path)
-@click.option("--mean", is_flag=True, help="Also prepend the table-mean profile.")
 @click.option("--pairs", is_flag=True,
               help="Also append every enroll/pairs/<name> enrolled embedding.")
 @click.option("--out", type=Path, default=None,
               help="Also write the JSON array here, prefixed with the run's name "
                    "(always printed to stdout).")
-def emulate_export_profiles(run, mean, pairs, out) -> None:
+def emulate_export_profiles(run, pairs, out) -> None:
     """Print all trained device embeddings as a JSON list of pasteable profiles."""
     import json as _json
 
@@ -543,7 +542,7 @@ def emulate_export_profiles(run, mean, pairs, out) -> None:
     if not (run / "checkpoint.pt").is_file():
         raise click.ClickException(f"No checkpoint.pt under {run}.")
     try:
-        ps = emu_export.export_profiles(run, mean=mean, pairs=pairs,
+        ps = emu_export.export_profiles(run, pairs=pairs,
                                         names=_device_names())
     except RuntimeError as exc:
         raise click.ClickException(str(exc))
@@ -611,6 +610,26 @@ def joint_eval(run, device, pairs, windows) -> None:
     r = joint_eval_mod.diagnose(cfg, run_dir, device=device, **kw)
     click.echo(f"  wrote {run_dir / 'diagnostics.json'}")
     click.echo(f"  {r['verdict']}")
+
+
+# ============================ Unfolded enrollment ==============================
+@cli.command()
+@click.option("--config", "config_path", type=Path, required=True,
+              help="configs/unfold/<name>.yaml; run name is the file stem.")
+@click.option("--device", default=_default_device)
+@click.option("--epochs", type=int, default=None, help="Override max epochs.")
+@click.option("--resume", is_flag=True, help="Continue from the run's last.pt; the "
+                                             "config is re-read and its training knobs take "
+                                             "effect — generator_run, encoder_run and steps "
+                                             "must not change.")
+def unfold(config_path, device, epochs, resume) -> None:
+    """Train K learned enrollment steps between a frozen encoder and generator."""
+    from openamp.training import unfold as unfold_train
+
+    spec = _run_spec(config_path)
+    if not spec.is_unfold:
+        raise click.ClickException(f"{config_path} has no unfold: section.")
+    unfold_train.train(spec, device=device, epochs=epochs, resume=resume)
 
 
 def main() -> None:

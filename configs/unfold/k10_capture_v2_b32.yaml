@@ -1,0 +1,42 @@
+# K=10 unfolded enrollment trained on the NAM capture file alone: the steps fit
+# on each amp's render of the T3K capture's train region, the loss is scored on
+# its val region. Selection and the report still score on EGDB guitar audio
+# (held-out amps' val / test files), so the report reads directly against the
+# EGDB-trained K=10 prototype (results/unfold/unfold_k10_v2_b32, median 0.081;
+# 0.088 when only its *test-time* fit clips came from the capture DI body).
+#
+#   OPENAMP_DATA_DIR=data openamp unfold --config configs/unfold/k10_capture_v2_b32.yaml
+#
+# data_sweep_a1: the A1 captures the generator learned, rendered over the capture
+# signal. Its manifest *paths* are wrong for 366 amps, but its renders are right;
+# the trainer checks every amp's nam_sha256 against data/ and level-matches each
+# amp's renders to data/'s output_scale. Its sweep_test is the same 9 s as
+# sweep_val, which is why nothing here scores on the capture file.
+#
+# The val region is 9 s of quiet guitar DI (-32.7 dBFS, ~10 dB under the train
+# region), so the loss sees little variety and mostly soft playing.
+
+data_dir: data
+
+unfold:
+  generator_run: results/emulate/delta_a2_tanh_r32_512_v2
+  encoder_run: results/joint/frozen_delta_a2_tanh_r32_512_v2_b32
+  frames_path: results/dac_frames/sweep_train
+  steps: 10
+  clips: 16
+  clips_data_dir: data_sweep_a1
+  fit_split: train
+  loss_split: val
+  step_lr: 1.0e-2
+  init_step_frac: 0.0226
+
+training:
+  lr: 3.0e-4                # V
+  batch_size: 6             # amps per update; 8 x 16 clips OOMs the 12 GB card
+  epochs: 80
+  early_stop_patience: 8
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2688           # select clips in total: 64 per amp over 42 amps
+  log_every: 20

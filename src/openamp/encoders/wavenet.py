@@ -41,10 +41,9 @@ from openamp.models import (A2_ACTIVATION, A2_DILATIONS, A2_KERNEL_SIZES,
                             make_activation, normalize_activation)
 
 __all__ = ["WaveNetEncoder", "WaveNetEncoderLayer",
-           "ENC_CHANNELS", "ENC_PROJ_HIDDEN", "ENC_HEADS", "ENC_TAPS"]
+           "ENC_CHANNELS", "ENC_HEADS", "ENC_TAPS"]
 
 ENC_CHANNELS = 32          # guidelines §7 puts C_enc at 16-32
-ENC_PROJ_HIDDEN = 128      # hidden width of the pooled -> De projection
 
 ENC_HEADS = ("stats", "multitap")
 # End of each of the A2 schedule's three dilation runs (7+7+2+7 layers) -- early
@@ -119,7 +118,6 @@ class WaveNetEncoder(nn.Module):
                  kernel_sizes: tuple[int, ...] = A2_KERNEL_SIZES,
                  dilations: tuple[int, ...] = A2_DILATIONS,
                  attn_hidden: int = ENC_ATTN_HIDDEN,
-                 proj_hidden: int = ENC_PROJ_HIDDEN,
                  normalize: bool = False, grad_checkpoint: bool = False,
                  head: str = "stats", taps: tuple[int, ...] = ENC_TAPS,
                  tap_stride: int = ENC_TAP_STRIDE,
@@ -157,16 +155,15 @@ class WaveNetEncoder(nn.Module):
             self.head = MultiTapStatsHead(
                 in_channels=len(self.taps) * self.channels,
                 embedding_dim=self.embedding_dim, expand_dim=expand_dim,
-                n_heads=n_heads, attn_hidden=attn_hidden, proj_hidden=proj_hidden,
+                n_heads=n_heads, attn_hidden=attn_hidden,
                 tap_stride=tap_stride, norm=expand_norm, norm_groups=norm_groups,
                 normalize=self.normalize)
         else:
             self.taps = (len(self.layers) - 1,)
             self.pool = AttentiveStatsPool(self.channels, attn_hidden)
-            hidden = int(proj_hidden) if int(proj_hidden) > 0 else max(1, self.channels // 2)
-            self.proj = nn.Sequential(nn.Linear(2 * self.channels, hidden),
-                                      make_activation(self.activation),
-                                      nn.Linear(hidden, self.embedding_dim))
+            # An adapter, not a stage: one Linear whose only job is to change
+            # width from pooled_dim to De, so nothing here narrows the pool.
+            self.proj = nn.Linear(2 * self.channels, self.embedding_dim)
 
     @classmethod
     def from_spec(cls, spec, embedding_dim: int, **extra) -> "WaveNetEncoder":

@@ -192,7 +192,7 @@ def test_encoder_init_and_forward_are_unchanged(tmp_path):
         torch.manual_seed(0)
         record(f"wavenet-{head}",
                WaveNetEncoder(embedding_dim=8, channels=4, attn_hidden=4,
-                              proj_hidden=4, head=head, taps=(1, 5), expand_dim=8,
+                              head=head, taps=(1, 5), expand_dim=8,
                               n_heads=2, tap_stride=4).eval(),
                ref_audio)
 
@@ -207,7 +207,7 @@ def test_encoder_init_and_forward_are_unchanged(tmp_path):
     torch.manual_seed(0)
     record("fingerprint",
            FingerprintEncoder(embedding_dim=8, fingerprints=pooled,
-                              device_ids=dev_ids, dry=dry, proj_hidden=8).eval(),
+                              device_ids=dev_ids, dry=dry).eval(),
            torch.tensor(DEVICES, dtype=torch.long))
 
     # dac_frames: per-device [T, D] fp16 shards.
@@ -222,7 +222,7 @@ def test_encoder_init_and_forward_are_unchanged(tmp_path):
     torch.manual_seed(0)
     record("dac_frames",
            FrameAttentionEncoder(embedding_dim=8, frames=FrameStore(fr_dir),
-                                 n_queries=2, d_model=8, proj_hidden=8).eval(),
+                                 n_queries=2, d_model=8).eval(),
            torch.tensor(DEVICES, dtype=torch.long))
     check("encoders", out)
 
@@ -274,7 +274,6 @@ def test_joint_training_is_unchanged(tmp_path, write_corpus):
                  joint=JointSpec(
                      ref=RefSpec(seconds=REF / SAMPLE_RATE),
                      encoder=EncoderSpec("wavenet", {"channels": 4, "attn_hidden": 4,
-                                                     "proj_hidden": 4,
                                                      # v1's JointConfig default;
                                                      # the constructor's is leakyrelu
                                                      "activation": "tanh"})))

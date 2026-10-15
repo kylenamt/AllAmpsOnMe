@@ -8,7 +8,7 @@ to rebuild the run -- including which corpus it trained on, which the old
 ``emulate:`` config never recorded because ``OPENAMP_DATA_DIR`` supplied it from
 the environment.
 
-**Five sections, mirroring the things that get changed independently:**
+**Six sections, mirroring the things that get changed independently:**
 
 =============  ===================================================================
 ``model``      arch name + whatever that arch's constructor takes
@@ -16,6 +16,8 @@ the environment.
 ``loss``       which objective + its knobs, and the per-device weighting
 ``training``   optimizer, schedule, precision, logging -- nothing model-specific
 ``joint``      encoder + reference window; absent for a table-conditioned run
+``unfold``     the frozen generator/encoder runs + the unfolder's knobs; absent
+               otherwise (a run is emulate, joint, or unfold -- never two)
 =============  ===================================================================
 
 ``model.kwargs`` and ``loss.kwargs`` are passed straight to the registered class,
@@ -34,7 +36,8 @@ from openamp.core import constants as C
 from openamp.core.config import DEFAULT_SEED, ConfigError, _read_yaml
 
 __all__ = ["ModelSpec", "DataSpec", "LossSpec", "TrainingSpec", "EncoderSpec",
-           "RefSpec", "JointSpec", "RunSpec", "load_run_spec", "spec_from_checkpoint"]
+           "RefSpec", "JointSpec", "UnfoldSpec", "RunSpec", "load_run_spec",
+           "spec_from_checkpoint"]
 
 
 def _split(values: dict, *named: str) -> tuple[dict, dict]:
@@ -147,6 +150,12 @@ class TrainingSpec:
     # Train-time Gaussian jitter on the conditioning, as a fraction of the
     # embedding's own scale (0 = off; train steps only, never val/eval).
     embed_noise_frac: float = 0.0
+    # Train-time nested dropout on the conditioning: each sample keeps only its
+    # first k embedding dims, k drawn uniformly from these sizes, so the leading
+    # dims learn the coarse amp and later ones refine it (empty = off; train
+    # steps only). A sample keeps every dim with probability embed_prefix_full_frac.
+    embed_prefix_sizes: tuple[int, ...] = ()
+    embed_prefix_full_frac: float = 0.5
 
     @classmethod
     def from_dict(cls, d: dict) -> "TrainingSpec":
@@ -237,6 +246,47 @@ class JointSpec:
 
 
 @dataclass(frozen=True)
+class UnfoldSpec:
+    """Deep-unfolded enrollment (:mod:`openamp.enroll.unfold`). Present only for an unfold run.
+
+    Both networks are *finished runs*, frozen, named by directory: the generator
+    an emulate run (``delta_wavenet``), the first guess a joint run's encoder.
+    The unfold run's ``model``/``data``/``loss`` sections are not read from its
+    config -- the trainer copies them from ``generator_run``'s checkpoint, since
+    that generator *is* the model, and records them in ``resolved_config.yaml``.
+
+    ``training.lr`` drives ``V``; ``step_lr`` drives the log step sizes, which
+    live on a different scale (a log, not a weight).
+    """
+
+    generator_run: str = ""
+    encoder_run: str = ""
+    frames_path: str = ""        # "" = the store the encoder's checkpoint recorded
+    steps: int = 5               # K
+    clips: int = 16              # per amp: fit clips, and as many again to score on
+    # Where the training amps' fit and loss clips, and the held-out amps' fit
+    # clips, come from: "" = the run's own corpus. Selection and the report
+    # always score on the run's own corpus (its val / test splits).
+    clips_data_dir: str = ""
+    fit_split: str = "train"
+    loss_split: str = "train"
+    step_lr: float = 1.0e-2
+    # Each step's starting length as a fraction of |e_0|. 0.0226 = 1e-3 * sqrt(512):
+    # one Adam step at enrollment's lr 1e-3 on a 512-d vector.
+    init_step_frac: float = 0.0226
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "UnfoldSpec":
+        unknown = set(d) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise ConfigError(f"unfold: unknown keys {sorted(unknown)}")
+        return cls(**d)
+
+    def to_dict(self) -> dict:
+        return {f: getattr(self, f) for f in self.__dataclass_fields__}
+
+
+@dataclass(frozen=True)
 class RunSpec:
     """One experiment, fully resolved. What a run writes down about itself."""
 
@@ -251,12 +301,15 @@ class RunSpec:
     loss: LossSpec = field(default_factory=LossSpec)
     training: TrainingSpec = field(default_factory=TrainingSpec)
     joint: JointSpec | None = None
+    unfold: UnfoldSpec | None = None
 
     def __post_init__(self) -> None:
         # Frozen, so coerce through object.__setattr__: a spec read back from a
         # checkpoint or yaml arrives with strings where Paths belong.
         object.__setattr__(self, "data_dir", Path(self.data_dir))
         object.__setattr__(self, "results_dir", Path(self.results_dir))
+        if self.joint is not None and self.unfold is not None:
+            raise ConfigError("a run spec has a joint: or an unfold: section, not both")
 
     # --- Derived ------------------------------------------------------------------
     @property
@@ -264,8 +317,12 @@ class RunSpec:
         return self.joint is not None
 
     @property
+    def is_unfold(self) -> bool:
+        return self.unfold is not None
+
+    @property
     def stage(self) -> str:
-        return "joint" if self.is_joint else "emulate"
+        return "unfold" if self.is_unfold else "joint" if self.is_joint else "emulate"
 
     @property
     def run_dir(self) -> Path:
@@ -298,6 +355,8 @@ class RunSpec:
              "loss": self.loss.to_dict(), "training": self.training.to_dict()}
         if self.joint is not None:
             d["joint"] = self.joint.to_dict()
+        if self.unfold is not None:
+            d["unfold"] = self.unfold.to_dict()
         return d
 
     @classmethod
@@ -306,7 +365,7 @@ class RunSpec:
         unknown = set(d) - set(cls.__dataclass_fields__)
         if unknown:
             raise ConfigError(f"run spec: unknown keys {sorted(unknown)}")
-        joint = d.get("joint")
+        joint, unfold = d.get("joint"), d.get("unfold")
         return cls(
             name=str(d["name"]), data_dir=Path(d["data_dir"]),
             results_dir=Path(d["results_dir"]),
@@ -317,7 +376,8 @@ class RunSpec:
             data=DataSpec.from_dict(d.get("data", {})),
             loss=LossSpec.from_dict(d.get("loss", {})),
             training=TrainingSpec.from_dict(d.get("training", {})),
-            joint=JointSpec.from_dict(joint) if joint is not None else None)
+            joint=JointSpec.from_dict(joint) if joint is not None else None,
+            unfold=UnfoldSpec.from_dict(unfold) if unfold is not None else None)
 
 
 # --- Loading -------------------------------------------------------------------
@@ -333,7 +393,8 @@ def load_run_spec(path: Path, *, results_dir: Path | None = None,
     path = Path(path)
     y = _read_yaml(path)
     unknown = set(y) - {"name", "data_dir", "results_dir", "seed", "sample_rate",
-                        "output_format", "model", "data", "loss", "training", "joint"}
+                        "output_format", "model", "data", "loss", "training", "joint",
+                        "unfold"}
     if unknown:
         raise ConfigError(f"{path}: unknown top-level keys {sorted(unknown)}")
 
@@ -351,7 +412,8 @@ def load_run_spec(path: Path, *, results_dir: Path | None = None,
         data=DataSpec.from_dict(y.get("data", {})),
         loss=LossSpec.from_dict(y.get("loss", {})),
         training=TrainingSpec.from_dict(y.get("training", {})),
-        joint=JointSpec.from_dict(y["joint"]) if "joint" in y else None)
+        joint=JointSpec.from_dict(y["joint"]) if "joint" in y else None,
+        unfold=UnfoldSpec.from_dict(y["unfold"]) if "unfold" in y else None)
     return spec.replace(**overrides) if overrides else spec
 
 

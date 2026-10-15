@@ -26,7 +26,7 @@ from openamp.encoders import AttentiveStatsPool, WaveNetEncoder  # noqa: E402
 
 # A shrunken encoder schedule: same structure, tiny receptive field, fast.
 SMALL = dict(kernel_sizes=(3, 3, 3), dilations=(1, 2, 4), channels=4,
-             attn_hidden=8, proj_hidden=8)
+             attn_hidden=8)
 
 
 def _jspec(tmp_path, *, model=None, encoder=None, ref=None, **training):
@@ -40,7 +40,7 @@ def _jspec(tmp_path, *, model=None, encoder=None, ref=None, **training):
         training=TrainingSpec(num_workers=0, **training),
         joint=JointSpec(encoder=encoder or EncoderSpec(
                             "wavenet", {"channels": 4, "attn_hidden": 4,
-                                        "proj_hidden": 4, "activation": "tanh"}),
+                                        "activation": "tanh"}),
                         ref=ref or RefSpec()))
 
 
@@ -73,7 +73,7 @@ def test_encoder_is_non_causal():
     sides. With one k=3 d=1 layer the reach is exactly one frame either way.
     """
     m = WaveNetEncoder(embedding_dim=4, kernel_sizes=(3,), dilations=(1,), channels=4,
-                       attn_hidden=4, proj_hidden=4).eval()
+                       attn_hidden=4).eval()
     x = torch.zeros(1, 2, 32)
     with torch.no_grad():
         base = m.encode_frames(x)
@@ -241,14 +241,19 @@ def test_multitap_expand_norm_options_all_build_and_run():
         WaveNetEncoder(embedding_dim=8, **dict(MULTITAP, expand_norm="layer"))
 
 
-def test_multitap_derives_proj_hidden_from_the_pooled_width():
-    """proj_hidden 0 means "a quarter of whatever pooling emits" — the only
-    default that still makes sense once pooled_dim is not a fixed 2*enc_channels."""
-    m = WaveNetEncoder(embedding_dim=16, **dict(MULTITAP, proj_hidden=0))
-    assert m.head.proj[0].in_features == m.pooled_dim == 32
-    assert m.head.proj[0].out_features == 32 // 4
-    explicit = WaveNetEncoder(embedding_dim=16, **dict(MULTITAP, proj_hidden=7))
-    assert explicit.head.proj[0].out_features == 7
+def test_the_adapter_is_one_linear_from_the_pooled_width():
+    """The adapter exists only to change width: pooled_dim -> De, no hidden
+    layer, so nothing between the pool and the generator narrows what was
+    pooled. Both heads, since both used to project through a bottleneck."""
+    multitap = WaveNetEncoder(embedding_dim=16, **MULTITAP)
+    assert isinstance(multitap.head.proj, torch.nn.Linear)
+    assert multitap.head.proj.in_features == multitap.pooled_dim == 32
+    assert multitap.head.proj.out_features == 16
+
+    stats = WaveNetEncoder(embedding_dim=16, **SMALL)
+    assert isinstance(stats.proj, torch.nn.Linear)
+    assert stats.proj.in_features == stats.pooled_dim == 2 * SMALL["channels"]
+    assert stats.proj.out_features == 16
 
 
 def test_multitap_gradient_reaches_the_first_layer():
@@ -345,9 +350,6 @@ def test_encoder_validates_its_numbers():
                     ({"activation": "relu"}, "enc_activation")]:
         with pytest.raises(ValueError, match=msg):
             WaveNetEncoder(embedding_dim=8, **{**SMALL, **kw})
-    # 0 is legal for proj_hidden — it is the "derive it" sentinel, not a mistake.
-    enc = WaveNetEncoder(embedding_dim=8, **{**SMALL, "proj_hidden": 0})
-    assert enc.proj[0].out_features == max(1, SMALL["channels"] // 2)
 
 
 def test_joint_section_round_trips_through_yaml(tmp_path):
@@ -746,7 +748,7 @@ def test_build_joint_selects_the_fingerprint_encoder(tmp_path):
 
     run, _, _ = _write_fingerprints(tmp_path, list(range(4)), dim=32)
     spec = _jspec(tmp_path, encoder=EncoderSpec(
-        "fingerprint", {"path": str(run), "proj_hidden": 4, "normalize": False}))
+        "fingerprint", {"path": str(run), "normalize": False}))
 
     model = build_joint(spec, 4)
     assert isinstance(model.encoder, FingerprintEncoder)
@@ -835,7 +837,6 @@ def _frame_encoder(tmp_path, device_ids, **kw):
     kw.setdefault("embedding_dim", 16)
     kw.setdefault("n_queries", 2)
     kw.setdefault("d_model", 8)
-    kw.setdefault("proj_hidden", 8)
     return FrameAttentionEncoder(frames=store, **kw), store
 
 
@@ -908,6 +909,145 @@ def test_frame_window_is_structural_on_resume(tmp_path):
     with pytest.raises(Exception, match="frame_window"):
         _check_resume_compatible(ck, _jspec(tmp_path, encoder=EncoderSpec(
             "dac_frames", {**base, "frame_window": 800})), None, None)
+
+
+# --- Refined frames arm (encoders.refine) ---------------------------------------
+def _refine_encoder(tmp_path, device_ids, **kw):
+    from openamp.encoders import AttentionEncoder, FrameStore
+
+    store = FrameStore(_write_frames(tmp_path, device_ids))
+    kw.setdefault("embedding_dim", 16)
+    kw.setdefault("n_queries", 2)
+    kw.setdefault("d_model", 8)
+    kw.setdefault("n_heads", 2)
+    return AttentionEncoder(frames=store, **kw), store
+
+
+def test_refine_pool_is_a_drop_in_for_the_single_block_pool():
+    """Same constructor head, same pooled_dim, same call — that is what lets a
+    frames arm swap one for the other and have the comparison mean something."""
+    from openamp.encoders import CrossAttentionPool, CrossAttentionPool2Block
+
+    x = torch.randn(2, 40, 16)
+    one, two = CrossAttentionPool(16, 4, 8), CrossAttentionPool2Block(16, 4, 8, n_heads=2)
+    assert one.pooled_dim == two.pooled_dim == 32
+    assert one(x).shape == two(x).shape == (2, 32)
+
+
+def test_refine_pool_masks_frames_out_entirely():
+    """True = valid, this package's convention. A masked frame must not reach the
+    output at all, or a padded batch would encode its padding."""
+    from openamp.encoders import CrossAttentionPool2Block
+
+    torch.manual_seed(0)
+    pool = CrossAttentionPool2Block(16, 2, 8, n_heads=2).eval()
+    x = torch.randn(1, 20, 16)
+    mask = torch.zeros(1, 20, dtype=torch.bool)
+    mask[:, :10] = True                          # only the first half is valid
+    with torch.no_grad():
+        before = pool(x, mask)
+        x[:, 10:] = 99.0                         # scribble over the invalid half
+        assert torch.allclose(before, pool(x, mask))
+    with pytest.raises(ValueError, match="mask length"):
+        pool(x, torch.ones(1, 5, dtype=torch.bool))
+
+
+def test_refine_pool_rejects_a_head_count_that_does_not_divide_d_model():
+    from openamp.encoders import CrossAttentionPool2Block
+
+    with pytest.raises(ValueError, match="divisible"):
+        CrossAttentionPool2Block(16, 2, 8, n_heads=3)
+
+
+def test_refine_pool_positions_change_the_pooled_vector():
+    """Position is not decoration: the same frames read as if they sat somewhere
+    else in the render must pool to a different vector."""
+    from openamp.encoders import CrossAttentionPool2Block
+
+    torch.manual_seed(0)
+    pool = CrossAttentionPool2Block(16, 2, 8, n_heads=2, max_len=200).eval()
+    x = torch.randn(1, 50, 16)
+    here = torch.arange(50).unsqueeze(0)
+    with torch.no_grad():
+        assert torch.allclose(pool(x), pool(x, frame_positions=here))   # the default
+        assert not torch.allclose(pool(x), pool(x, frame_positions=here + 60))
+
+
+def test_refine_pool_can_be_built_with_no_positions():
+    """positional=False: no table, nothing added to the frames, and a caller that
+    passes positions anyway is told rather than quietly ignored."""
+    from openamp.encoders import CrossAttentionPool2Block
+
+    torch.manual_seed(0)
+    pool = CrossAttentionPool2Block(16, 2, 8, n_heads=2, max_len=200,
+                                    positional=False).eval()
+    assert not pool.positional and not hasattr(pool, "pos_table")
+    x = torch.randn(1, 50, 16)
+    with torch.no_grad():
+        assert pool(x).shape == (1, 16)
+    with pytest.raises(ValueError, match="positional=False"):
+        pool(x, frame_positions=torch.arange(50).unsqueeze(0))
+
+
+def test_refine_encoder_passes_positional_through(tmp_path):
+    enc, _ = _refine_encoder(tmp_path, [3, 7, 11], positional=False)
+    assert enc.capacity_report()["positional"] is False
+    assert not enc.pool.positional
+    assert enc(torch.tensor([3, 7, 11], dtype=torch.long)).shape == (3, 16)
+    on, _ = _refine_encoder(tmp_path, [3, 7, 11])
+    assert on.capacity_report()["positional"] is True
+
+
+def test_refine_encoder_always_reads_the_whole_render(tmp_path):
+    """No window on this arm — one device id is one fixed [n_frames, D] input,
+    and a config that sets frame_window was written for the other arm."""
+    enc, store = _refine_encoder(tmp_path, [3, 7, 11])
+    assert enc.frame_window == 0 and enc.pool.max_len == store.n_frames == 200
+    ids = torch.tensor([3, 7, 11], dtype=torch.long)
+    assert enc(ids).shape == (3, 16)
+    assert enc.eval()(ids).shape == (3, 16)
+    with pytest.raises(TypeError, match="frame_window"):
+        _refine_encoder(tmp_path, [3, 7, 11], frame_window=50)
+
+
+def test_refine_gradient_reaches_both_blocks(tmp_path):
+    enc, _ = _refine_encoder(tmp_path, [3, 7, 11])
+    enc(torch.tensor([3, 7, 11], dtype=torch.long)).pow(2).mean().backward()
+    for name in ("block1.k.weight", "block2.k.weight", "q"):
+        g = dict(enc.pool.named_parameters())[name].grad
+        assert g is not None and g.abs().sum() > 0, f"no gradient reached pool.{name}"
+
+
+def test_refine_positions_cost_nothing_and_are_not_checkpointed(tmp_path):
+    """Fixed sinusoids: no parameters, no optimizer state, and nothing in the
+    state dict — the table is a pure function of (max_len, in_dim), so a saved
+    copy could only ever disagree with the code that rebuilds it."""
+    from openamp.encoders.refine import sinusoidal_positions
+
+    enc, _ = _refine_encoder(tmp_path, [3, 7, 11])
+    assert not any("pos" in n for n, _ in enc.named_parameters())
+    assert not any("pos" in k for k in enc.state_dict())
+    assert torch.equal(enc.pool.pos_table, sinusoidal_positions(200, 16))
+
+    table = sinusoidal_positions(64, 9)                 # odd dim must still fill
+    assert tuple(table.shape) == (64, 9)
+    assert table[0].tolist() == pytest.approx([0.0, 1.0] * 4 + [0.0])
+    assert not torch.equal(table[5], table[6])          # neighbours differ
+
+
+def test_refine_is_a_registered_kind_that_looks_a_device_up(tmp_path):
+    from openamp.encoders import AttentionEncoder, build_encoder, ref_mode_for
+
+    assert ref_mode_for("dac_frames_refine") == "device"
+    run = _write_frames(tmp_path, [3, 7, 11])
+    enc = build_encoder(EncoderSpec("dac_frames_refine",
+                                    {"frames_path": str(run), "n_queries": 2,
+                                     "d_model": 8, "n_heads": 2}), 16)
+    assert isinstance(enc, AttentionEncoder)
+    report = enc.capacity_report()
+    assert report["head"] == "dac_frames_refine"
+    assert (report["n_blocks"], report["max_len"]) == (2, 200)
+    assert report["pooled_dim"] == enc.pooled_dim == 16
 
 
 # --- Embedding jitter (emulate.embed_noise_frac) ---------------------------------

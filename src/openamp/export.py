@@ -163,9 +163,8 @@ def export_bundle(run_dir: Path, out_path: Path, *,
                   profile_pairs: list[str] | None = None) -> dict:
     """Write the plugin weight bundle for a run; returns the (blob-free) summary.
 
-    Always includes a ``"Table mean"`` profile (the trained table's average —
-    the model's best generic-amp prior). ``profile_device_ids`` adds table rows
-    by device_id; ``profile_pairs`` adds ``enroll/pairs/<name>`` embeddings.
+    ``profile_device_ids`` adds table rows by device_id; ``profile_pairs`` adds
+    ``enroll/pairs/<name>`` embeddings. With neither, the bundle has no profiles.
     """
     from openamp.evaluation import load_model
 
@@ -179,8 +178,7 @@ def export_bundle(run_dir: Path, out_path: Path, *,
                "x1_w": _blob(l.layer1x1.weight), "x1_b": _blob(l.layer1x1.bias)}
               for l in model.layers]
 
-    profiles = [{"name": "Table mean",
-                 "embedding": model.embedding_table().mean(dim=0).tolist()}]
+    profiles = []
     id_to_idx = {int(k): int(v) for k, v in ck["id_to_idx"].items()}
     for did in (profile_device_ids or []):
         if int(did) not in id_to_idx:
@@ -228,23 +226,22 @@ def _profile(emb: torch.Tensor, name: str, *, dim: int, run_sha: str) -> dict:
 
 @torch.no_grad()
 def export_profile(run_dir: Path, *, device_id: int | None = None,
-                   mean: bool = False, pair_name: str | None = None,
+                   pair_name: str | None = None,
                    name: str | None = None,
                    names: dict[int, str] | None = None) -> dict:
     """Build one pasteable profile dict from exactly one source.
 
     Sources (mutually exclusive): ``device_id`` — a trained table row;
-    ``mean`` — the table average; ``pair_name`` — an
-    ``enroll/pairs/<name>/enrolled_pair.pt`` embedding. ``name`` overrides the
-    label outright; otherwise a ``device_id`` row is labelled from ``names``
-    (``{device_id: display name}``), falling back to ``device <id>``.
+    ``pair_name`` — an ``enroll/pairs/<name>/enrolled_pair.pt`` embedding.
+    ``name`` overrides the label outright; otherwise a ``device_id`` row is
+    labelled from ``names`` (``{device_id: display name}``), falling back to
+    ``device <id>``.
     """
     from openamp.evaluation import load_model
 
     run_dir = Path(run_dir)
-    if sum(x is not None and x is not False
-           for x in (device_id, mean or None, pair_name)) != 1:
-        raise RuntimeError("pass exactly one of device_id / mean / pair_name")
+    if sum(x is not None for x in (device_id, pair_name)) != 1:
+        raise RuntimeError("pass exactly one of device_id / pair_name")
 
     model, ck = load_model(run_dir, "cpu")
     model = _require_wavenet(model)
@@ -252,8 +249,6 @@ def export_profile(run_dir: Path, *, device_id: int | None = None,
         blob = torch.load(run_dir / "enroll" / "pairs" / pair_name / "enrolled_pair.pt",
                           map_location="cpu", weights_only=False)
         emb, default = blob["embedding"].reshape(-1), str(blob.get("name", pair_name))
-    elif mean:
-        emb, default = model.embedding_table().mean(dim=0), "Table mean"
     else:
         id_to_idx = {int(k): int(v) for k, v in ck["id_to_idx"].items()}
         if int(device_id) not in id_to_idx:
@@ -265,16 +260,15 @@ def export_profile(run_dir: Path, *, device_id: int | None = None,
 
 
 @torch.no_grad()
-def export_profiles(run_dir: Path, *, mean: bool = False, pairs: bool = False,
+def export_profiles(run_dir: Path, *, pairs: bool = False,
                     names: dict[int, str] | None = None) -> list[dict]:
     """Build a list of pasteable profiles — every trained device row by default.
 
     Rows come out in table-index order, labelled from ``names``
     (``{device_id: display name}``) and falling back to ``device <id>`` for any
-    id not present. Opt-in extras: ``mean`` prepends the table-mean profile;
-    ``pairs`` appends every ``enroll/pairs/<name>/enrolled_pair.pt`` embedding
-    (name-sorted). Each entry has the same ``aaom_profile`` schema as
-    :func:`export_profile`.
+    id not present. Opt-in extra: ``pairs`` appends every
+    ``enroll/pairs/<name>/enrolled_pair.pt`` embedding (name-sorted). Each entry
+    has the same ``aaom_profile`` schema as :func:`export_profile`.
     """
     from openamp.evaluation import load_model
 
@@ -286,9 +280,6 @@ def export_profiles(run_dir: Path, *, mean: bool = False, pairs: bool = False,
 
     id_to_idx = {int(k): int(v) for k, v in ck["id_to_idx"].items()}
     profiles = []
-    if mean:
-        profiles.append(_profile(model.embedding_table().mean(dim=0), "Table mean",
-                                 dim=dim, run_sha=run_sha))
     for did in sorted(id_to_idx, key=id_to_idx.get):        # table-index order
         profiles.append(_profile(model.embedding_table()[id_to_idx[did]],
                                  names.get(did) or f"device {did}",

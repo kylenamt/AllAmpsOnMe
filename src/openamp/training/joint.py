@@ -18,7 +18,7 @@ What's different:
 - joint.enc_frame_window (dac_frames only) draws a random contiguous span of
   frames per step instead of the amp's whole fixed tensor, so one device id
   stops being one deterministic encoder input.
-- AdamW, not emulate's Adam (see `_optimizer`). joint.enc_weight_decay is a
+- AdamW in two param groups (see `_optimizer`). joint.enc_weight_decay is a
   real value under test, and only AdamW makes it mean one shrinkage strength.
 
 - A collapse tripwire runs every epoch: val_esr_shuffled (embeddings permuted
@@ -190,7 +190,7 @@ def _optimizer(model, spec: RunSpec):
     aren't even a buffer -- ``FrameStore`` is a plain attribute, not registered --
     so ``model.encoder.parameters()`` is exactly the attention pool plus the adapter.
 
-    AdamW, where emulate uses Adam. Adam folds weight decay into the gradient, so
+    AdamW, as in training/emulate.py. Adam folds weight decay into the gradient, so
     the adaptive per-parameter scaling divides it too and joint.enc_weight_decay
     would buy a different shrinkage on every adapter weight. AdamW decouples it
     into one uniform pull toward zero, which is the guard against adapter
@@ -316,11 +316,15 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
     if cap["head"] == "fingerprint":
         src = (f"fp={jcfg.encoder.kwargs.get('path')} preprocess={cap.get('preprocess')} "
               f"n_fingerprints={cap.get('n_fingerprints')}")
-    elif cap["head"] == "dac_frames":
+    elif cap["head"].startswith("dac_frames"):
+        # Every frames arm, not just the single-block one: the refined arm reports
+        # the same fields plus its own, and falling through to the else branch
+        # would ask a lookup encoder for `.channels` it does not have.
         win = cap.get("frame_window", 0)
+        blocks = (f"x{cap['n_blocks']}blk/{cap['n_heads']}h" if "n_blocks" in cap else "")
         src = (f"fp_frames={jcfg.encoder.kwargs.get('frames_path')} "
               f"n_devices={cap.get('n_devices')} "
-              f"pool={cap.get('n_queries')}x{cap.get('d_model')} "
+              f"pool={cap.get('n_queries')}x{cap.get('d_model')}{blocks} "
               + (f"window={win}/{cap.get('n_frames')} frames (random in train, "
                  f"centre in eval)" if win else
                  f"window=all {cap.get('n_frames')} frames"))

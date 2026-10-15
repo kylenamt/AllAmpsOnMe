@@ -17,6 +17,7 @@ than what produced the features (see ``dac-frames-are-3d-not-the-pooling``).
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -27,7 +28,28 @@ from torch import nn
 __all__ = ["AttentiveStatsPool", "MultiHeadAttentiveStatsPool", "MultiTapStatsHead",
            "CrossAttentionPool", "FrameStore",
            "ENC_ATTN_HIDDEN", "ENC_TAP_STRIDE", "ENC_EXPAND_DIM", "ENC_N_HEADS",
-           "ENC_EXPAND_NORM", "ENC_EXPAND_NORMS", "ENC_NORM_GROUPS"]
+           "ENC_EXPAND_NORM", "ENC_EXPAND_NORMS", "ENC_NORM_GROUPS",
+           "FRAME_GATHER_THREADS"]
+
+# Threads FrameStore.batch copies its shards with. The cost there is page faults
+# against the memmap, not Python, and numpy drops the GIL around the copy, so the
+# stalls overlap. Measured on the DAC store (32 amps per batch, 10 cores, another
+# run using the machine):
+#
+#     threads          1       2       4       6       8
+#     7,364 frames  0.301   0.171   0.067   0.063   0.061  s
+#     14,728        0.889   0.373   0.160   0.141   0.172  s
+#
+# 4 is where it flattens -- past that the limit is the NVMe and the page cache,
+# not the cores -- and it leaves most of the box to whatever else is running.
+#
+# Threads, not DataLoader workers: openamp.encoders.frames records why processes
+# lose this trade, a ~30 MiB item copied through shared memory and pin_memory
+# costing more than the gather it was meant to hide. Threads share the memmap and
+# copy nothing extra -- each one writes straight into its own row of the output.
+# Order is preserved, so a batch is byte-identical to the single-threaded one and
+# nothing about a run's numbers changes.
+FRAME_GATHER_THREADS = 4
 
 ENC_ATTN_HIDDEN = 64       # attention bottleneck, independent of C_enc
 
@@ -180,7 +202,7 @@ class MultiTapStatsHead(nn.Module):
 
     def __init__(self, *, in_channels: int, embedding_dim: int,
                  expand_dim: int = ENC_EXPAND_DIM, n_heads: int = ENC_N_HEADS,
-                 attn_hidden: int = ENC_ATTN_HIDDEN, proj_hidden: int = 0,
+                 attn_hidden: int = ENC_ATTN_HIDDEN,
                  tap_stride: int = ENC_TAP_STRIDE, norm: str = ENC_EXPAND_NORM,
                  norm_groups: int = ENC_NORM_GROUPS, normalize: bool = True,
                  eps: float = 1e-5):
@@ -191,10 +213,10 @@ class MultiTapStatsHead(nn.Module):
         self.norm = _make_expand_norm(norm, expand_dim, norm_groups)
         self.act = nn.GELU()
         self.pool = MultiHeadAttentiveStatsPool(expand_dim, n_heads, attn_hidden, eps)
-        # proj_hidden 0 = derive as pooled // 4, the spec's rule.
-        hidden = int(proj_hidden) if int(proj_hidden) > 0 else max(1, self.pooled_dim // 4)
-        self.proj = nn.Sequential(nn.Linear(self.pooled_dim, hidden), nn.GELU(),
-                                  nn.Linear(hidden, embedding_dim))
+        # An adapter, not a stage: one Linear whose only job is to change width
+        # from pooled_dim to De. No hidden layer, so nothing here narrows what
+        # the pool found before the generator sees it.
+        self.proj = nn.Linear(self.pooled_dim, embedding_dim)
 
     @property
     def pooled_dim(self) -> int:
@@ -296,20 +318,59 @@ class FrameStore:
             self._mm[did] = np.load(path, mmap_mode="r")
         return self._mm[did]
 
-    def batch(self, ids, device, *, window: int | None = None,
-              starts=None) -> torch.Tensor:
-        """``[B, T, D]`` fp16, optionally one contiguous ``window`` per id.
+    def _gather(self, ids, take, rows: int) -> np.ndarray:
+        """``[B, rows, D]`` fp16: ``take(memmap, k) -> [rows, D]`` per id, in order.
 
-        The slice is taken on the memmap, before the stack, so a windowed read
-        touches only the pages it needs -- that is the point of the option, not
-        just a smaller output tensor.
-
-        ``starts`` is one offset per id (defaults to all-zero). Callers pick
-        them: the frame store has no opinion about whether they should be
-        random or fixed.
+        Each thread writes its own row of the output, so there is no lock and no
+        second copy of the batch -- the destination is allocated once here. The
+        memmaps are opened in the calling thread, so the pool only ever touches
+        ones that already exist.
         """
-        if window is None:
-            arr = np.stack([np.asarray(self.get(d)) for d in ids])   # [B, T, D] fp16
+        mms = [self.get(d) for d in ids]
+        out = np.empty((len(mms), int(rows), self.latent_dim), dtype=np.float16)
+
+        def fill(k: int) -> None:
+            out[k] = take(mms[k], k)
+
+        n = min(int(FRAME_GATHER_THREADS), len(mms))
+        if n <= 1:
+            for k in range(len(mms)):
+                fill(k)
+        else:
+            with ThreadPoolExecutor(n) as ex:
+                list(ex.map(fill, range(len(mms))))
+        return out
+
+    def batch(self, ids, device, *, window: int | None = None,
+              starts=None, indices=None) -> torch.Tensor:
+        """``[B, T, D]`` fp16: every frame, one contiguous ``window`` per id, or
+        an explicit set of frame ``indices`` per id.
+
+        The slice or gather is taken on the memmap, before the stack, so a
+        partial read touches only the pages it needs -- that is the point of
+        these options, not just a smaller output tensor.
+
+        ``starts`` is one offset per id (defaults to all-zero). ``indices`` is
+        one ``[k]`` index array per id, ``[B, k]`` in all, for a scattered read
+        rather than a contiguous one. Callers pick both: the frame store has no
+        opinion about whether they should be random or fixed.
+        """
+        if indices is not None:
+            if window is not None or starts is not None:
+                raise ValueError("indices is exclusive with window/starts — a "
+                                 "scattered draw and a contiguous span are "
+                                 "different reads")
+            idx = np.asarray(indices, dtype=np.int64)
+            if idx.ndim != 2 or len(idx) != len(ids):
+                raise ValueError(f"indices must be [{len(ids)}, k], got "
+                                 f"{tuple(idx.shape)}")
+            if idx.size and (idx.min() < 0 or idx.max() >= self.n_frames):
+                raise ValueError(f"frame indices out of range for the "
+                                 f"{self.n_frames}-frame shards: "
+                                 f"[{idx.min()}, {idx.max()}]")
+            arr = self._gather(ids, lambda m, k: np.asarray(m)[idx[k]], idx.shape[1])
+        elif window is None:
+            arr = self._gather(ids, lambda m, k: m, self.n_frames)   # [B, T, D] fp16
         else:
             window = int(window)
             offs = [0] * len(ids) if starts is None else [int(s) for s in starts]
@@ -323,6 +384,5 @@ class FrameStore:
             if bad:
                 raise ValueError(f"window {window} overruns the {self.n_frames}-frame "
                                  f"shards at (device, start) {bad}")
-            arr = np.stack([np.asarray(self.get(d)[s:s + window])
-                            for d, s in zip(ids, offs)])
+            arr = self._gather(ids, lambda m, k: m[offs[k]:offs[k] + window], window)
         return torch.from_numpy(arr).to(device, non_blocking=True)

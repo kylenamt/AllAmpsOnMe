@@ -171,7 +171,7 @@ def main() -> None:
     ap.add_argument("--run", type=Path,
                     default=Path("results/emulate/delta_a2_tanh_r32_512"),
                     help="Emulate run supplying the target table and the frozen generator.")
-    ap.add_argument("--out", type=Path, default=Path("results/encoder_probe"))
+    ap.add_argument("--out", type=Path, default=Path("results/encoder/encoder_probe"))
     ap.add_argument("--n-queries", type=int, default=4)
     ap.add_argument("--d-model", type=int, default=64)
     ap.add_argument("--hidden", type=int, default=128)

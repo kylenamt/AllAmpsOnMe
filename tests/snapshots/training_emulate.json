@@ -97,6 +97,8 @@
       "cosine_min_lr_frac": 0.01,
       "early_stop_patience": 8,
       "embed_noise_frac": 0.0,
+      "embed_prefix_full_frac": 0.5,
+      "embed_prefix_sizes": [],
       "epochs": 2,
       "log_every": 1000000000,
       "lr": 0.0005,

@@ -6,7 +6,9 @@
   just a new conditioning vector?
 - All devices enroll jointly in one loop: row i only gets gradient from batch
   items with device_idx == i. Enroll one device at a time via --devices for
-  strict independence between rows.
+  strict independence between rows. The run's own loss spec drives the fit,
+  device_loss_weighting included, so enrollment optimizes the objective the run
+  was trained on.
 - Rows start at the trained table's own init variance ("uniform", default) or
   its mean ("table_mean") -- see _swap_embedding. Training is plain fp32
   (trainable state is a few KB, so none of the training loop's AMP/nan-guard
@@ -42,7 +44,7 @@ from openamp.training.emulate import evaluate_esr
 from openamp.evaluation import (SILENCE_DBFS, load_model, per_device_esr,
                                 resolve_device)
 from openamp.training import GRAD_CLIP_NORM
-from openamp.losses import build_loss
+from openamp.losses import build_loss, device_loss_weights
 from openamp.spec import RunSpec, spec_from_checkpoint
 from openamp.models import A2_EMBEDDING_STD
 
@@ -135,6 +137,21 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
     enroll_idx = {d: i for i, d in enumerate(enroll_ids)}
     n = len(enroll_ids)
 
+    # Per-device ESR weighting from the run's own loss spec, on the fit's loss
+    # and its val ESR alike. Weights are computed from the *enrolled* devices'
+    # train-split render levels and normalized to mean 1 over them, so they
+    # balance this cohort -- they are not the trained table's weights.
+    strength = float(spec.loss.device_loss_weighting)
+    if strength < 0.0:
+        raise ValueError(f"loss.device_loss_weighting must be >= 0, got {strength}")
+    dev_w = None
+    if strength > 0.0:
+        _w = device_loss_weights(paths.renders_manifest, enroll_ids, strength)
+        dev_w = torch.as_tensor(_w, dtype=torch.float32, device=dev)
+        print(f"[loss]  device_loss_weighting={strength:g} "
+              f"weights min={_w.min():.4g} p50={np.median(_w):.4g} "
+              f"max={_w.max():.4g} (mean 1.0, ESR term only; val ESR weighted too)")
+
     _swap_embedding(model, n, dev, init=init)
 
     R = model.receptive_field
@@ -171,7 +188,7 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
     t0 = time.time()
     baseline_test = np.full(n, np.nan) if test_loader is None else per_device_esr(
         model, test_loader, dev, n, silence_dbfs=SILENCE_DBFS, clip=clip)
-    init_val = evaluate_esr(model, val_loader, dev, lossfn.coeff)
+    init_val = evaluate_esr(model, val_loader, dev, lossfn.coeff, weights=dev_w)
     print(f"[enroll] baseline val_esr={init_val:.5f}")
     with log_path.open("a", newline="", encoding="utf-8") as fh:
         csv.writer(fh).writerow([-1, 0, "", "", "", f"{init_val:.6f}",
@@ -179,7 +196,7 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
 
     best_emb, best_val, best_epoch, epochs_run = _fit_embedding(
         model, spec, lossfn, train_ds, val_loader, dev, epochs=epochs, lr=lr,
-        weight_decay=weight_decay, seed=seed,
+        weight_decay=weight_decay, seed=seed, weights=dev_w,
         log_path=log_path, init_val=init_val, t0=t0,
         early_stop_patience=early_stop_patience,
         plateau_patience=plateau_patience, plateau_factor=plateau_factor)
@@ -221,6 +238,7 @@ def enroll(cfg: Config, run_dir: Path, *, device_ids: list[int] | None = None,
         "run": base_name, "n_enrolled": n, "skipped": skipped,
         "pairs": int(pairs), "epochs": int(epochs), "epochs_run": epochs_run,
         "best_epoch": best_epoch, "lr": float(lr), "seed": seed, "init": init,
+        "device_loss_weighting": strength,
         "init_val_esr_pooled": _json_num(init_val),
         "best_val_esr_pooled": _json_num(best_val),
         "test_esr_mean": test_mean, "test_esr_median": test_median,
@@ -291,13 +309,16 @@ def _fit_embedding(model, spec: RunSpec, lossfn, train_ds, val_loader, dev, *,
                    init_val: float, t0: float,
                    early_stop_patience: int = EARLY_STOP_PATIENCE,
                    plateau_patience: int = PLATEAU_PATIENCE,
-                   plateau_factor: float = 0.5):
+                   plateau_factor: float = 0.5,
+                   weights: torch.Tensor | None = None):
     """Adam on the swapped-in embedding rows only, early-stopped on val ESR.
 
     train_ds just needs the EmulationDataset item contract plus a seed
     attribute (bumped per epoch for fresh windows) -- WetDryDataset qualifies.
     Best starts at the init rows, so the result is never worse than init on
     val. early_stop_patience <= 0 disables early stopping (runs full epochs).
+    ``weights`` [n_rows] is the per-device ESR weighting (None = unweighted),
+    on the train loss and val ESR alike.
     Returns (best_emb, best_val, best_epoch, epochs_run).
     """
     R = model.receptive_field
@@ -323,7 +344,8 @@ def _fit_embedding(model, spec: RunSpec, lossfn, train_ds, val_loader, dev, *,
 
             opt.zero_grad(set_to_none=True)
             out = model(inp, di)[..., R:]
-            loss, parts = lossfn(out.float(), target)
+            loss, parts = lossfn(out.float(), target,
+                                 weights=None if weights is None else weights[di])
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.embedding.parameters(), GRAD_CLIP_NORM)
             opt.step()
@@ -337,7 +359,7 @@ def _fit_embedding(model, spec: RunSpec, lossfn, train_ds, val_loader, dev, *,
                       f"esr {parts['esr']:.5f} stft {parts['stft']:.4f} {sps:5.0f} smp/s",
                       flush=True)
 
-        val_esr = evaluate_esr(model, val_loader, dev, lossfn.coeff)
+        val_esr = evaluate_esr(model, val_loader, dev, lossfn.coeff, weights=weights)
         sched.step(val_esr)
         cur_lr = opt.param_groups[0]["lr"]
         improved = val_esr < best_val
@@ -454,6 +476,8 @@ def enroll_pair(cfg: Config, run_dir: Path, dry: np.ndarray, wet: np.ndarray, *,
         csv.writer(fh).writerow([-1, 0, "", "", "", f"{init_val:.6f}",
                                  f"{lr:.2e}", f"{time.time() - t0:.1f}"])
 
+    # No device weighting: one row, and mean-1 weights over a single device are
+    # 1.0 anyway (a recorded pair has no manifest render level either).
     best_emb, best_val, best_epoch, epochs_run = _fit_embedding(
         model, spec, lossfn, train_ds, val_loader, dev, epochs=epochs, lr=lr, seed=seed,
         log_path=log_path, init_val=init_val, t0=t0,

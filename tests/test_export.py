@@ -157,7 +157,7 @@ def test_export_bundle_and_profile_from_fake_run(tmp_path):
     s = ex.export_bundle(run, out, profile_device_ids=[22])
     assert out.is_file() and s["arch"]["embedding_dim"] == KW["embedding_dim"]
     assert s["arch"]["activation"] == "LeakyReLU"      # NAM's spelling, for the plugin
-    assert s["profiles"] == ["Table mean", "device 22"]
+    assert s["profiles"] == ["device 22"]
 
     import json
     b = json.loads(out.read_text(encoding="utf-8"))
@@ -168,14 +168,14 @@ def test_export_bundle_and_profile_from_fake_run(tmp_path):
     assert _unblob(b["weights"]["layers"][0]["film_w"]).shape == \
         (2 * m2.channels, m2.embedding_dim)
     # Built-in profile == the table row it came from.
-    assert np.allclose(b["profiles"][1]["embedding"],
+    assert np.allclose(b["profiles"][0]["embedding"],
                        m2.embedding.weight[1].detach().numpy(), atol=1e-6)
 
     p = ex.export_profile(run, device_id=22)
     assert p["aaom_profile"] == 1 and p["dim"] == KW["embedding_dim"]
     assert p["run"] == b["run"]["sha8"] and len(p["embedding"]) == p["dim"]
     with pytest.raises(RuntimeError):
-        ex.export_profile(run, device_id=22, mean=True)   # exactly one source
+        ex.export_profile(run, device_id=22, pair_name="x")  # exactly one source
     with pytest.raises(RuntimeError):
         ex.export_profile(run, device_id=99)              # not in the table
 
@@ -188,12 +188,6 @@ def test_export_bundle_and_profile_from_fake_run(tmp_path):
                        m2.embedding.weight[1].detach().numpy(), atol=1e-6)
     # Each row equals export_profile for the same device (shared _profile path).
     assert ps[1] == ex.export_profile(run, device_id=22)
-    # --mean prepends the table mean; device rows still follow in order.
-    pm = ex.export_profiles(run, mean=True)
-    assert [q["name"] for q in pm] == ["Table mean", "device 11", "device 22",
-                                       "device 33"]
-    assert np.allclose(pm[0]["embedding"],
-                       m2.embedding.weight.mean(0).detach().numpy(), atol=1e-6)
 
     # names map by device_id; ids missing from the map keep the generic label.
     named = ex.export_profiles(run, names={22: "Marshall JCM800"})

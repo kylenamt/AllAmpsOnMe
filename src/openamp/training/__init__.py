@@ -4,7 +4,9 @@ Two loops live on, in :mod:`openamp.training.emulate` and
 :mod:`openamp.training.joint`: one conditions the generator on a table row,
 the other on an encoder's output, and they disagree about what validation means
 (the joint loop measures shuffled/zero/holdout probes every epoch). Folding them
-into one loop with flags would hide that difference rather than remove it.
+into one loop with flags would hide that difference rather than remove it. A
+third, :mod:`openamp.training.unfold`, trains neither network: both are frozen
+and only the learned enrollment steps between them move.
 
 What they genuinely shared was the bookkeeping around the loop, and that is
 here:

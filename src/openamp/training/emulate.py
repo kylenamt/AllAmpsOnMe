@@ -3,7 +3,7 @@
 - Takes a :class:`~openamp.spec.RunSpec` and nothing else: the architecture
   (``model:``), the dataset (``data:``), the objective (``loss:``) and the
   schedule (``training:``) all arrive through registries, so the loop below
-  never names one of them. Adam, reduce-on-plateau, early stopped at the
+  never names one of them. AdamW, reduce-on-plateau, early stopped at the
   val-ESR plateau. Plain single-GPU PyTorch.
 - Every run writes to results/emulate/<name>/: best/last checkpoints,
   resolved_config.yaml, metrics.json, train_log.csv (per-epoch curves).
@@ -34,20 +34,41 @@ LOG_COLUMNS = ["epoch", "step", "train_loss", "train_esr", "train_stft", "val_es
                "lr", "elapsed_s"]
 
 
-def _conditioning(model, device_idx: torch.Tensor, noise_frac: float) -> torch.Tensor:
-    """The batch's embedding rows, optionally jittered (train steps only).
+def _conditioning(model, device_idx: torch.Tensor, noise_frac: float,
+                  prefix_sizes: torch.Tensor | None = None,
+                  prefix_full_frac: float = 0.0) -> torch.Tensor:
+    """The batch's embedding rows, optionally jittered and/or cut (train steps only).
 
     Noise std is ``noise_frac * table.std()`` recomputed each step, not a fixed
     number of embedding units: the table's scale drifts over a run, so a
     relative size keeps the perturbation the same fraction of the space
     throughout. Read off the whole table (not the batch) so a batch of similar
     devices doesn't shrink its own noise.
+
+    The noisy vector is re-projected through ``model.project_embedding`` so an
+    ``embed_normalize`` model gets its noise back on the sphere at the same
+    radius (direction only jitters); on a model without ``embed_normalize`` this
+    is a no-op and the raw noisy vector passes through unchanged.
+
+    ``prefix_sizes`` (nested dropout): each row keeps its first ``k`` dims and
+    zeroes the rest, ``k`` drawn per row from ``prefix_sizes``, or all dims with
+    probability ``prefix_full_frac``. The cut comes *after* the projection, so a
+    kept prefix holds its share of the full vector's size rather than being
+    re-inflated to the sphere's radius -- a short prefix has to mean "less of
+    the same amp", not a different, full-size one.
     """
     emb = model.embed(device_idx)
-    if noise_frac <= 0.0:
+    if noise_frac > 0.0:
+        std = noise_frac * model.embedding_table().detach().std()
+        emb = model.project_embedding(emb + torch.randn_like(emb) * std)
+    if prefix_sizes is None:
         return emb
-    std = noise_frac * model.embedding_table().detach().std()
-    return emb + torch.randn_like(emb) * std
+    B, E = emb.shape
+    k = prefix_sizes[torch.randint(len(prefix_sizes), (B,), device=emb.device)]
+    full = torch.rand(B, device=emb.device) < prefix_full_frac
+    k = torch.where(full, torch.full_like(k, E), k)
+    keep = torch.arange(E, device=emb.device) < k.unsqueeze(1)
+    return emb * keep
 
 
 @torch.no_grad()
@@ -114,7 +135,7 @@ def overfit_one_batch(spec: RunSpec, *, device: str = "cuda",
     di = batch["device_idx"].to(dev)
 
     lossfn = build_loss(spec.loss).to(dev)
-    opt = torch.optim.Adam(model.parameters(), lr=tcfg.lr)
+    opt = torch.optim.AdamW(model.parameters(), lr=tcfg.lr)
     print(f"[overfit] devices={len(ids)} params={count_parameters(model):,} "
           f"receptive_field={R} ({1000 * R / spec.sample_rate:.1f} ms)")
     final = float("nan")
@@ -171,6 +192,24 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
     if noise_frac > 0.0:
         print(f"[model] embed_noise_frac={noise_frac:g}")
 
+    # Nested dropout on the embedding: train steps only (val/eval read every dim).
+    sizes = tuple(int(s) for s in tcfg.embed_prefix_sizes)
+    full_frac = float(tcfg.embed_prefix_full_frac)
+    prefix_sizes = None
+    if sizes:
+        E = model.embedding_dim
+        if any(s < 1 or s > E for s in sizes):
+            raise ValueError(f"training.embed_prefix_sizes must lie in [1, {E}] "
+                             f"(the embedding dim), got {list(sizes)}")
+        if not 0.0 <= full_frac <= 1.0:
+            raise ValueError("training.embed_prefix_full_frac must be in [0, 1], "
+                             f"got {full_frac}")
+        prefix_sizes = torch.tensor(sizes, dtype=torch.long, device=dev)
+        # How often the last dim is trained at all -- the tail's share of signal.
+        tail = full_frac + (1.0 - full_frac) * sum(s == E for s in sizes) / len(sizes)
+        print(f"[model] embed_prefix_sizes={list(sizes)} full_frac={full_frac:g}  "
+              f"(last dim active on {100 * tail:.0f}% of samples)")
+
     # --- Data -------------------------------------------------------------------
     common = dict(paths=paths, receptive_field=R, id_to_idx=id_to_idx,
                   clip_samples=clip, sources=spec.data.sources, **spec.data.kwargs)
@@ -200,8 +239,8 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
               f"weights min={_w.min():.4g} p50={np.median(_w):.4g} "
               f"max={_w.max():.4g} (mean 1.0, ESR term only; val ESR weighted "
               f"too — not comparable with a strength-0 run)")
-    opt = torch.optim.Adam(model.parameters(), lr=tcfg.lr,
-                           weight_decay=tcfg.weight_decay)
+    opt = torch.optim.AdamW(model.parameters(), lr=tcfg.lr,
+                            weight_decay=tcfg.weight_decay)
     use_amp, amp_dtype, scaler = amp_setup(tcfg, dev)
 
     run = RunDir(spec.run_dir)
@@ -219,7 +258,7 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
         start_epoch = resumed_from + 1
         best_val = float(ck.get("best_val_esr", float("inf")))
         # Config wins over the checkpoint's own lr/weight_decay, so a resumed
-        # run can be hand-annealed; Adam's moment buffers are still preserved.
+        # run can be hand-annealed; AdamW's moment buffers are still preserved.
         for g in opt.param_groups:
             g["lr"], g["weight_decay"] = tcfg.lr, tcfg.weight_decay
         print(f"[resume] from epoch {start_epoch}, best_val_esr={best_val:.5f}; "
@@ -265,7 +304,8 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
 
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                out = model.forward_emb(inp, _conditioning(model, di, noise_frac))[..., R:]
+                out = model.forward_emb(inp, _conditioning(model, di, noise_frac,
+                                                           prefix_sizes, full_frac))[..., R:]
             loss, parts = lossfn(out.float(), target,
                                  weights=None if dev_w is None else dev_w[di])
             scaler.scale(loss).backward()

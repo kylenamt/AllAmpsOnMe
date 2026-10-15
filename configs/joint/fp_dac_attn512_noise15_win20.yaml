@@ -168,8 +168,6 @@ joint:
     # NEW vs fp_dac_attn512 -- the other field this file changes. 0 = all
     # 14,728 frames (what every dac_frames run so far did).
     frame_window: 1723
-    proj_hidden: 128
-    activation: tanh
     # ON, for the same reason fp_dac_delta512 turns it on: nothing else bounds
     # |e| and the reconstruction gradient inflates it.
     normalize: true

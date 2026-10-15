@@ -52,18 +52,22 @@ from openamp.encoders.frames import FrameAttentionEncoder
 from openamp.encoders.pooling import (AttentiveStatsPool, CrossAttentionPool,
                                       FrameStore, MultiHeadAttentiveStatsPool,
                                       MultiTapStatsHead)
+from openamp.encoders.refine import (AttentionEncoder, CrossAttentionPool2Block,
+                                     CrossAttnBlock)
 from openamp.encoders.wavenet import WaveNetEncoder, WaveNetEncoderLayer
 
 __all__ = ["ENCODERS", "register_encoder", "build_encoder", "encoder_class",
            "ref_mode_for", "WaveNetEncoder", "WaveNetEncoderLayer",
-           "FingerprintEncoder", "FrameAttentionEncoder", "AttentiveStatsPool",
-           "MultiHeadAttentiveStatsPool", "MultiTapStatsHead", "CrossAttentionPool",
+           "FingerprintEncoder", "FrameAttentionEncoder", "AttentionEncoder",
+           "AttentiveStatsPool", "MultiHeadAttentiveStatsPool", "MultiTapStatsHead",
+           "CrossAttentionPool", "CrossAttnBlock", "CrossAttentionPool2Block",
            "FrameStore", "FINGERPRINT_PREPROCESS", "DRY_ID"]
 
 ENCODERS: dict[str, type] = {
     "wavenet": WaveNetEncoder,
     "fingerprint": FingerprintEncoder,
     "dac_frames": FrameAttentionEncoder,
+    "dac_frames_refine": AttentionEncoder,
 }
 
 

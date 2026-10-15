@@ -49,6 +49,7 @@ src/openamp/
     grid.py               #   the same fixed window grid for every device
     joint.py              #   a window plus a disjoint reference segment
     pair.py               #   one (dry, wet) recording, for pair enrollment
+    amps.py               #   one amp per item: fit clips + score clips, for the unfolder
     loaders.py            #   make_loader: seeded, worker-safe DataLoader
 
   models/                 # conditioned architectures (registry: `model.arch`)
@@ -70,6 +71,7 @@ src/openamp/
     optim.py              #   plateau scheduler, AMP dtype/scaler, grad clip
     emulate.py            #   the table-conditioned loop + sanity ladder
     joint.py              #   the encoder+generator loop + collapse tripwire
+    unfold.py             #   the learned-enrollment-steps loop; both networks frozen
 
   evaluation/             # scoring a finished run
     metrics.py            #   the two ESR definitions every caller shares
@@ -80,17 +82,20 @@ src/openamp/
   enroll/                 # fit an embedding for an amp the network never saw
     fit.py                #   the fitting loop; corpus holdout and (dry, wet) pair
     alignment.py          #   reamp latency, capture regions, chunked rendering
+    unfold.py             #   deep unfolding: encoder guess + K learned gradient steps
 
   export.py               # plugin weight bundle + pasteable profiles (weight folding)
 
   probes/                 # standalone feasibility probes, wired into nothing
     extract.py            #   frozen DAC over each render, frames kept
     probe.py              #   cross-attention pooler regressed onto a trained table
+    probe_attn.py         #   same regression, the shipped AttentionEncoder instead
+    probe_esr.py          #   a trained probe_attn encoder -> frozen decoder, seen vs unseen ESR
 ```
 
 - `core` and (mostly) `acquire` load on a bare numpy/pandas stack; everything from `spec.py` down pulls torch / soundfile / auraloss.
 - **The training half is five seams**, each a registry plus a contract plus a config section that names the implementation: `data`, `models`, `encoders`, `losses`, and the objective's own `training` knobs. Adding one is a new file and a config line; the loops name no implementation. See the worked example in [README.md](../README.md#adding-an-architecture).
-- **`probes/` is standalone**: nothing imports from it, and the dependency runs one way — it reuses `data`, `evaluation` and `encoders.pooling`.
+- **`probes/` is standalone**: nothing imports from it, and the dependency runs one way — it reuses `data`, `evaluation`, `encoders.pooling` and (`probe_attn.py`) `encoders.refine`.
 - `cli.py` imports each stage module lazily inside its command body, so `openamp --help` and metadata-only verbs stay fast without loading torch.
 
 ---
@@ -142,10 +147,11 @@ Run order (each is one `openamp` verb). "Reads" / "Writes" are files under `data
 | `emulate-demo` | `evaluation/emulate.py` | a run + test renders | `results/emulate/demos/*.wav` |
 | `joint-eval` | `evaluation/joint.py` | one joint run + renders | `results/joint/<name>/{diagnostics.json,tsne.csv}` |
 | `emulate-enroll` | `enroll/fit.py` | a finished run + a held-out device's renders | `<run>/enroll/{enrolled_embeddings.pt,enrollment.csv,metrics.json}` |
+| `unfold` | `training/unfold.py` | a finished emulate run (generator) + a finished joint run (encoder) + renders | `results/unfold/<name>/{checkpoint,last}.pt`, `train_log.csv`, `metrics.json`, `report_per_device.csv`, `encoder_vectors.pt` |
 
 **One experiment is one `RunSpec`.** `openamp emulate --config configs/emulate/<name>.yaml`
 reads that file once, in `spec.load_run_spec`, and everything below takes the spec.
-Its five sections each name an implementation in a registry:
+Its sections each name an implementation in a registry:
 
 | Section | Registry | Contract lives in |
 |---|---|---|
@@ -154,6 +160,7 @@ Its five sections each name an implementation in a registry:
 | `loss:` | `losses.LOSSES` | `losses.py` |
 | `joint.encoder:` | `encoders.ENCODERS` | `encoders/__init__.py` |
 | `training:` | — (the loop's own knobs) | `spec.TrainingSpec` |
+| `unfold:` | — (two finished run dirs + the unfolder's knobs) | `spec.UnfoldSpec` |
 
 `model.kwargs` and `loss.kwargs` are opaque and reach the registered class
 untouched, so a config uses constructor parameter names and a new implementation
@@ -199,7 +206,12 @@ architecture-independent.
   vector still posts a respectable ESR. AdamW here, not emulate's Adam, because
   `enc_weight_decay` is a real value under test.
 
-They stay two loops on purpose: they disagree about what validation *means*, and one
+- **`training/unfold.py`** trains neither network. Both are finished runs, frozen —
+  the generator an emulate run, the first guess a joint run's encoder — and what
+  trains is the *enrollment steps between them* (see below). Its `model`/`data`/`loss`
+  come from the generator run, not the config.
+
+The first two stay two loops on purpose: they disagree about what validation *means*, and one
 loop with flags would hide that rather than remove it. What they genuinely shared —
 run-directory I/O, the resume check, the schedule/AMP setup — is `training/artifacts.py`
 and `training/optim.py`. `training.scheduler` picks `plateau` (the default, on val ESR) or
@@ -225,6 +237,25 @@ id to look up — so the training and evaluation loops agree without either nami
 What makes an embedding carry *tone* rather than *audio*: the reference is a different
 segment of the recording, in practice a different corpus file, than the one the
 generator must reconstruct. Only what survives that gap is the amp.
+
+#### Unfolded enrollment (`openamp.enroll.unfold`)
+
+Between the two ways of getting an unseen amp's vector — enrollment (thousands of
+gradient steps, close) and an encoder (one forward pass, far) — the unfolder starts
+from the encoder's guess and takes K gradient steps whose shape is *learned*.
+
+- A `delta_wavenet` reads `e` only through one linear map per layer
+  (`c_l = W_l e + b_l`), so `dL/de = Σ_l W_lᵀ g_l` exactly. Each unfolded step
+  replaces `W_lᵀ` with its own trainable copy `V_{k,l}` and adds a per-dimension
+  step size: `e ← P(e − s_k ⊙ Σ_l V_{k,l}ᵀ ĝ_l)`, with `ĝ` the coeff gradient
+  normalized per amp and `P` the generator's own projection back onto its sphere.
+- `V` starts at `W` and the step sizes are calibrated to one length, so an untrained
+  unfolder *is* normalized gradient descent.
+- **First-order**: each `g` is a constant to the outer loss, so memory is one
+  generator pass at any K.
+- One step costs one generator forward + backward on the amp's fit clips; K steps
+  cost K of them. Only `delta_wavenet` is supported — other archs have no single
+  linear map to learn around.
 
 ---
 
