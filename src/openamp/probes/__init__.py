@@ -30,8 +30,11 @@ experiment, and it has a number to beat before any ESR is measured.
 - :mod:`~openamp.probes.probe_synth` -- probe_attn's head on log-mel tokens of
   the T3K capture, trained on real amps plus made-up amps the frozen generator
   renders online.
+- :mod:`~openamp.probes.probe_conformer` -- a raw-audio + log-mel Conformer
+  encoder on the same reference, trained by the frozen decoder's audio loss on
+  EGDB clips instead of cosine to the table.
 - :mod:`~openamp.probes.probe_esr`  -- reload a finished ``probe_attn`` encoder
-  (or a ``probe_synth`` run's predictions), wire it to the frozen decoder, report
+  (or a ``probe_synth`` / ``probe_conformer`` run's predictions), wire it to the frozen decoder, report
   ESR for trained vs held-out amps against each group's oracle vector.
 
 ``python -m openamp.probes.extract`` then ``python -m openamp.probes.probe``
@@ -40,4 +43,4 @@ experiment, and it has a number to beat before any ESR is measured.
 
 from __future__ import annotations
 
-__all__ = ["extract", "probe", "probe_attn", "probe_synth", "probe_esr"]
+__all__ = ["extract", "probe", "probe_attn", "probe_synth", "probe_conformer", "probe_esr"]
