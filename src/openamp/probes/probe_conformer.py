@@ -65,6 +65,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from openamp.core.config import load_config
 from openamp.corpus.render import _render_signal
@@ -86,9 +87,11 @@ RAW_STRIDES = (4, 4, 4, 4, 2)
 RAW_KERNELS = (8, 8, 8, 8, 4)
 POWER_EPS = 1e-12
 
+# --weight-decay, --lr-schedule, --warmup and --min-lr may change on --resume: the
+# schedule is a function of the step alone, so a resumed run joins the new one there.
 RESUME_FIXED = ("run", "sweep", "captures", "renders", "seed", "val_frac", "batch",
                 "synth_per_batch", "ref_seconds", "clip_seconds", "val_clips",
-                "eval_every", "lr", "weight_decay", "width", "n_blocks", "n_heads",
+                "eval_every", "lr", "width", "n_blocks", "n_heads",
                 "ff_ratio", "conv_kernel", "n_queries", "d_model", "pool_heads",
                 "mlp_ratio")
 
@@ -195,12 +198,18 @@ class ConformerEncoder(nn.Module):
     2. One Linear to ``width``, then ``n_blocks`` :class:`ConformerBlock`.
     3. probe_synth's pool (two cross-attention blocks, learned queries, no
        positions), one Linear to ``De``, L2-normalized.
+
+    ``raw_chunk`` > 0 runs the raw branch under activation checkpointing, that many
+    batch items at a time, when gradients are on: its first layers hold ~[B, width,
+    n / 4] activations, which on a long reference do not fit next to the rest of
+    the step. Items are independent in that branch, so the result is unchanged.
     """
 
     def __init__(self, embedding_dim: int, sample_rate: int, *, width: int, n_blocks: int,
                  n_heads: int, ff_ratio: int, conv_kernel: int, n_queries: int,
-                 d_model: int, pool_heads: int, mlp_ratio: int):
+                 d_model: int, pool_heads: int, mlp_ratio: int, raw_chunk: int = 0):
         super().__init__()
+        self.raw_chunk = int(raw_chunk)
         self.logmel = LogMel(sample_rate, 0)
         self.register_buffer("feat_mean", torch.zeros(2 * N_MELS))
         self.register_buffer("feat_std", torch.ones(2 * N_MELS))
@@ -220,7 +229,12 @@ class ConformerEncoder(nn.Module):
 
     def forward(self, dry: torch.Tensor, wet: torch.Tensor) -> torch.Tensor:
         mel = (self.mel_features(dry, wet) - self.feat_mean) / self.feat_std
-        raw = self.raw(torch.stack([dry, wet], dim=1), mel.shape[1])
+        x = torch.stack([dry, wet], dim=1)
+        if self.raw_chunk > 0 and torch.is_grad_enabled():
+            raw = torch.cat([checkpoint(self.raw, c, mel.shape[1], use_reentrant=False)
+                             for c in x.split(self.raw_chunk)])
+        else:
+            raw = self.raw(x, mel.shape[1])
         h = self.fuse(torch.cat([raw, mel.to(raw.dtype)], dim=-1))
         for block in self.blocks:
             h = block(h)
@@ -330,9 +344,16 @@ def main() -> None:
     ap.add_argument("--mlp-ratio", type=int, default=4)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight-decay", type=float, default=0.1)
+    ap.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant",
+                    help="after --warmup: hold --lr, or cosine-decay it to --min-lr at --steps")
+    ap.add_argument("--warmup", type=int, default=0, help="steps of linear LR warmup")
+    ap.add_argument("--min-lr", type=float, default=1e-5)
     ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--render-chunk", type=int, default=4,
                     help="amps the generator plays the whole reference for at once")
+    ap.add_argument("--raw-chunk", type=int, default=0,
+                    help="checkpoint the raw branch this many amps at a time (0: off); "
+                         "for a long --ref-seconds")
     ap.add_argument("--num-workers", type=int, default=6)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--device", default="cuda")
@@ -458,7 +479,8 @@ def main() -> None:
     encoder = ConformerEncoder(
         embedding_dim, sr, width=args.width, n_blocks=args.n_blocks, n_heads=args.n_heads,
         ff_ratio=args.ff_ratio, conv_kernel=args.conv_kernel, n_queries=args.n_queries,
-        d_model=args.d_model, pool_heads=args.pool_heads, mlp_ratio=args.mlp_ratio).to(dev)
+        d_model=args.d_model, pool_heads=args.pool_heads, mlp_ratio=args.mlp_ratio,
+        raw_chunk=args.raw_chunk).to(dev)
 
     # Real amps on the whole reference: the training amps for the log-mel
     # standardization (dry from the reference, wet from them), kept for the val amps.
@@ -515,6 +537,8 @@ def main() -> None:
         encoder.load_state_dict(ck["state_dict"])
         opt.load_state_dict(ck["opt"])
         start, best_val, best_step = ck["step"] + 1, ck["best_val"], ck["best_step"]
+        for group in opt.param_groups:
+            group["weight_decay"] = args.weight_decay
         best_state = ck["best_state"]
         print(f"[conf] resumed {args.resume} at step {start} (best val {best_val:.4f} "
               f"at step {best_step + 1})")
@@ -555,6 +579,14 @@ def main() -> None:
             stft_t += parts["stft"]
             nb += 1
         return {"loss": tot / nb, "esr": esr_t / nb, "stft": stft_t / nb}
+
+    def lr_at(step: int) -> float:
+        if step < args.warmup:
+            return args.lr * (step + 1) / args.warmup
+        if args.lr_schedule == "constant":
+            return args.lr
+        t = (step - args.warmup) / max(args.steps - args.warmup, 1)
+        return args.min_lr + 0.5 * (args.lr - args.min_lr) * (1 + math.cos(math.pi * t))
 
     def checkpoint(step: int) -> dict:
         return {"state_dict": encoder.state_dict(), "opt": opt.state_dict(), "step": step,
@@ -605,6 +637,8 @@ def main() -> None:
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(encoder.parameters(), GRAD_CLIP_NORM)
+        for group in opt.param_groups:
+            group["lr"] = lr_at(step)
         opt.step()
 
         with torch.no_grad():
@@ -629,7 +663,8 @@ def main() -> None:
             print(f"  s{step + 1:05d}  train loss {acc['loss'] / n:.4f}  esr real "
                   f"{acc['real'] / n:.4f} made-up {acc['synth'] / n:.4f}  val loss "
                   f"{va_m['loss']:.4f} (esr {va_m['esr']:.4f} stft {va_m['stft']:.4f}) "
-                  f"best {best_val:.4f}  {elapsed / 60:.1f} min, data wait "
+                  f"best {best_val:.4f}  lr {lr_at(step):.2e}  {elapsed / 60:.1f} min, "
+                  f"data wait "
                   f"{t_wait / max(elapsed, 1e-9):.0%} render "
                   f"{t_render / max(elapsed, 1e-9):.0%}" + ("  *" if star else ""),
                   flush=True)
