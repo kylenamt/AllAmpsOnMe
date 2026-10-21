@@ -25,14 +25,21 @@ values (variance floored at ``VAR_FLOOR``). No ``W_q`` (the query is already
 learned) and no ``W_o`` (the next Linear does its job). Linear 2·width ->
 embedding, L2 normalize.
 
-**Phase 1: contrastive, real amps only.** Each step draws one length ``k`` (1 to
-``K_max`` chunks, uniform; ``K_max`` chunks is ``--max-seconds``) and two crops A
-and B of the reference that never overlap. The same two crops for all
-``--batch`` amps, so the music is identical across amps and only the amp tells
-a match from a miss. InfoNCE both ways on cosine / ``--tau``: each amp's A must
-pick its own B among the batch, and B its A. No projection head; the
-generator is not used. Wet crops are played online by each amp's ``.nam``, at
-the ``output_scale`` its corpus renders carried.
+**Phase 1: contrastive.** Each step draws one length ``k`` (1 to ``K_max``
+chunks, uniform; ``K_max`` chunks is ``--max-seconds``) and two crops A and B of
+the reference that never overlap. The same two crops for every amp in the step,
+so the music is identical across amps and only the amp tells a match from a
+miss. InfoNCE both ways on cosine / ``--tau``: each amp's A must pick its own B
+among the step's amps, and B its A. No projection head. A step holds
+``--batch`` real amps, played online by their ``.nam`` at the ``output_scale``
+their corpus renders carried, plus ``--synth-per-batch`` made-up amps.
+
+**Made-up amps** (:class:`ShapedCloud`): an embedding drawn from a Gaussian with
+the training table rows' mean and covariance, the covariance's eigenvalues
+raised to ``--synth-shape`` (1 = the rows' own shape, 0 = the same spread in
+every direction; the total variance is kept), then scaled to the rows' length.
+The frozen generator (``--run``) plays both crops, in bf16, with real left
+context. Each one is drawn once and never reused.
 
 **Learning rate**: linear warmup from 0 over ``--warmup-steps``, then a cosine
 down to ``--min-lr-frac`` of ``--lr`` at the last step. A pure function of the
@@ -44,7 +51,9 @@ pass. Same result, more compute.
 
 **Validation**: every val amp, A = the reference's first ``--max-seconds``,
 B = its last. ``best_val`` is the InfoNCE loss there; top-1 retrieval is
-reported both ways (chance is 1 / val amps).
+reported both ways (chance is 1 / val amps). The same is reported, never used
+to pick the checkpoint, for ``--synth-val`` fixed made-up amps from the same
+sampler.
 
 **Resuming.** Every draw is seeded by ``(seed, stream, step)``, so
 ``--resume <out>/last.pt`` continues the identical stream.
@@ -68,7 +77,7 @@ from openamp.core.config import load_config
 from openamp.corpus.render import _render_signal
 from openamp.dsp import audio as audio_io
 from openamp.dsp import nam as nam_io
-from openamp.evaluation import resolve_device
+from openamp.evaluation import load_model, resolve_device
 from openamp.models import count_parameters
 from openamp.probes.probe_conformer import ConformerBlock
 from openamp.probes.probe_synth import (DB_EPS, HOP, N_FFT, SKIP_SECONDS, captures_by_sha,
@@ -83,7 +92,7 @@ RESUME_FIXED = ("run", "sweep", "captures", "renders", "seed", "val_frac", "batc
                 "steps", "max_seconds", "tau", "lr", "warmup_steps", "min_lr_frac",
                 "weight_decay", "embedding_dim", "chunk_n",
                 "width", "n_blocks", "n_heads", "ff_ratio", "conv_kernel", "pool_heads",
-                "key_hidden")
+                "key_hidden", "synth_per_batch", "synth_shape", "synth_val")
 
 
 # --- Chunks ---------------------------------------------------------------------------
@@ -188,6 +197,28 @@ class ChunkedEncoder(nn.Module):
 
 
 # --- Training -------------------------------------------------------------------------
+class ShapedCloud:
+    """Random embeddings around a set of table rows: a Gaussian with the rows' mean
+    and covariance, the covariance's eigenvalues raised to ``shape`` and rescaled to
+    the same total (1 = the rows' own shape, 0 = equal in every direction); each
+    draw is then scaled to ``radius``, the length every row of an
+    ``embed_normalize`` table has."""
+
+    def __init__(self, rows: np.ndarray, radius: float, shape: float):
+        rows = np.asarray(rows, dtype=np.float64)
+        self.mu = rows.mean(0)
+        lam, self.V = np.linalg.eigh(np.cov(rows.T))
+        lam = lam.clip(min=0.0)
+        sc = lam ** shape
+        self.sd = np.sqrt(sc * lam.sum() / sc.sum())
+        self.radius = float(radius)
+
+    def draw(self, rng: np.random.Generator, n: int) -> np.ndarray:
+        e = self.mu + (rng.standard_normal((n, len(self.mu))) * self.sd) @ self.V.T
+        e = self.radius * e / np.linalg.norm(e, axis=1, keepdims=True)
+        return e.astype(np.float32)
+
+
 def crop_pair(rng: np.random.Generator, n: int, L: int) -> tuple[int, int]:
     """Starts ``(a, b)`` of two ``L``-sample crops of ``[0, n)`` that do not overlap,
     uniform over all such pairs; which one is A is a coin flip."""
@@ -223,8 +254,9 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", type=Path,
                     default=Path("results/emulate/delta_a2_tanh_r32_512_v2_n10"),
-                    help="emulate run whose table gives the amp list and the "
-                         "train/val split (probe_synth's); its model is not used")
+                    help="emulate run: its table gives the amp list, the train/val "
+                         "split (probe_synth's) and the made-up draws' shape; its "
+                         "frozen generator plays the made-up amps")
     ap.add_argument("--sweep", type=Path,
                     default=Path("data_sweep_a1/clean/train/sweep_train.flac"),
                     help="the reference: the T3K capture signal's train region")
@@ -233,6 +265,15 @@ def main() -> None:
     ap.add_argument("--out", type=Path,
                     default=Path("results/encoder/encoder_probe_chunked"))
     ap.add_argument("--batch", type=int, default=32, help="real amps per step")
+    ap.add_argument("--synth-per-batch", type=int, default=0,
+                    help="made-up amps per step, on top of --batch")
+    ap.add_argument("--synth-shape", type=float, default=1.0,
+                    help="made-up draws: covariance eigenvalues ** this (1 = the "
+                         "table rows' shape, 0 = equal in every direction)")
+    ap.add_argument("--synth-val", type=int, default=76,
+                    help="fixed made-up amps scored beside the real val amps")
+    ap.add_argument("--gen-chunk", type=int, default=4,
+                    help="made-up amps the generator plays at once")
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--eval-every", type=int, default=21,
                     help="steps between validations (21 = about one pass over the "
@@ -318,6 +359,29 @@ def main() -> None:
         raise SystemExit(f"two {args.max_seconds:g} s crops do not fit side by side in "
                          f"the reference's {n_keep / sr:.1f} s")
 
+    # --- Frozen generator and the made-up draws -------------------------------------
+    model, _ = load_model(args.run, str(dev))
+    model.requires_grad_(False)
+    model.eval()
+    R = model.receptive_field
+    table = tbl["embedding"].float().numpy()
+    cloud = ShapedCloud(table[train_sel], float(np.linalg.norm(table, axis=1).mean()),
+                        args.synth_shape)
+    x_pad_gen = torch.from_numpy(np.concatenate([np.zeros(R, np.float32), x])).to(dev)
+
+    @torch.no_grad()
+    def synth_crops(E: torch.Tensor, g: int, L: int) -> torch.Tensor:
+        """``[S, De]`` -> ``[S, L]``: the generator on ``x[g : g + L]`` with ``R``
+        samples of real left context."""
+        seg = x_pad_gen[g:g + R + L]
+        out = []
+        for s in range(0, len(E), args.gen_chunk):
+            e = E[s:s + args.gen_chunk]
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
+                out.append(model.forward_emb(seg[None, None].expand(len(e), -1, -1),
+                                             e)[:, 0, R:].float())
+        return torch.cat(out)
+
     def crop_len(k: int) -> int:
         return L_max if k == k_max else crop_samples(k, chunk, cstep)
 
@@ -377,7 +441,12 @@ def main() -> None:
     wet_val_a = torch.stack([w[:L_max] for w in wet_val])                   # [V, L_max]
     wet_val_b = torch.stack([w[-L_max:] for w in wet_val])
     del wet_val
-    print(f"[chunk] rendered {len(val_ids)} val amps on the reference", flush=True)
+    if args.synth_val:
+        E_sv = torch.from_numpy(cloud.draw(step_rng(args.seed, 6, 0), args.synth_val)).to(dev)
+        synth_val_a = synth_crops(E_sv, skip, L_max).cpu()
+        synth_val_b = synth_crops(E_sv, skip + n_keep - L_max, L_max).cpu()
+    print(f"[chunk] rendered {len(val_ids)} val amps and {args.synth_val} made-up val "
+          f"amps on the reference", flush=True)
 
     opt = torch.optim.AdamW(encoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     start, best_val, best_step, best_state, best_metrics = 0, float("inf"), -1, None, {}
@@ -392,7 +461,8 @@ def main() -> None:
     n_params = count_parameters(encoder)
     print(f"[chunk] {len(ids)} amps: {len(train_sel)} train / {len(val_sel)} val  "
           f"reference {n_keep / sr:.1f} s after the skip")
-    print(f"[chunk] per step: {args.batch} real amps x 2 crops that do not overlap, "
+    print(f"[chunk] per step: {args.batch} real + {args.synth_per_batch} made-up amps "
+          f"(shape {args.synth_shape:g}) x 2 crops that do not overlap, "
           f"k = 1..{k_max} chunks of {chunk} samples ({chunk / sr:.3f} s, step "
           f"{cstep / sr:.3f} s), longest {args.max_seconds:g} s; InfoNCE tau {args.tau:g}")
     print(f"[chunk] encoder: complex STFT 4x{N_BINS} -> {args.width} -> {args.n_blocks} "
@@ -415,7 +485,13 @@ def main() -> None:
         ea = encode(dry_full[:L_max], wet_val_a)
         eb = encode(dry_full[-L_max:], wet_val_b)
         loss, m = info_nce(ea, eb, args.tau)
-        return {"loss": float(loss), **m}
+        out = {"loss": float(loss), **m}
+        if args.synth_val:
+            loss, m = info_nce(encode(dry_full[:L_max], synth_val_a),
+                               encode(dry_full[-L_max:], synth_val_b), args.tau)
+            out.update({"synth_loss": float(loss), "synth_top1_ab": m["top1_ab"],
+                        "synth_top1_ba": m["top1_ba"]})
+        return out
 
     def checkpoint_state(step: int) -> dict:
         return {"state_dict": encoder.state_dict(), "opt": opt.state_dict(), "step": step,
@@ -448,10 +524,21 @@ def main() -> None:
         a, b = crop_pair(rng, n_keep, L)
         amps = step_amps(step)
         tr0 = time.time()
-        wet = torch.from_numpy(np.stack([real_crop(d, skip + g, L)
-                                         for g in (a, b) for d in amps])).to(dev)
+        S = args.synth_per_batch
+        E = (torch.from_numpy(cloud.draw(step_rng(args.seed, 2, step), S)).to(dev)
+             if S else None)
+        views = []
+        for g in (a, b):
+            views.append(torch.from_numpy(np.stack([real_crop(d, skip + g, L)
+                                                    for d in amps])).to(dev))
+            if S:
+                views.append(synth_crops(E, skip + g, L))
+        wet = torch.cat(views)
+        del views
+        if dev.type == "cuda":
+            torch.cuda.synchronize()
         t_render += time.time() - tr0
-        B = args.batch
+        B = args.batch + S
         dry = torch.cat([dry_full[a:a + L][None].expand(B, -1),
                          dry_full[b:b + L][None].expand(B, -1)])
 
@@ -480,6 +567,8 @@ def main() -> None:
             print(f"  s{step + 1:05d}  train loss {acc['loss'] / n:.4f} top1 "
                   f"{acc['top1_ab'] / n:.3f}/{acc['top1_ba'] / n:.3f}  val loss "
                   f"{v['loss']:.4f} top1 A>B {v['top1_ab']:.3f} B>A {v['top1_ba']:.3f}  "
+                  + (f"made-up val loss {v['synth_loss']:.4f} top1 {v['synth_top1_ab']:.3f}/"
+                     f"{v['synth_top1_ba']:.3f}  " if args.synth_val else "") +
                   f"best {best_val:.4f}  lr {lr:.2e}  {elapsed / 60:.1f} min, render "
                   f"{t_render / max(elapsed, 1e-9):.0%}" + ("  *" if star else ""),
                   flush=True)
@@ -491,11 +580,16 @@ def main() -> None:
 
     report = {
         "n_params": int(n_params), "n_train": int(len(train_sel)), "n_val": int(len(val_sel)),
-        "steps": int(args.steps), "batch": int(args.batch), "tau": args.tau,
+        "steps": int(args.steps), "batch": int(args.batch),
+        "synth_per_batch": int(args.synth_per_batch), "synth_shape": args.synth_shape,
+        "tau": args.tau,
         "max_seconds": args.max_seconds, "k_max": int(k_max),
         "best_val_loss": best_val, "best_step": int(best_step + 1),
         "val_top1_ab": best_metrics.get("top1_ab"), "val_top1_ba": best_metrics.get("top1_ba"),
         "chance_top1": 1.0 / len(val_sel), "train_minutes": train_min,
+        "synth_val": int(args.synth_val), "val_synth_loss": best_metrics.get("synth_loss"),
+        "val_synth_top1_ab": best_metrics.get("synth_top1_ab"),
+        "val_synth_top1_ba": best_metrics.get("synth_top1_ba"),
     }
     torch.save({"state_dict": encoder.state_dict(), "best_state": best_state,
                 "args": arg_dict, "device_ids": ids.tolist(),
