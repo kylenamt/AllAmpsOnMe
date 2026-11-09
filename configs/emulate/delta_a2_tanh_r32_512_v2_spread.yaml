@@ -1,0 +1,54 @@
+# delta_a2_tanh_r32_512_v2_n10 with a learned noise size per amp and per dim, the
+# VAE-style table. Run name = file stem.
+#
+#   openamp emulate --config configs/emulate/delta_a2_tanh_r32_512_v2_spread.yaml
+#
+# ONE CHANGE from delta_a2_tanh_r32_512_v2_n10.yaml: the fixed embed_noise_frac
+# 0.1 is replaced by a learned spread that starts at the same 0.1. That run and
+# delta_a2_tanh_r32_512_v2_n50 (fixed 0.5) are the controls.
+#
+# The spreads train only. Val, eval, enrollment, export and encoders read the
+# centres, so the result is an ordinary table + generator.
+#
+# embed_spread_weight 0.1: a first guess from the nudge curves, not tuned.
+#
+# Full copy of delta_a2_tanh_r32_512_v2_n10.yaml's numbers otherwise.
+
+model:
+  arch: delta_wavenet  # A2 topology; embedding -> low-rank residual on each conv
+  channels: 8  # A2 full-width submodel (the exports' other width is 3)
+  activation: tanh  # "leakyrelu" (the capture default) | "tanh"
+  embedding_dim: 512  # widened with the rank so 23*32=736 DOF is not clipped to 256
+  delta_rank: 32  # generator is the limit only above rank 22 at this E
+  embed_normalize: true  # e = embed_scale * normalize(row)
+
+
+data:
+  dataset: emulation
+
+  holdout_frac: 0.1
+  clip_seconds: 2.0  # must match the corpus clip grid
+  pairs_per_epoch: 50000
+
+loss:
+  name: esr_mrstft
+  stft_weight: 0.05  # NAM's MRSTFT weight, rescaled from MSE to this trainer's ESR term
+  preemph_coeff: 0.85  # 0.0 = NAM-faithful (plain ESR, no pre-emphasis)
+  device_loss_weighting: 1.0  # per-device ESR weighting (train loss + val ESR)
+
+
+training:
+  batch_size: 32
+  epochs: 150
+  lr: 1.614e-4  # was 4.0e-3; set on resume at epoch 55 to the annealed lr, 4.0e-3 * 0.7^9, because the config lr wins on resume
+  weight_decay: 0.01
+  plateau_patience: 3
+  plateau_factor: 0.7
+  early_stop_patience: 999
+  embed_spread_init: 0.1  # replaces embed_noise_frac; same starting size as v2_n10
+  embed_spread_weight: 0.1
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2000
+  log_every: 50

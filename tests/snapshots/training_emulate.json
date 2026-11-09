@@ -99,6 +99,8 @@
       "embed_noise_frac": 0.0,
       "embed_prefix_full_frac": 0.5,
       "embed_prefix_sizes": [],
+      "embed_spread_init": 0.0,
+      "embed_spread_weight": 0.0,
       "epochs": 2,
       "log_every": 1000000000,
       "lr": 0.0005,

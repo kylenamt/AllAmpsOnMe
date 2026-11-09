@@ -36,7 +36,8 @@ LOG_COLUMNS = ["epoch", "step", "train_loss", "train_esr", "train_stft", "val_es
 
 def _conditioning(model, device_idx: torch.Tensor, noise_frac: float,
                   prefix_sizes: torch.Tensor | None = None,
-                  prefix_full_frac: float = 0.0) -> torch.Tensor:
+                  prefix_full_frac: float = 0.0,
+                  spread: torch.Tensor | None = None) -> torch.Tensor:
     """The batch's embedding rows, optionally jittered and/or cut (train steps only).
 
     Noise std is ``noise_frac * table.std()`` recomputed each step, not a fixed
@@ -44,6 +45,9 @@ def _conditioning(model, device_idx: torch.Tensor, noise_frac: float,
     relative size keeps the perturbation the same fraction of the space
     throughout. Read off the whole table (not the batch) so a batch of similar
     devices doesn't shrink its own noise.
+
+    ``spread`` ``[B, D]`` replaces ``noise_frac`` with a learned fraction per row
+    and dim (``training.embed_spread_init``); the rest is the same step.
 
     The noisy vector is re-projected through ``model.project_embedding`` so an
     ``embed_normalize`` model gets its noise back on the sphere at the same
@@ -58,8 +62,9 @@ def _conditioning(model, device_idx: torch.Tensor, noise_frac: float,
     the same amp", not a different, full-size one.
     """
     emb = model.embed(device_idx)
-    if noise_frac > 0.0:
-        std = noise_frac * model.embedding_table().detach().std()
+    if noise_frac > 0.0 or spread is not None:
+        frac = noise_frac if spread is None else spread
+        std = frac * model.embedding_table().detach().std()
         emb = model.project_embedding(emb + torch.randn_like(emb) * std)
     if prefix_sizes is None:
         return emb
@@ -69,6 +74,16 @@ def _conditioning(model, device_idx: torch.Tensor, noise_frac: float,
     k = torch.where(full, torch.full_like(k, E), k)
     keep = torch.arange(E, device=emb.device) < k.unsqueeze(1)
     return emb * keep
+
+
+def spread_kl(log_spread: torch.Tensor) -> torch.Tensor:
+    """VAE KL against a spread of 1, for ``[..., D]`` log fractions; mean over everything.
+
+    Keeps the learned spreads from shrinking to nothing. Under ``embed_normalize``
+    every centre has the same length, so the KL's centre term is a constant and
+    this spread term is all of it that can act. A fraction of 1 is one table std.
+    """
+    return 0.5 * (torch.exp(2.0 * log_spread) - 2.0 * log_spread - 1.0).mean()
 
 
 @torch.no_grad()
@@ -192,6 +207,22 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
     if noise_frac > 0.0:
         print(f"[model] embed_noise_frac={noise_frac:g}")
 
+    # Learned spread on the embedding: train steps only (val/eval read the centres).
+    # Held beside the model, not in it, so the checkpoint's model is an ordinary
+    # table + generator and enrollment/export/encoders read it unchanged.
+    spread_init, spread_w = float(tcfg.embed_spread_init), float(tcfg.embed_spread_weight)
+    log_spread = None
+    if spread_init != 0.0 or spread_w != 0.0:
+        if spread_init <= 0.0 or spread_w <= 0.0:
+            raise ValueError("training.embed_spread_init and embed_spread_weight must "
+                             f"both be > 0 or both 0, got {spread_init}, {spread_w}")
+        if noise_frac > 0.0:
+            raise ValueError("training.embed_spread_init replaces embed_noise_frac; "
+                             "set only one of them")
+        log_spread = torch.nn.Parameter(torch.full((len(ids), model.embedding_dim),
+                                                   float(np.log(spread_init)), device=dev))
+        print(f"[model] embed_spread_init={spread_init:g} embed_spread_weight={spread_w:g}")
+
     # Nested dropout on the embedding: train steps only (val/eval read every dim).
     sizes = tuple(int(s) for s in tcfg.embed_prefix_sizes)
     full_frac = float(tcfg.embed_prefix_full_frac)
@@ -241,6 +272,9 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
               f"too — not comparable with a strength-0 run)")
     opt = torch.optim.AdamW(model.parameters(), lr=tcfg.lr,
                             weight_decay=tcfg.weight_decay)
+    if log_spread is not None:
+        # No weight decay: on a log it would pull every spread toward 1.
+        opt.add_param_group({"params": [log_spread], "weight_decay": 0.0})
     use_amp, amp_dtype, scaler = amp_setup(tcfg, dev)
 
     run = RunDir(spec.run_dir)
@@ -254,13 +288,16 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["optim"])
         scaler.load_state_dict(ck["scaler"])
+        if log_spread is not None:
+            log_spread.data.copy_(ck["log_spread"])
         resumed_from = int(ck["epoch"])
         start_epoch = resumed_from + 1
         best_val = float(ck.get("best_val_esr", float("inf")))
         # Config wins over the checkpoint's own lr/weight_decay, so a resumed
         # run can be hand-annealed; AdamW's moment buffers are still preserved.
         for g in opt.param_groups:
-            g["lr"], g["weight_decay"] = tcfg.lr, tcfg.weight_decay
+            g["lr"] = tcfg.lr
+        opt.param_groups[0]["weight_decay"] = tcfg.weight_decay
         print(f"[resume] from epoch {start_epoch}, best_val_esr={best_val:.5f}; "
               f"lr={tcfg.lr:.2e} weight_decay={tcfg.weight_decay:g} (from config)")
     else:
@@ -283,6 +320,7 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
             "manifest_sha256": manifest_sig, "receptive_field": R,
             "params": n_params, "sample_rate": spec.sample_rate, "seed": spec.seed,
             "name": name, "epoch": epoch, "val_esr": val_esr, "best_val_esr": best_val,
+            **({} if log_spread is None else {"log_spread": log_spread.detach().cpu()}),
         })
 
     # --- Loop -------------------------------------------------------------------
@@ -304,10 +342,13 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
 
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                out = model.forward_emb(inp, _conditioning(model, di, noise_frac,
-                                                           prefix_sizes, full_frac))[..., R:]
+                out = model.forward_emb(inp, _conditioning(
+                    model, di, noise_frac, prefix_sizes, full_frac,
+                    None if log_spread is None else log_spread[di].exp()))[..., R:]
             loss, parts = lossfn(out.float(), target,
                                  weights=None if dev_w is None else dev_w[di])
+            if log_spread is not None:
+                loss = loss + spread_w * spread_kl(log_spread[di])
             scaler.scale(loss).backward()
             scaler.unscale_(opt)      # GradScaler only skips non-finite grads; clip the rest
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
@@ -341,6 +382,8 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
             ck = torch.load(ckpt_path, map_location=dev, weights_only=False)
             model.load_state_dict(ck["model"])
             opt.load_state_dict(ck["optim"])
+            if log_spread is not None:
+                log_spread.data.copy_(ck["log_spread"])
             if use_amp:
                 use_amp, scaler = False, torch.amp.GradScaler("cuda", enabled=False)
                 note = "AMP off, fp32 from here"
@@ -375,6 +418,10 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
         print(f"[epoch {epoch:02d}] train_esr={tr_esr:.5f} val_esr={val_esr:.5f} "
               f"best={best_val:.5f} lr={cur_lr:.1e}{'  *saved*' if improved else ''}",
               flush=True)
+        if log_spread is not None:
+            f = log_spread.detach().exp().flatten()
+            print(f"[spread] mean {f.mean():.3f}  p10 {f.quantile(0.1):.3f}  "
+                  f"p90 {f.quantile(0.9):.3f}", flush=True)
         if since_improved >= tcfg.early_stop_patience:
             print(f"[stop] no val improvement for {since_improved} epochs")
             break

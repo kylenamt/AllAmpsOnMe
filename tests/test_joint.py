@@ -1092,6 +1092,57 @@ def test_jitter_carries_gradient_to_the_clean_embedding():
     assert e.grad is not None and torch.isfinite(e.grad).all() and e.grad.abs().sum() > 0
 
 
+# --- Learned spread (emulate.embed_spread_init) ----------------------------------
+class _SphereTable(torch.nn.Module):
+    """The three table methods _conditioning reads, on a sphere of radius 2."""
+
+    def __init__(self, n=64, dim=32):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(n, dim)
+
+    def project_embedding(self, emb):
+        return 2.0 * torch.nn.functional.normalize(emb, dim=-1)
+
+    def embed(self, idx):
+        return self.project_embedding(self.embedding(idx))
+
+    def embedding_table(self):
+        return self.project_embedding(self.embedding.weight)
+
+
+def test_spread_kl_is_zero_at_one_and_positive_either_side():
+    from openamp.training.emulate import spread_kl
+
+    assert float(spread_kl(torch.zeros(4, 8))) == 0.0
+    for f in (0.1, 3.0):
+        assert float(spread_kl(torch.full((4, 8), float(torch.log(torch.tensor(f)))))) > 0.0
+
+
+def test_learned_spread_stays_on_the_sphere_and_trains():
+    from openamp.training.emulate import _conditioning, spread_kl
+
+    torch.manual_seed(0)
+    model, idx = _SphereTable(), torch.arange(8)
+    log_s = torch.nn.Parameter(torch.full((8, 32), -1.0))
+    e = _conditioning(model, idx, 0.0, spread=log_s.exp())
+    assert torch.allclose(e.norm(dim=-1), torch.full((8,), 2.0), atol=1e-5)
+    assert not torch.allclose(e, model.embed(idx))
+    (e.sum() + spread_kl(log_s)).backward()
+    assert log_s.grad is not None and log_s.grad.abs().sum() > 0
+    assert model.embedding.weight.grad.abs().sum() > 0
+
+
+def test_spread_size_follows_each_row():
+    """A row with a larger spread must move further from its centre."""
+    from openamp.training.emulate import _conditioning
+
+    torch.manual_seed(0)
+    model, idx = _SphereTable(), torch.arange(64)
+    spread = torch.cat([torch.full((32, 32), 0.05), torch.full((32, 32), 0.5)])
+    moved = (_conditioning(model, idx, 0.0, spread=spread) - model.embed(idx)).norm(dim=-1)
+    assert moved[32:].mean() > 3.0 * moved[:32].mean()
+
+
 # --- LR schedule ----------------------------------------------------------------
 def _two_group_opt():
     """The joint trainer's shape: two groups 8x apart, as the configs run them."""

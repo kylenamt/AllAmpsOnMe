@@ -156,6 +156,12 @@ class TrainingSpec:
     # steps only). A sample keeps every dim with probability embed_prefix_full_frac.
     embed_prefix_sizes: tuple[int, ...] = ()
     embed_prefix_full_frac: float = 0.5
+    # Train-time learned spread on the conditioning (VAE-style table): each amp
+    # gets its own noise size per dim, a fraction of the table's std, starting at
+    # embed_spread_init and kept from collapsing by a KL term of weight
+    # embed_spread_weight (both 0 = off; train steps only, never val/eval).
+    embed_spread_init: float = 0.0
+    embed_spread_weight: float = 0.0
 
     @classmethod
     def from_dict(cls, d: dict) -> "TrainingSpec":
