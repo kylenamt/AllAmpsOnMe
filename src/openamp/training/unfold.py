@@ -2,7 +2,7 @@
 
 The third loop, beside emulate and joint, and the only one that trains neither
 network: the generator (an emulate run) and the first guess (a joint run's
-encoder) are both finished and frozen, and what trains is
+encoder, or a probe_conformer run's) are both finished and frozen, and what trains is
 :class:`~openamp.enroll.unfold.Unfolder` -- the per-step ``V`` and step sizes.
 
 **One training example is one amp.** Its encoder guess, K unfolded steps on
@@ -144,11 +144,13 @@ def _unfold_all(unf, gen, e0, x, t, coeff, amp_dtype, chunk: int) -> torch.Tenso
     return torch.cat(out)
 
 
-def _train_step(unf, gen, opt, b, e0, coeff, amp_dtype, dev) -> tuple[float, float, float]:
+def _train_step(unf, gen, opt, b, e0, coeff, amp_dtype, dev,
+                second_order: bool) -> tuple[float, float, float]:
     """One update on one batch of amps. A function so its ~GiB of tensors die on return."""
     xf, tf = b["xf"].to(dev, non_blocking=True), b["tf"].to(dev, non_blocking=True)
     xs, ts = b["xs"].to(dev, non_blocking=True), b["ts"].to(dev, non_blocking=True)
-    eK, esr0, step_len = unf(gen, e0, xf, tf, coeff, amp_dtype=amp_dtype)
+    eK, esr0, step_len = unf(gen, e0, xf, tf, coeff, amp_dtype=amp_dtype,
+                             second_order=second_order)
     A, n = xs.shape[:2]
     with torch.autocast(dev.type, dtype=amp_dtype, enabled=amp_dtype is not None):
         y = gen.forward_emb(xs.reshape(A * n, -1), eK.repeat_interleave(n, 0))
@@ -271,7 +273,7 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
     if resume and run.last.is_file():
         ck = torch.load(run.last, map_location=dev, weights_only=False)
         saved = ck["spec"].get("unfold", {})
-        structural = ("generator_run", "encoder_run", "steps")
+        structural = ("generator_run", "encoder_run", "steps", "second_order")
         check_resume_compatible(
             ck, [({k: saved.get(k) for k in structural},
                   {k: u.to_dict()[k] for k in structural}, "unfold.")],
@@ -298,7 +300,8 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
         print(f"[unfold] K={unf.steps} L={unf.V.shape[1]} r={unf.V.shape[2]} D={D} "
               f"trainable={n_params:,} | step length {step_len:.4f} | amps: train "
               f"{len(train_ids)}, select {len(sel_ids)}, report {len(rep_ids)} | "
-              f"{A} amps x {u.clips} clips per update | amp={use_amp}", flush=True)
+              f"{A} amps x {u.clips} clips per update | amp={use_amp} | "
+              f"second_order={u.second_order}", flush=True)
         t0 = time.time()
         enc = score_on(rep_e0, rep_ids, "test", TEST_PAIRS_PER_DEVICE)
         rep0, sel0 = report(), select()
@@ -332,7 +335,8 @@ def train(spec: RunSpec, *, device: str = "cuda", epochs: int | None = None,
         losses, starts, lens = [], [], []
         for it, b in enumerate(loader):
             ids = [train_ids[int(j)] for j in b["amp"]]
-            loss, esr0, step_len = _train_step(unf, gen, opt, b, e0_of(ids), coeff, adt, dev)
+            loss, esr0, step_len = _train_step(unf, gen, opt, b, e0_of(ids), coeff, adt, dev,
+                                               u.second_order)
             losses.append(loss); starts.append(esr0); lens.append(step_len)
             if it % tcfg.log_every == 0:
                 print(f"  e{epoch:02d} update {it:4d}/{len(loader)} ESR {loss:.4f} "

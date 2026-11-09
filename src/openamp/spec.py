@@ -256,7 +256,8 @@ class UnfoldSpec:
     """Deep-unfolded enrollment (:mod:`openamp.enroll.unfold`). Present only for an unfold run.
 
     Both networks are *finished runs*, frozen, named by directory: the generator
-    an emulate run (``delta_wavenet``), the first guess a joint run's encoder.
+    an emulate run (``delta_wavenet``), the first guess a joint run's encoder or
+    a ``probe_conformer`` run.
     The unfold run's ``model``/``data``/``loss`` sections are not read from its
     config -- the trainer copies them from ``generator_run``'s checkpoint, since
     that generator *is* the model, and records them in ``resolved_config.yaml``.
@@ -280,6 +281,8 @@ class UnfoldSpec:
     # Each step's starting length as a fraction of |e_0|. 0.0226 = 1e-3 * sqrt(512):
     # one Adam step at enrollment's lr 1e-3 on a 512-d vector.
     init_step_frac: float = 0.0226
+    # Train through each step's gradient too (needs far more GPU memory).
+    second_order: bool = False
 
     @classmethod
     def from_dict(cls, d: dict) -> "UnfoldSpec":

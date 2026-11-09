@@ -1,0 +1,30 @@
+# Ten learned steps, trained with full (second-order) gradients, starting from c1's
+# guess on the generator c1 was trained through. Run name = file stem.
+#
+#   openamp unfold --config configs/unfold/k10_second_order_v2n10_c1.yaml
+#
+# Needs an 80 GB card: see scripts/triton_unfold_k10_second_order.sbatch.
+#
+# Against k10 on v2 + b32 (results/unfold/unfold_k10_v2_b32): second_order true, the
+# generator, the encoder, and batch_size 2 (was 6, for memory). Everything else is
+# the same.
+
+data_dir: data
+unfold:
+  generator_run: results/emulate/delta_a2_tanh_r32_512_v2_n10
+  encoder_run: results/encoder/encoder_probe_conformer_c1
+  steps: 10
+  clips: 16
+  second_order: true
+  step_lr: 1.0e-2
+  init_step_frac: 0.0226
+training:
+  lr: 3.0e-4                # V
+  batch_size: 2             # amps per update
+  epochs: 80
+  early_stop_patience: 8
+  num_workers: 6
+  amp: true
+  amp_dtype: bf16
+  val_pairs: 2688           # select clips in total: 64 per amp over 42 amps
+  log_every: 20

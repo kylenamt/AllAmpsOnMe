@@ -620,8 +620,8 @@ def joint_eval(run, device, pairs, windows) -> None:
 @click.option("--epochs", type=int, default=None, help="Override max epochs.")
 @click.option("--resume", is_flag=True, help="Continue from the run's last.pt; the "
                                              "config is re-read and its training knobs take "
-                                             "effect — generator_run, encoder_run and steps "
-                                             "must not change.")
+                                             "effect — generator_run, encoder_run, steps and "
+                                             "second_order must not change.")
 def unfold(config_path, device, epochs, resume) -> None:
     """Train K learned enrollment steps between a frozen encoder and generator."""
     from openamp.training import unfold as unfold_train

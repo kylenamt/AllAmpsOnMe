@@ -292,6 +292,53 @@ def amp_weights(power: torch.Tensor, strength: float) -> torch.Tensor:
 
 
 # --- Main -----------------------------------------------------------------------------
+@torch.no_grad()
+def predict_vectors(probe_path: Path, ids: list[int], dev) -> dict[int, np.ndarray]:
+    """``{device_id: unit vector}``: a finished run's encoder on each amp.
+
+    The condition the run's ``pred`` was made in -- the amp's ``.nam`` on the whole
+    reference, at its corpus level -- for any amps with a capture, so also the
+    generator's holdout, which ``pred`` does not cover.
+    """
+    ck = torch.load(probe_path, map_location="cpu", weights_only=False)
+    a = ck["args"]
+    cfg = load_config()
+    x, sr = audio_io.read_audio(Path(a["sweep"]))
+    x = np.asarray(x, dtype=np.float32)
+    if sr != cfg.sample_rate:
+        raise ValueError(f"{a['sweep']} is {sr} Hz, the corpus is {cfg.sample_rate} Hz")
+    skip = int(round(SKIP_SECONDS * sr))
+    dry = torch.from_numpy(x[skip:]).to(dev)
+
+    rend = (pd.read_parquet(a["renders"], columns=["device_id", "output_scale", "nam_sha256"])
+            .groupby("device_id").first())
+    found = captures_by_sha(Path(a["captures"]),
+                            {rend.loc[int(d), "nam_sha256"] for d in ids})
+    encoder = ConformerEncoder(
+        int(ck["report"]["embedding_dim"]), sr, width=a["width"], n_blocks=a["n_blocks"],
+        n_heads=a["n_heads"], ff_ratio=a["ff_ratio"], conv_kernel=a["conv_kernel"],
+        n_queries=a["n_queries"], d_model=a["d_model"], pool_heads=a["pool_heads"],
+        mlp_ratio=a["mlp_ratio"]).to(dev)
+    encoder.load_state_dict(ck["state_dict"])
+    encoder.eval()
+
+    out: dict[int, np.ndarray] = {}
+    for d in ids:
+        d = int(d)
+        sha = rend.loc[d, "nam_sha256"]
+        if sha not in found:
+            raise FileNotFoundError(f"no .nam under {a['captures']} for amp {d}")
+        m = nam_io.load_model(found[sha], device=str(dev))
+        if m.sample_rate != cfg.sample_rate:
+            raise ValueError(f"amp {d}: .nam at {m.sample_rate} Hz, the corpus is "
+                             f"{cfg.sample_rate} Hz")
+        y = _render_signal(m, x, cfg, False) * float(rend.loc[d, "output_scale"])
+        wet = torch.from_numpy(y[skip:].astype(np.float32)).to(dev)
+        with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=dev.type == "cuda"):
+            out[d] = encoder(dry[None], wet[None])[0].float().cpu().numpy()
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)

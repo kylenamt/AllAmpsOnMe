@@ -14,6 +14,7 @@ from torch import nn
 
 __all__ = ["MLPFiLM", "DeltaWeightGen", "NormalizedEmbedding", "film_output_linear",
            "init_film_identity", "init_delta_zero", "per_sample_conv1d",
+           "per_sample_conv1d_matmul",
            "make_activation", "normalize_activation", "count_parameters",
            "ACTIVATIONS", "NAM_ACTIVATION_NAMES", "A2_ACTIVATION", "A2_EMBEDDING_STD",
            "A2_COND_HIDDEN", "A2_COND_ACTIVATION", "A2_DELTA_RANK",
@@ -84,6 +85,21 @@ def per_sample_conv1d(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor,
     return F.conv1d(F.pad(x, (pad, 0)).reshape(1, B * C, -1),
                     w.reshape(B * C, C, K), b.reshape(B * C),
                     dilation=dilation, groups=B).reshape(B, C, T)
+
+
+def per_sample_conv1d_matmul(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor,
+                             pad: int, dilation: int) -> torch.Tensor:
+    """:func:`per_sample_conv1d` as shifted matmuls: the same maths, for second order.
+
+    Differentiating a grouped conv twice takes time per group, so per clip; a
+    matmul's second derivative stays one batched operation. About 20x slower than
+    the grouped conv at first order (many more kernel launches), so only the
+    second-order path uses it.
+    """
+    T, K = x.shape[-1], w.shape[-1]
+    xp = F.pad(x, (pad, 0))
+    out = sum(w[..., k] @ xp[..., k * dilation:k * dilation + T] for k in range(K))
+    return out + b[:, :, None].to(out.dtype)
 
 
 # --- Embedding ------------------------------------------------------------------

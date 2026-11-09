@@ -120,6 +120,64 @@ def test_V_and_the_step_sizes_get_gradient_and_the_generator_does_not():
     assert all(p.grad is None for p in gen.parameters())
 
 
+def test_matmul_conv_is_the_grouped_conv():
+    from openamp.models.blocks import per_sample_conv1d, per_sample_conv1d_matmul
+
+    g = torch.Generator().manual_seed(0)
+    B, C, T, K, dilation = 3, 4, 200, 6, 5
+    x = torch.randn(B, C, T, generator=g)
+    w = torch.randn(B, C, C, K, generator=g)
+    b = torch.randn(B, C, generator=g)
+    pad = (K - 1) * dilation
+    assert torch.allclose(per_sample_conv1d_matmul(x, w, b, pad, dilation),
+                          per_sample_conv1d(x, w, b, pad, dilation), rtol=1e-4, atol=1e-5)
+
+
+def test_matmul_conv_is_on_only_while_second_order_gradients_are_taken():
+    gen = _gen(embed_normalize=True)
+    x, t = _clips(gen)
+    coeff_grads(gen, x, t, _e0(gen), COEFF, second_order=True)
+    assert not any(layer.matmul_conv for layer in gen.layers)
+
+
+def test_second_order_gradient_matches_finite_differences_and_first_order_does_not():
+    gen = _gen(embed_normalize=True, activation="tanh")   # smooth, as the real runs are
+    for layer in gen.layers:                    # an untrained delta barely hears e
+        layer.delta.scale.data.mul_(200.0)
+    x, t = _clips(gen)
+    e0 = _e0(gen)
+    A, n = x.shape[:2]
+
+    def outer(unf, second_order):
+        eK, _, _ = unf(gen, e0, x, t, COEFF, second_order=second_order)
+        y = gen.forward_emb(x.reshape(A * n, -1), eK.repeat_interleave(n, 0))
+        return per_amp_esr(y[..., gen.receptive_field:].view(A, n, -1), t, COEFF).mean()
+
+    def fresh():
+        unf = Unfolder(gen, steps=2)
+        unf.log_s.data.fill_(np.log(0.3))
+        return unf
+
+    # Step 0's V: the only path first-order loses is through step 1's gradient.
+    grads = {}
+    for so in (True, False):
+        unf = fresh()
+        outer(unf, so).backward()
+        grads[so] = unf.V.grad[0].clone()
+    d = grads[True] / grads[True].norm()        # the largest slope, above float32's noise
+    eps = 0.02
+
+    def at(sign):
+        unf = fresh()
+        unf.V.data[0] += sign * eps * d
+        return float(outer(unf, False).detach())
+
+    numeric = (at(1) - at(-1)) / (2 * eps)
+    second, first = float((grads[True] * d).sum()), float((grads[False] * d).sum())
+    assert second == pytest.approx(numeric, rel=0.05)
+    assert abs(first - numeric) > 3 * abs(second - numeric)
+
+
 def test_untrained_V_starts_at_W_and_drift_reads_zero():
     unf = Unfolder(_gen(), steps=4)
     assert unf.V.shape == (4, 3, 3, 8)                      # [K, L, rank, D]
@@ -291,6 +349,21 @@ def test_train_writes_a_run_reports_unseen_amps_and_resumes(tmp_path, write_corp
     assert list(pd.read_csv(run / "train_log.csv")["epoch"]) == [-1, 0, 1, 2]
     with pytest.raises(RuntimeError, match="unfold.steps"):
         train(_uspec(tmp_path, gdir, edir, steps=3), device="cpu", resume=True)
+
+
+def test_train_second_order_runs_and_cannot_be_switched_on_resume(tmp_path, write_corpus):
+    pytest.importorskip("soundfile")
+    pytest.importorskip("auraloss")
+    from openamp.training.unfold import train
+
+    write_corpus(_data_spec(tmp_path), TRAIN + HOLD, samples=6000,
+                 splits=("train", "val", "test"))
+    gdir, edir, _ = _write_runs(tmp_path)
+    spec = _uspec(tmp_path, gdir, edir, second_order=True)
+    m = train(spec.replace(training=replace(spec.training, epochs=1)), device="cpu")
+    assert np.isfinite(m["report_median"])
+    with pytest.raises(RuntimeError, match="unfold.second_order"):
+        train(_uspec(tmp_path, gdir, edir), device="cpu", resume=True)
 
 
 def test_amp_clips_can_score_on_another_split_and_scale_targets(tmp_path, write_corpus):

@@ -25,10 +25,18 @@ with a trainable copy per step, plus a trainable per-dimension step size::
   magnitude between amps (an amp the encoder places badly has ESR 5-40); an
   unnormalized step that suits one amp throws another off the map.
 
-**First-order.** Each ``g`` is computed on a detached copy of ``e`` and treated
-as a constant: the outer loss never differentiates through a gradient, so memory
-stays at one generator pass however large K is. The step sizes and ``V`` still
-get an exact gradient through the explicit update path.
+**First-order by default.** Each ``g`` is computed on a detached copy of ``e`` and
+treated as a constant: the outer loss never differentiates through a gradient, so
+memory stays at one generator pass however large K is. The step sizes and ``V``
+still get an exact gradient through the explicit update path.
+
+**Second-order on request** (``second_order=True`` to ``forward``). ``g`` keeps its
+graph, so the outer loss also sees how an earlier step's move changes every later
+step's ``g``. Every step's forward and backward graphs stay alive until the outer
+``backward``, so memory grows with K, amps and clips. Only training asks for it;
+scoring an unfolded amp needs ordinary gradients either way. While it computes
+``g`` the generator's convs run as matmuls (the same maths), because a grouped
+conv's second derivative costs time per clip.
 
 Trained by :mod:`openamp.training.unfold`; :func:`load_unfold` reads a run back.
 """
@@ -81,12 +89,13 @@ def _autocast(dev: torch.device, amp_dtype: torch.dtype | None):
 
 
 def coeff_grads(gen, x: torch.Tensor, t: torch.Tensor, e: torch.Tensor, coeff: float,
-                *, amp_dtype: torch.dtype | None = None):
+                *, amp_dtype: torch.dtype | None = None, second_order: bool = False):
     """``(g [A, L, r], esr [A])``: each amp's gradient at its coeff outputs.
 
     ``x`` ``[A, n, R + T]`` clean with left-context, ``t`` ``[A, n, T]`` its
     render, ``e`` ``[A, D]`` the vectors the generator sees. ``e`` is detached --
-    this is the first-order step. Each layer's coeff output is captured by a
+    the first-order step -- unless ``second_order``, where ``g`` stays a
+    differentiable function of ``e``. Each layer's coeff output is captured by a
     forward hook and differentiated directly, so ``g`` is exactly the ``g_l`` of
     the closed form, summed over the amp's clips.
     """
@@ -95,15 +104,21 @@ def coeff_grads(gen, x: torch.Tensor, t: torch.Tensor, e: torch.Tensor, coeff: f
     R = gen.receptive_field
     outs: list[torch.Tensor] = []
     hooks = [m.register_forward_hook(lambda _m, _i, o: outs.append(o)) for m in maps]
+    for layer in gen.layers:
+        layer.matmul_conv = second_order
     try:
-        e_in = e.detach().repeat_interleave(n, 0).requires_grad_(True)
+        e_in = (e if second_order else e.detach()).repeat_interleave(n, 0)
+        if not e_in.requires_grad:             # the first step's e0 carries no graph
+            e_in.requires_grad_(True)
         with torch.enable_grad(), _autocast(x.device, amp_dtype):
             y = gen.forward_emb(x.reshape(A * n, -1), e_in)[..., R:]
             esr = per_amp_esr(y.float().view(A, n, -1), t, coeff)
-            gs = torch.autograd.grad(esr.sum(), outs)
+            gs = torch.autograd.grad(esr.sum(), outs, create_graph=second_order)
     finally:
         for h in hooks:
             h.remove()
+        for layer in gen.layers:
+            layer.matmul_conv = False
     g = torch.stack([gi.float().view(A, n, -1).sum(1) for gi in gs], 1)
     return g, esr.detach()
 
@@ -154,7 +169,8 @@ class Unfolder(nn.Module):
         return target
 
     def forward(self, gen, e0: torch.Tensor, x: torch.Tensor, t: torch.Tensor,
-                coeff: float, *, amp_dtype: torch.dtype | None = None):
+                coeff: float, *, amp_dtype: torch.dtype | None = None,
+                second_order: bool = False):
         """K steps from ``e0`` ``[A, D]`` (already projected) on clips ``x``/``t``.
 
         Returns ``(e_K, esr at e0 [A], mean step length)``. The graph from ``V``
@@ -162,7 +178,8 @@ class Unfolder(nn.Module):
         """
         e, esr0, lens = e0, None, []
         for k in range(self.steps):
-            g, esr = coeff_grads(gen, x, t, e, coeff, amp_dtype=amp_dtype)
+            g, esr = coeff_grads(gen, x, t, e, coeff, amp_dtype=amp_dtype,
+                                 second_order=second_order)
             esr0 = esr if esr0 is None else esr0
             step = self.log_s[k].exp() * self.direction(k, self.normalize(g))
             e = gen.project_embedding(e - step)
@@ -179,14 +196,22 @@ class Unfolder(nn.Module):
 # --- The frozen halves ---------------------------------------------------------------
 def zero_shot_vectors(encoder_run: Path, ids: list[int], dev, *,
                       frames_path: str = "") -> dict[int, np.ndarray]:
-    """``{device_id: raw vector}`` from a joint run's encoder, in eval mode.
+    """``{device_id: raw vector}`` from a finished encoder, in eval mode.
 
-    Raw, as the encoder emits it; the caller projects. ``frames_path`` overrides
-    the store the checkpoint recorded -- the dac_frames runs name a host-local
-    copy (``/var/tmp/...``) that does not exist on another machine.
+    ``encoder_run`` is a joint run, or a ``probe_conformer`` run (a directory
+    holding ``probe_conformer.pt``). Raw, as the encoder emits it; the caller
+    projects. ``frames_path`` overrides the store a joint checkpoint recorded --
+    the dac_frames runs name a host-local copy (``/var/tmp/...``) that does not
+    exist on another machine.
     """
     from openamp.encoders import build_encoder
     from openamp.spec import EncoderSpec, spec_from_checkpoint
+
+    probe = Path(encoder_run) / "probe_conformer.pt"
+    if probe.is_file():
+        from openamp.probes.probe_conformer import predict_vectors
+
+        return predict_vectors(probe, ids, dev)
 
     ck = torch.load(Path(encoder_run) / "checkpoint.pt", map_location="cpu",
                     weights_only=False)

@@ -31,7 +31,8 @@ from openamp.models.blocks import (A2_ACTIVATION, A2_COND_ACTIVATION, A2_COND_HI
                                    NAM_ACTIVATION_NAMES, DeltaWeightGen, MLPFiLM,
                                    NormalizedEmbedding, init_delta_zero,
                                    init_film_identity, make_activation,
-                                   normalize_activation, per_sample_conv1d)
+                                   normalize_activation, per_sample_conv1d,
+                                   per_sample_conv1d_matmul)
 
 __all__ = ["FiLMWaveNet", "MLPFiLMWaveNet", "DeltaWaveNet",
            "FiLMWaveNetLayer", "DeltaWaveNetLayer",
@@ -272,6 +273,7 @@ class DeltaWaveNetLayer(nn.Module):
         self.kernel_size = int(kernel_size)
         self.dilation = int(dilation)
         self.pad = (kernel_size - 1) * dilation          # causal left pad
+        self.matmul_conv = False                         # second-order unfolding sets it
         self.conv = nn.Conv1d(channels, channels, kernel_size, dilation=dilation)
         self.input_mixer = nn.Conv1d(1, channels, 1, bias=False)
         # Sized off this layer's own kernel std, so the delta starts at the
@@ -287,9 +289,9 @@ class DeltaWaveNetLayer(nn.Module):
         """x trunk [B,C,T], cond clean signal [B,1,T], emb [B,E]."""
         C = self.channels
         dw, db, dm = self.delta(emb)                     # [B,C,C,K], [B,C], [B,C]
-        z = per_sample_conv1d(x, self.conv.weight.unsqueeze(0) + dw,
-                              self.conv.bias.unsqueeze(0) + db,
-                              self.pad, self.dilation)
+        conv = per_sample_conv1d_matmul if self.matmul_conv else per_sample_conv1d
+        z = conv(x, self.conv.weight.unsqueeze(0) + dw, self.conv.bias.unsqueeze(0) + db,
+                 self.pad, self.dilation)
         # Per-channel gain on the raw signal as a broadcast multiply so the
         # delta can ride on it; cast to z's dtype first since autocast only
         # rewrites conv/matmul (a bare fp32 multiply would promote the layer back).
