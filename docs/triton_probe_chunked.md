@@ -42,11 +42,12 @@ points 366 amps at the wrong files.
 
 ## 3. GPU and job settings
 
-- **A100 or H100 only.** torch 2.9.1 (cu128) has no Volta kernels, so a V100 fails
-  on its first kernel launch.
-- **Partition names are guesses.** The sbatch file's `--partition` line was written
-  without access to Triton. If the c1 job script uses different `#SBATCH` lines,
-  copy those.
+- **A100, H100 or H200 only.** torch 2.9.1 (cu128) has no Volta kernels, so a V100
+  fails on its first kernel launch.
+- **Partitions and environment** are the ones c1 ran with (`conformer_c1.sbatch`):
+  the same four GPU partitions, `module load mamba` + `source activate
+  $WRKDIR/envs/openamp`, `OPENAMP_DATA_DIR=data` and
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 - **GPU memory.**
   - A 32 + 32 step at full length is about 12 GB.
   - Gradient checkpointing (`--ckpt-group 112`) is what keeps it that small. It
@@ -55,9 +56,9 @@ points 366 amps at the wrong files.
 - **CPU memory.** About 10 GB holds the val audio (real and made-up). The job asks
   for 48 GB.
 - **Time.** About 2–3 h for 1,000 steps on an A100 or H100. The job asks for 6 h.
-- **Paths.** `PY` (the env's python) and `OUT` (the run folder) can be set when you
-  submit. The defaults are `/scratch/work/$USER/envs/openamp/bin/python` and
-  `results/encoder/encoder_probe_chunked_p3`. Point `PY` at the env that ran c1.
+- **Paths.** `PY` (the python to run) and `OUT` (the run folder) can be set when you
+  submit. The defaults are the activated env's `python` and
+  `results/encoder/encoder_probe_chunked_p3`.
 
 ## 4. Launch
 

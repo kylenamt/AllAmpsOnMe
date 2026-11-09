@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=chunked_p3
-#SBATCH --partition=gpu-a100-80g,gpu-h100-80g
+#SBATCH --partition=gpu-a100-80g,gpu-h100-80g,gpu-h100-80g-short,gpu-h200-141g-short
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=6
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=06:00:00
 #SBATCH --output=slurm-%x-%j.out
@@ -17,10 +17,15 @@
 #   OUT=results/encoder/smoke sbatch --time=00:30:00 scripts/triton_probe_chunked.sbatch \
 #       --steps 2 --eval-every 1
 #
-# torch 2.9.1 (cu128) has no Volta kernels, hence A100 / H100 only.
-set -euo pipefail
+# torch 2.9.1 (cu128) has no Volta kernels, hence A100 / H100 / H200 only.
+set -eo pipefail
 cd "${SLURM_SUBMIT_DIR:-.}"
-PY=${PY:-/scratch/work/$USER/envs/openamp/bin/python}
+module load mamba
+source activate $WRKDIR/envs/openamp
+set -u
+export OPENAMP_DATA_DIR=data
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+PY=${PY:-python}
 OUT=${OUT:-results/encoder/encoder_probe_chunked_p3}
 mkdir -p "$OUT"
 RESUME=()
